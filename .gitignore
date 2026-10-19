@@ -1,0 +1,6 @@
+# Not part of SplatScout
+Small Hours/
+
+node_modules/
+.DS_Store
+Thumbs.db

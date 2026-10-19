@@ -1,0 +1,12 @@
+{
+  "name": "splatscout",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AR capture coach for Gaussian splats (static web app, no build step).",
+  "scripts": {
+    "start": "node tools/serve.mjs 8080",
+    "icons": "node tools/make-icons.mjs",
+    "check": "node tools/check.mjs"
+  }
+}
