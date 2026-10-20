@@ -6,6 +6,7 @@ import { getTemplate } from '../core/plans.js';
 import { drawTopDown, drawPanorama } from '../capture/minimap.js';
 import { buildExport, deliver } from '../data/exporter.js';
 import * as store from '../data/store.js';
+import { getSettings } from '../data/settings.js';
 
 const FLAG_LABEL = {
   blurry: 'blurry', rushed: 'rushed', dark: 'dark', highlights: 'glare', lowtex: 'blank', untracked: 'no pose', rotonly: 'turned only',
@@ -193,9 +194,12 @@ export async function reviewScreen(root, { captureId, navigate }) {
       mount(back.firstChild,
         h('h3', 'Export ready'),
         h('p', `${filename} · ${fmtBytes(blob.size)}`),
-        h('p.small.muted', 'Copy the ZIP to your PC (USB, Quick Share or cloud drive), unzip it, and point your splat pipeline at the images/ folder. AR poses and depth points are in poses/ if your pipeline can use them.'),
+        h('p.small.muted', 'Save the ZIP, then get it to SplatStation on your PC: plug the phone in over USB (it imports automatically), upload it from the SplatStation page, or copy it into the station\'s inbox folder.'),
         h('div.row.end',
           h('button.btn.ghost', { onclick: () => back.remove() }, 'Close'),
+          getSettings().stationUrl
+            ? h('a.btn', { href: getSettings().stationUrl, target: '_blank', rel: 'noopener' }, 'Open SplatStation')
+            : null,
           h('button.btn.primary', {
             onclick: async () => {
               const r = await deliver(blob, filename);

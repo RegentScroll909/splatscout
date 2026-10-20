@@ -30,6 +30,10 @@ Two capture engines:
 There's also a **Practice room**: a virtual classroom that runs the full pipeline on a laptop or phone,
 so club members can learn the technique before scanning a real building.
 
+The repo also contains **SplatStation** ([`station/`](station/)), the PC side. It turns SplatScout exports
+(or plain phone videos) into finished Gaussian splats on your NVIDIA GPU, with no Python and no cloud.
+See [SplatStation](#splatstation-turn-captures-into-splats-on-your-pc) below.
+
 ---
 
 ## 1. Put it on your phone
@@ -101,6 +105,54 @@ Building_Room_YYYYMMDD/
   reconstruction of plain-walled rooms where SfM struggles. The COLMAP model loads directly in COLMAP 4.x
   (`model_analyzer`, `point_triangulator`, …).
 
+## SplatStation: turn captures into splats on your PC
+
+SplatStation runs on the PC with the GPU. It watches for new captures and turns each one into a finished
+Gaussian splat automatically:
+
+```
+SplatScout ZIP  ─┐                        ┌─ COLMAP 4 (GPU SIFT + matching)
+phone video     ─┼─► inbox / upload / USB ─┤   • AR poses → triangulate + bundle-adjust (fast, robust)
+                 │                        │   • no poses → global SfM + level the scene
+                 │                        └─ Brush (trains the splat on the GPU) ─► library/<Building>/<Room>/<date>/scene.ply
+```
+
+**Start it:** double-click **`start-station.cmd`** (or run `node station/station.mjs`), then open
+**http://localhost:8787**. The dashboard shows the queue, a progress bar for each stage, live GPU load and VRAM,
+a library of finished splats, and a 3D viewer.
+
+**Get captures in, any of these ways:**
+- **USB (easiest with your Pixel):** plug the phone in. New SplatScout exports in the phone's *Download* folder are
+  pulled in automatically (needs USB debugging on; uses `adb`).
+- **Drag and drop** a ZIP or video onto the dashboard.
+- **From the phone over Wi-Fi:** open the "From a phone on the same Wi-Fi" address shown on the dashboard and
+  upload. Put that address in SplatScout → Settings → *SplatStation address* to get an "Open SplatStation" button
+  after each export. Campus Wi-Fi often blocks phone-to-PC traffic; use USB there.
+- **Copy files** into `%USERPROFILE%\SplatStation\inbox`.
+
+**Quality presets** (choose on the dashboard; you can re-train any finished job with a different preset):
+
+| Preset | Steps | Training resolution | Use it for |
+|---|---|---|---|
+| Quick preview | 7,000 | 1280 px | Checking a capture right after you scan it |
+| Standard | 30,000 | 1920 px | Normal archive quality |
+| High | 50,000 | 2560 px | Showcase scenes, 4K camera-mode captures |
+
+On the RTX 5080, the practice room (309 photos) took **2 min 19 s end to end on Quick**: about 80 s for the camera
+solve and 58 s of training. Training time grows roughly with the step count; the dashboard shows a live estimate.
+
+**Output:** `%USERPROFILE%\SplatStation\library\<Building>\<Room>\<date>\` contains `scene.ply` (standard 3DGS
+format, works in SuperSplat, Postshot, Unity/Unreal plugins and the web viewers), `info.json` (photos, camera-solve
+quality, training stats, capture grade) and `thumb.jpg`. Click **View** for the built-in viewer, or **Edit in
+SuperSplat** to crop and clean floaters.
+
+**What it needs:** an NVIDIA GPU, plus the following, all found automatically. Paths can be changed in
+`%USERPROFILE%\SplatStation\station.config.json`.
+- COLMAP 4.x with CUDA (`C:\Tools\COLMAP`).
+- Brush v0.3 (`C:\Tools\Brush\brush_app.exe`, from github.com/ArthurBrussee/brush releases).
+- ffmpeg (video input only).
+- adb (USB import only).
+
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
@@ -131,6 +183,7 @@ app/js/capture/   session engine, 3D overlay, minimap, audio
 app/js/data/      IndexedDB storage, settings, ZIP export
 app/js/ui/        screens
 tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs
+station/          SplatStation: station.mjs (server, queue, inbox), lib/ (zip, COLMAP, Brush, video, adb), web/ (dashboard, viewer)
 ```
 
 - `npm start`: local server on http://localhost:8080

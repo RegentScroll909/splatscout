@@ -14,6 +14,7 @@ export const DEFAULTS = {
   arFlipY: true,
   showDebug: false,
   overlayVoxels: true,
+  stationUrl: '', // SplatStation on your PC, e.g. http://192.168.1.20:8787
 };
 
 let cache = null;

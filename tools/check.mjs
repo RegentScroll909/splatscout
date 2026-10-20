@@ -234,4 +234,37 @@ const zipTest = async () => {
 };
 await zipTest();
 
+// ---- SplatStation
+const { listZip, extractZip, readZipText } = await import('../station/lib/zipread.mjs');
+const { posePairs } = await import('../station/lib/colmap.mjs');
+const stationZip = async () => {
+  const z = new ZipWriter();
+  await z.add('Hall_Room_20261019/images/0001.jpg', new Uint8Array([9, 8, 7]));
+  await z.add('Hall_Room_20261019/splatscout.json', JSON.stringify({ capture: { building: 'Hall' } }));
+  const dir = mkdtempSync(join(tmpdir(), 'ssz-'));
+  const file = join(dir, 'c.zip');
+  writeFileSync(file, Buffer.from(await z.finish().arrayBuffer()));
+  assert.equal((await listZip(file)).length, 2);
+  assert.equal(JSON.parse(await readZipText(file, 'splatscout.json')).capture.building, 'Hall');
+  await extractZip(file, join(dir, 'out'));
+  assert.deepEqual([...readFileSync(join(dir, 'out', 'images', '0001.jpg'))], [9, 8, 7]);
+  passed++;
+  console.log('  ok station unpacks SplatScout ZIPs (top folder stripped)');
+};
+await stationZip();
+
+test('station picks matching pairs from AR poses (neighbours + loop closures)', () => {
+  const frames = [];
+  for (let i = 0; i < 60; i++) {
+    const a = (i / 60) * Math.PI * 2;
+    frames.push({ name: `${String(i + 1).padStart(4, '0')}.jpg`, pose: Array.from(poseLookDir([Math.cos(a) * 2, 1.5, Math.sin(a) * 2], [-Math.cos(a), 0, -Math.sin(a)])) });
+  }
+  // A second lap repeats the first: frame 60+k sits where frame k was.
+  for (let i = 0; i < 20; i++) frames.push({ name: `${String(61 + i).padStart(4, '0')}.jpg`, pose: frames[i].pose });
+  const pairs = posePairs(frames, { temporal: 5, spatial: 10 });
+  assert.ok(pairs.includes('0001.jpg 0002.jpg'), 'temporal neighbour');
+  assert.ok(pairs.includes('0005.jpg 0065.jpg'), 'loop closure between laps');
+  assert.ok(pairs.length < (80 * 79) / 2 / 3, 'far fewer pairs than exhaustive');
+});
+
 console.log(`\n${passed} checks passed`);

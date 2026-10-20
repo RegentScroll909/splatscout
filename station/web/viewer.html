@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Splat viewer</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #eee; font: 14px system-ui, sans-serif; overflow: hidden; }
+    #bar { position: fixed; top: 0; left: 0; right: 0; display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: #000a; z-index: 10; flex-wrap: wrap; }
+    #title { font-weight: 700; margin-right: auto; }
+    button, a.b { font: inherit; color: #eee; background: #2a2230; border: 1px solid #3a3040; border-radius: 8px; padding: 5px 10px; cursor: pointer; text-decoration: none; }
+    #help { position: fixed; bottom: 10px; left: 12px; font-size: 12px; color: #bbb; background: #000a; padding: 6px 10px; border-radius: 8px; z-index: 10; }
+    #msg { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: 15px; color: #ccc; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="bar">
+    <span id="title">Splat</span>
+    <button id="flip" title="Turn the scene upside down if it loads inverted">⇅ Flip up</button>
+    <button id="home" title="Back to the first photo's viewpoint">⌂ Start view</button>
+    <a class="b" id="dl" download>⬇ .ply</a>
+    <a class="b" href="https://superspl.at/editor" target="_blank" rel="noopener" title="Open SuperSplat, then drag the .ply onto it to clean up floaters">✂ Edit in SuperSplat</a>
+  </div>
+  <div id="msg">Loading splat…</div>
+  <div id="help">Drag to orbit · right-drag to pan · scroll to zoom</div>
+  <script type="module">
+    import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
+
+    const q = new URLSearchParams(location.search);
+    const ply = q.get('ply');
+    const view = q.get('view') ? JSON.parse(q.get('view')) : null;
+    document.getElementById('title').textContent = q.get('title') || 'Splat';
+    document.title = (q.get('title') || 'Splat') + ' · SplatStation';
+    document.getElementById('dl').href = ply;
+
+    let up = view && view.up ? view.up : [0, -1, 0];
+    let viewer = null;
+
+    async function load() {
+      if (viewer) {
+        await viewer.dispose();
+        document.querySelectorAll('canvas').forEach((c) => c.remove());
+      }
+      const pos = view ? view.position : [0, 0, 0];
+      const look = view ? view.lookAt : [0, 0, -1];
+      viewer = new GaussianSplats3D.Viewer({
+        cameraUp: up,
+        initialCameraPosition: pos,
+        initialCameraLookAt: look,
+        sharedMemoryForWorkers: false,
+        antialiased: true,
+      });
+      try {
+        await viewer.addSplatScene(ply, { splatAlphaRemovalThreshold: 5, showLoadingUI: true, progressiveLoad: true, format: GaussianSplats3D.SceneFormat.Ply });
+        viewer.start();
+        document.getElementById('msg').textContent = '';
+      } catch (e) {
+        document.getElementById('msg').textContent = 'Could not load the splat: ' + (e.message || e);
+      }
+    }
+
+    document.getElementById('flip').onclick = () => {
+      up = up.map((v) => -v);
+      load();
+    };
+    document.getElementById('home').onclick = () => load();
+    if (!ply) document.getElementById('msg').textContent = 'No splat given (?ply=…).';
+    else load();
+  </script>
+</body>
+</html>

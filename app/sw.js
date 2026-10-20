@@ -1,5 +1,5 @@
 // Offline support: cache the app shell so SplatScout opens in basements with no signal.
-const CACHE = 'splatscout-v1';
+const CACHE = 'splatscout-v2';
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',
   'js/main.js', 'js/ui/dom.js', 'js/ui/home.js', 'js/ui/setup.js', 'js/ui/captureScreen.js', 'js/ui/review.js', 'js/ui/learn.js', 'js/ui/settingsScreen.js',
