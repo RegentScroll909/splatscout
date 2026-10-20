@@ -1,6 +1,8 @@
 # Not part of SplatScout
 Small Hours/
 .claude/
+# Brush GPU autotune cache (if Brush is ever run from the repo folder)
+target/
 
 node_modules/
 .DS_Store

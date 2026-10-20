@@ -61,7 +61,9 @@ export async function trainBrush(p) {
   }, 2000);
 
   try {
-    await run(brush, args, { log, token });
+    // Brush keeps a GPU autotune cache in ./target; give it a stable home so tuning is reused.
+    if (p.cacheDir) mkdirSync(p.cacheDir, { recursive: true });
+    await run(brush, args, { log, token, cwd: p.cacheDir });
   } finally {
     clearInterval(poll);
   }

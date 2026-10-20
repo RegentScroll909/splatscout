@@ -154,6 +154,7 @@ export async function processJob(job, ctx) {
     preset,
     nImages: rec.stats.images,
     stepsPerSec: cfg.rates && cfg.rates[presetKey],
+    cacheDir: join(cfg.workDir, 'brush-cache'),
     progress: (f, note) => ctx.stage('train', f, note),
     onExport: (file, iter) => ctx.update({ preview: { file, iter, at: Date.now() } }),
     token,
