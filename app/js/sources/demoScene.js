@@ -3,6 +3,7 @@
 
 import { compileProgram } from './gpu.js';
 import { projectionFromIntrinsics, mat4InvertRigid, transformDir } from '../core/math.js';
+import { depthToPoints, unprojectIntr } from '../core/depth.js';
 
 export const ROOM = { min: [-4, 0, -3.5], max: [4, 3, 3.5] };
 
@@ -218,25 +219,50 @@ export function raycast(o, d) {
   return t;
 }
 
-/** Simulated depth grid: world points and image uv for an nx x ny grid. */
-export function depthGrid(pose, intr, nx, ny, minD = 0.25, maxD = 6) {
-  const xyz = [], uv = [];
+/** Surface normal at a point on the room or furniture (for simulated AR hit tests). */
+export function surfaceNormal(p) {
+  const e = 1e-3;
+  if (Math.abs(p[1] - ROOM.min[1]) < e) return [0, 1, 0];
+  if (Math.abs(p[1] - ROOM.max[1]) < e) return [0, -1, 0];
+  for (const f of FURNITURE) {
+    if (p[0] < f.min[0] - e || p[0] > f.max[0] + e || p[1] < f.min[1] - e || p[1] > f.max[1] + e || p[2] < f.min[2] - e || p[2] > f.max[2] + e) continue;
+    if (Math.abs(p[1] - f.max[1]) < e) return [0, 1, 0];
+    if (Math.abs(p[0] - f.min[0]) < e) return [-1, 0, 0];
+    if (Math.abs(p[0] - f.max[0]) < e) return [1, 0, 0];
+    if (Math.abs(p[2] - f.min[2]) < e) return [0, 0, -1];
+    if (Math.abs(p[2] - f.max[2]) < e) return [0, 0, 1];
+  }
+  if (Math.abs(p[0] - ROOM.min[0]) < e) return [1, 0, 0];
+  if (Math.abs(p[0] - ROOM.max[0]) < e) return [-1, 0, 0];
+  if (Math.abs(p[2] - ROOM.min[2]) < e) return [0, 0, 1];
+  return [0, 0, -1];
+}
+
+/**
+ * Simulated phone depth: planar depth per grid cell (0 = none). Like ARCore's smoothed depth it
+ * has ~1% noise and blends depths across object edges (each sample averages two nearby rays), which
+ * creates the "flying pixels" the real filter has to remove.
+ */
+export function depthImage(pose, intr, nx, ny, minD = 0.25, maxD = 6, smear = true) {
+  const D = new Float32Array(nx * ny);
   const o = [pose[12], pose[13], pose[14]];
+  const ray = (u, v) => {
+    const dc = [(u * intr.w - intr.cx) / intr.fx, -(v * intr.h - intr.cy) / intr.fy, -1];
+    return raycast(o, transformDir(pose, dc)); // dc has z = -1, so the ray parameter is planar depth
+  };
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
       const u = (i + 0.5) / nx, v = (j + 0.5) / ny;
-      const xc = (u * intr.w - intr.cx) / intr.fx;
-      const yc = -(v * intr.h - intr.cy) / intr.fy;
-      const dc = [xc, yc, -1];
-      const dw = transformDir(pose, dc);
-      const t = raycast(o, dw);
-      const depth = t; // dc has z = -1, so the ray parameter equals planar depth
-      if (!(depth > minD && depth < maxD)) continue;
-      // Simulate ARCore noise (~1% of depth).
-      const nz = 1 + (Math.random() - 0.5) * 0.02;
-      xyz.push(o[0] + dw[0] * t * nz, o[1] + dw[1] * t * nz, o[2] + dw[2] * t * nz);
-      uv.push(u, v);
+      let d = ray(u, v);
+      if (smear) d = 0.5 * (d + ray(u + (0.45 * ((i + j) % 2 ? 1 : -1)) / nx, v + (0.45 * (j % 2 ? 1 : -1)) / ny));
+      d *= 1 + (Math.random() - 0.5) * 0.02;
+      if (d > minD && d < maxD) D[j * nx + i] = d;
     }
   }
-  return { xyz: new Float32Array(xyz), uv: new Float32Array(uv) };
+  return D;
+}
+
+/** Simulated depth grid: world points (flying pixels filtered like on the phone), image uv, depth image. */
+export function depthGrid(pose, intr, nx, ny, minD = 0.25, maxD = 6) {
+  return depthToPoints(depthImage(pose, intr, nx, ny, minD, maxD), nx, ny, unprojectIntr(intr), pose);
 }

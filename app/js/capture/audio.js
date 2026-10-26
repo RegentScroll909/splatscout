@@ -25,6 +25,24 @@ export function tick(kind = 'shot') {
   o.stop(t + 0.25);
 }
 
+/** Two rising notes: a pass or the scan area is complete. */
+export function chime() {
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  [660, 990].forEach((f, i) => {
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(f, t + i * 0.12);
+    g.gain.setValueAtTime(0.0001, t + i * 0.12);
+    g.gain.exponentialRampToValueAtTime(0.07, t + i * 0.12 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + i * 0.12 + 0.3);
+    o.connect(g).connect(ctx.destination);
+    o.start(t + i * 0.12);
+    o.stop(t + i * 0.12 + 0.35);
+  });
+}
+
 export function buzz(ms = 15) {
   try {
     const active = !navigator.userActivation || navigator.userActivation.hasBeenActive;

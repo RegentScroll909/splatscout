@@ -1,14 +1,15 @@
 // Practice source: walk through a virtual classroom with mouse/keyboard or touch (or an automatic
 // tour). It behaves like the AR source (6DoF + depth) or like camera mode (orientation only).
 
-import { DemoScene, depthGrid, ROOM } from './demoScene.js';
+import { DemoScene, depthGrid, depthImage, raycast, surfaceNormal, ROOM } from './demoScene.js';
 import { analysisSize, coverMapping } from './common.js';
 import { BitmapImage } from './frameImage.js';
 import { rgbaToGray } from '../core/analyzer.js';
 import { Overlay3D } from '../capture/overlay3d.js';
 import { DEG, clamp, poseLookDir, mat4InvertRigid, rotationDelta, v3 } from '../core/math.js';
 
-const HFOV = 68;
+// Same geometry as the Pixel's ARCore camera image: 860 x 1920, 70° along the long side (35° across).
+const HFOV = 70;
 
 export class DemoSource {
   /**
@@ -28,6 +29,8 @@ export class DemoSource {
     this.pitch = -5;
     this.keys = new Set();
     this.running = false;
+    this.autopilot = null; // () => {pos, aim} | null: the auto-tour follows the guide when set
+    this.frameNo = 0;
     this._loop = this._loop.bind(this);
   }
 
@@ -36,7 +39,7 @@ export class DemoSource {
     this.onEnd = onEnd;
     const rect = this.container.getBoundingClientRect();
     const portrait = rect.height > rect.width * 1.1;
-    const W = portrait ? 720 : 1280, H = portrait ? 1280 : 720;
+    const W = portrait ? 576 : 1280, H = portrait ? 1280 : 576;
     const f = Math.max(W, H) / 2 / Math.tan((HFOV / 2) * DEG);
     this.intr = { fx: f, fy: f, cx: W / 2, cy: H / 2, w: W, h: H };
     this.info.camW = W;
@@ -214,9 +217,36 @@ export class DemoSource {
     this._frame(this.simT, dt);
   }
 
+  /** Auto-tour that follows the capture guide: walk towards its target and aim where it says. */
+  _follow(dt, tgt) {
+    // Like a person: walk slower while turning a lot.
+    const want = Math.atan2(tgt.aim[0], -tgt.aim[2]) / DEG;
+    const err = Math.abs(((want - this.yaw + 540) % 360) - 180);
+    const sp = 0.32 * clamp(1 - err / 60, 0.3, 1) * dt;
+    const tx = tgt.pos[0] - this.pos[0], tz = tgt.pos[2] - this.pos[2];
+    const d = Math.hypot(tx, tz);
+    if (d > 1e-3) {
+      const k = Math.min(d, sp) / d;
+      this.pos[0] += tx * k;
+      this.pos[2] += tz * k;
+    }
+    this.pos[1] += clamp(tgt.pos[1] - this.pos[1], -0.5 * dt, 0.5 * dt);
+    this.pos[0] = clamp(this.pos[0], ROOM.min[0] + 0.3, ROOM.max[0] - 0.3);
+    this.pos[2] = clamp(this.pos[2], ROOM.min[2] + 0.3, ROOM.max[2] - 0.3);
+    const a = tgt.aim;
+    const yaw = Math.atan2(a[0], -a[2]) / DEG, pitch = Math.asin(clamp(a[1], -1, 1)) / DEG;
+    // Smooth, proportional turning capped at 12°/s (a person following the ring, not a robot).
+    const dyaw = ((yaw - this.yaw + 540) % 360) - 180;
+    this.yaw += clamp(dyaw * 1.5, -12, 12) * dt;
+    this.pitch += clamp((pitch - this.pitch) * 1.5, -12, 12) * dt;
+  }
+
   _frame(now, dt) {
-    if (this.tourSpeed > 0) this._tour(dt);
+    const tgt = this.tourSpeed > 0 && this.autopilot ? this.autopilot() : null;
+    if (tgt) this._follow(dt * this.tourSpeed, tgt);
+    else if (this.tourSpeed > 0) this._tour(dt);
     else this._manual(dt);
+    this.frameNo++;
 
     const fwd = [Math.sin(this.yaw * DEG) * Math.cos(this.pitch * DEG), Math.sin(this.pitch * DEG), -Math.cos(this.yaw * DEG) * Math.cos(this.pitch * DEG)];
     const truePose = poseLookDir(this.pos, fwd);
@@ -228,7 +258,7 @@ export class DemoSource {
       const rot = rotationDelta(this.prevPose, truePose) / DEG / dt;
       const lin = v3.dist([this.prevPose[12], this.prevPose[13], this.prevPose[14]], this.pos) / dt;
       // Image motion during a 1/60 s exposure; a box blur of length L ~ Gaussian sigma 0.29 L.
-      const pxPerSec = (rot / HFOV) * this.intr.w + (lin / 2) * this.intr.fx;
+      const pxPerSec = (rot * DEG + lin / 2) * this.intr.fx;
       blur = Math.max(0, (0.29 * pxPerSec) / 60 - 0.3);
     }
     this.prevPose = truePose;
@@ -249,9 +279,19 @@ export class DemoSource {
       this.actx.drawImage(this.out, 0, 0, as.w, as.h);
       return this.actx.getImageData(0, 0, as.w, as.h).data;
     };
+    // Simulated AR hit test at the screen centre (where the reticle is).
+    let hit = null;
+    if (this.tracking === '6dof') {
+      const t = raycast(this.pos, fwd);
+      if (isFinite(t)) {
+        const p = [this.pos[0] + fwd[0] * t, this.pos[1] + fwd[1] * t, this.pos[2] + fwd[2] * t];
+        hit = { p, n: surfaceNormal(p) };
+      }
+    }
     const fi = {
       t: now,
       pose,
+      hit,
       trackState: this.tracking === '6dof' ? 'ok' : 'n/a',
       intr,
       displayIntr: map.displayIntr,
@@ -269,7 +309,7 @@ export class DemoSource {
                 ds.sort((a, b) => a - b);
                 return ds.length ? ds[ds.length >> 1] : 0;
               },
-              grid: (nx, ny, minD, maxD) => depthGrid(truePose, intr, nx, ny, minD, maxD),
+              grid: (nx, ny, minD = 0.25, maxD = 8) => depthGrid(truePose, intr, nx, ny, minD, maxD),
             }
           : null,
       requestAnalysis: () => {
@@ -302,7 +342,10 @@ export class DemoSource {
     gl.viewport(0, 0, cw, ch);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    this.overlay.draw(mat4InvertRigid(pose), map.proj, ch, now);
+    if (this.frameNo % 4 === 0) {
+      this.overlay.setOcclusion(this.tracking === '6dof' ? depthImage(truePose, map.displayIntr, 32, 24, 0.1, 20, false) : null, 32, 24);
+    }
+    this.overlay.draw(mat4InvertRigid(pose), map.proj, [0, 0, cw, ch], now);
   }
 }
 

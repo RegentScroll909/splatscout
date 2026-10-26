@@ -138,8 +138,12 @@ const DIR_SEP_COS = Math.cos(15 * DEG); // observation directions closer than 15
 
 /**
  * Sparse voxel grid of observed surfaces.
- * Each voxel stores how often depth hit it ("hits": it is real geometry, not noise) and a small
- * set of distinct observation directions from keyframes ("dirs": how many angles it was captured from).
+ *  * Depth frames add "hits" where they land and "misses" along the rays in front of them, so depth
+ *    noise floating in the air is carved away again (only voxels confirmed by several frames and
+ *    not seen through count as surfaces).
+ *  * Each photo adds its viewing direction to every surface voxel visible in it ("dirs": how many
+ *    clearly different angles the surface was photographed from).
+ *  * Optional bounds: only surfaces inside the scan area count.
  */
 export class VoxelMap {
   constructor(size = 0.2, maxObsDist = 5) {
@@ -147,6 +151,9 @@ export class VoxelMap {
     this.maxObsDist = maxObsDist;
     this.vox = new Map();
     this.version = 0;
+    this.frameId = 0;
+    this.bounds = null;
+    this.bver = 0;
   }
 
   reset() {
@@ -158,12 +165,23 @@ export class VoxelMap {
     return ((ix + 1024) * 2048 + (iy + 1024)) * 2048 + (iz + 1024);
   }
 
+  setBounds(b) {
+    this.bounds = b || null;
+    this.boundsChanged();
+  }
+
+  /** Call after the bounds (or their skipped spots) changed. */
+  boundsChanged() {
+    this.bver++;
+    this.version++;
+  }
+
   /**
-   * Integrate depth points (flat [x,y,z,...] world coordinates).
-   * @param camPos camera position
-   * @param fromKeyframe true when these points belong to a captured keyframe
+   * Integrate one depth frame (flat [x,y,z,...] world points seen from camPos).
+   * @param {boolean} [carve] also mark the space in front of each point as empty
    */
-  observe(points, camPos, fromKeyframe) {
+  integrate(points, camPos, carve = true) {
+    const id = ++this.frameId;
     const s = this.size;
     for (let i = 0; i < points.length; i += 3) {
       const x = points[i], y = points[i + 1], z = points[i + 2];
@@ -171,119 +189,251 @@ export class VoxelMap {
       const k = this.key(ix, iy, iz);
       let v = this.vox.get(k);
       if (!v) {
-        v = { ix, iy, iz, hits: 0, kfs: 0, dirs: [] };
+        v = { ix, iy, iz, n: 0, sx: 0, sy: 0, sz: 0, hit: 0, miss: 0, f: 0, m: 0, kfs: 0, dirs: [], bv: -1, ib: true };
         this.vox.set(k, v);
       }
-      v.hits++;
-      if (!fromKeyframe) continue;
-      const dx = camPos[0] - x, dy = camPos[1] - y, dz = camPos[2] - z;
-      const d = Math.hypot(dx, dy, dz);
-      if (d < 0.05 || d > this.maxObsDist) continue; // too far away to resolve detail
-      v.kfs++;
-      if (v.dirs.length >= MAX_DIRS) continue;
-      const ux = dx / d, uy = dy / d, uz = dz / d;
-      let dup = false;
-      for (const o of v.dirs) {
-        if (o[0] * ux + o[1] * uy + o[2] * uz > DIR_SEP_COS) {
-          dup = true;
-          break;
-        }
+      v.n++;
+      v.sx += x; v.sy += y; v.sz += z;
+      if (v.f !== id) {
+        v.f = id;
+        v.hit++;
       }
-      if (!dup) v.dirs.push([ux, uy, uz]);
+    }
+    if (carve) {
+      const stopBefore = 1.5 * s; // leave the surface itself (and depth noise around it) alone
+      const visit = (v) => {
+        if (v.f !== id && v.m !== id) {
+          v.m = id;
+          v.miss++;
+        }
+        return false;
+      };
+      for (let i = 0; i < points.length; i += 3) {
+        const dx = points[i] - camPos[0], dy = points[i + 1] - camPos[1], dz = points[i + 2] - camPos[2];
+        const len = Math.hypot(dx, dy, dz);
+        if (len - stopBefore <= s) continue;
+        this.march(camPos, [dx / len, dy / len, dz / len], len - stopBefore, visit);
+      }
     }
     this.version++;
   }
 
-  /** Voxels hit at least twice are treated as real surfaces (filters depth noise). */
-  static isSolid(v) {
-    return v.hits >= 2;
+  /**
+   * Walk the voxels along a ray (3D DDA). `visit(voxel, t)` is called for existing voxels;
+   * return true to stop. Returns the stopping voxel or null.
+   */
+  march(o, dir, maxLen, visit) {
+    const s = this.size;
+    let ix = Math.floor(o[0] / s), iy = Math.floor(o[1] / s), iz = Math.floor(o[2] / s);
+    const sx = dir[0] > 0 ? 1 : -1, sy = dir[1] > 0 ? 1 : -1, sz = dir[2] > 0 ? 1 : -1;
+    const ax = Math.abs(dir[0]), ay = Math.abs(dir[1]), az = Math.abs(dir[2]);
+    const dX = ax > 1e-9 ? s / ax : Infinity, dY = ay > 1e-9 ? s / ay : Infinity, dZ = az > 1e-9 ? s / az : Infinity;
+    let tX = ax > 1e-9 ? (sx > 0 ? (ix + 1) * s - o[0] : o[0] - ix * s) / ax : Infinity;
+    let tY = ay > 1e-9 ? (sy > 0 ? (iy + 1) * s - o[1] : o[1] - iy * s) / ay : Infinity;
+    let tZ = az > 1e-9 ? (sz > 0 ? (iz + 1) * s - o[2] : o[2] - iz * s) / az : Infinity;
+    let t = 0;
+    for (let guard = 0; t < maxLen && guard < 4096; guard++) {
+      const v = this.vox.get(this.key(ix, iy, iz));
+      if (v && visit(v, t)) return v;
+      if (tX < tY && tX < tZ) { t = tX; tX += dX; ix += sx; }
+      else if (tY < tZ) { t = tY; tY += dY; iy += sy; }
+      else { t = tZ; tZ += dZ; iz += sz; }
+    }
+    return null;
   }
 
-  /** 0 = seen but never captured, 1 = one angle, 2 = two angles, 3 = three or more angles. */
+  /** First surface hit along a ray: {point, voxel, t} or null. */
+  raycast(o, dir, maxLen = 10, skipNear = 0.15) {
+    let hitT = 0;
+    const v = this.march(o, dir, maxLen, (vx, t) => {
+      if (t < skipNear || !VoxelMap.isSolid(vx)) return false;
+      hitT = t;
+      return true;
+    });
+    return v ? { point: VoxelMap.centroid(v), voxel: v, t: hitT } : null;
+  }
+
+  /**
+   * A photo was taken: every surface voxel visible in it gains this viewing direction.
+   * Visibility = the voxel projects into the photo and the photo's depth there matches its distance.
+   * @param pose camera-to-world 4x4
+   * @param intr intrinsics of the photo
+   * @param dimg {d: planar depth per grid cell (0 = unknown), nx, ny} covering the photo
+   */
+  observeView(pose, intr, dimg) {
+    const cx = pose[12], cy = pose[13], cz = pose[14];
+    const maxD2 = this.maxObsDist * this.maxObsDist;
+    const { d, nx, ny } = dimg;
+    const tol0 = 0.5 * this.size;
+    let seen = 0;
+    for (const v of this.vox.values()) {
+      const inv = 1 / v.n;
+      const wx = v.sx * inv - cx, wy = v.sy * inv - cy, wz = v.sz * inv - cz;
+      const d2 = wx * wx + wy * wy + wz * wz;
+      if (d2 > maxD2 || d2 < 0.0025) continue;
+      const zc = -(pose[8] * wx + pose[9] * wy + pose[10] * wz);
+      if (zc < 0.15) continue;
+      const x = pose[0] * wx + pose[1] * wy + pose[2] * wz;
+      const y = pose[4] * wx + pose[5] * wy + pose[6] * wz;
+      const u = (intr.cx + (intr.fx * x) / zc) / intr.w;
+      const w = (intr.cy - (intr.fy * y) / zc) / intr.h;
+      if (u < 0.03 || u > 0.97 || w < 0.03 || w > 0.97) continue;
+      const i = Math.min(nx - 1, Math.floor(u * nx)), j = Math.min(ny - 1, Math.floor(w * ny));
+      const tol = tol0 + 0.03 * zc;
+      let vis = false;
+      for (let jj = Math.max(0, j - 1); jj <= Math.min(ny - 1, j + 1) && !vis; jj++) {
+        for (let ii = Math.max(0, i - 1); ii <= Math.min(nx - 1, i + 1); ii++) {
+          const m = d[jj * nx + ii];
+          if (m > 0 && Math.abs(m - zc) < tol) {
+            vis = true;
+            break;
+          }
+        }
+      }
+      if (!vis) continue;
+      v.kfs++;
+      addDir(v, -wx, -wy, -wz);
+      seen++;
+    }
+    this.version++;
+    return seen;
+  }
+
+  /** Older captures without per-photo depth images: the voxels the photo's depth points landed in. */
+  observePoints(points, camPos) {
+    const s = this.size;
+    for (let i = 0; i < points.length; i += 3) {
+      const v = this.vox.get(this.key(Math.floor(points[i] / s), Math.floor(points[i + 1] / s), Math.floor(points[i + 2] / s)));
+      if (!v) continue;
+      const dx = camPos[0] - points[i], dy = camPos[1] - points[i + 1], dz = camPos[2] - points[i + 2];
+      if (dx * dx + dy * dy + dz * dz > this.maxObsDist * this.maxObsDist) continue;
+      v.kfs++;
+      addDir(v, dx, dy, dz);
+    }
+    this.version++;
+  }
+
+  /** Surfaces: confirmed by at least two depth frames and not seen through more often than seen. */
+  static isSolid(v) {
+    return v.hit >= 2 && v.miss <= 2 * v.hit;
+  }
+
+  /** 0 = seen but never photographed, 1 = one angle, 2 = two angles, 3 = three or more angles. */
   static quality(v) {
     return Math.min(3, v.dirs.length);
   }
 
+  /** Mean position of the depth points in a voxel: where the surface actually is. */
+  static centroid(v) {
+    return [v.sx / v.n, v.sy / v.n, v.sz / v.n];
+  }
+
+  inBounds(v) {
+    if (!this.bounds) return true;
+    if (v.bv !== this.bver) {
+      v.bv = this.bver;
+      v.ib = this.bounds.contains(v.sx / v.n, v.sy / v.n, v.sz / v.n);
+    }
+    return v.ib;
+  }
+
+  isSolidAt(x, y, z) {
+    const s = this.size;
+    const v = this.vox.get(this.key(Math.floor(x / s), Math.floor(y / s), Math.floor(z / s)));
+    return !!v && VoxelMap.isSolid(v);
+  }
+
+  /** Coverage of the surfaces inside the scan area. */
   stats() {
+    if (this._statsVer === this.version) return this._stats;
     const q = [0, 0, 0, 0];
-    let solid = 0;
+    let solid = 0, outside = 0;
     for (const v of this.vox.values()) {
       if (!VoxelMap.isSolid(v)) continue;
+      if (!this.inBounds(v)) {
+        outside++;
+        continue;
+      }
       solid++;
       q[VoxelMap.quality(v)]++;
     }
     const coverage = solid ? (q[3] + 0.5 * q[2]) / solid : 0;
-    return { solid, q0: q[0], q1: q[1], q2: q[2], q3: q[3], coverage };
+    this._statsVer = this.version;
+    this._stats = { solid, outside, q0: q[0], q1: q[1], q2: q[2], q3: q[3], coverage };
+    return this._stats;
   }
 
-  /** Estimated floor height (lowest dense layer of voxels), or null. */
+  /** Estimated floor height (the scan area's floor, else the lowest dense layer of voxels), or null. */
   floorY() {
+    if (this.bounds && this.bounds.poly) return this.bounds.floorY;
     const ys = [];
-    for (const v of this.vox.values()) if (VoxelMap.isSolid(v)) ys.push(v.iy);
+    for (const v of this.vox.values()) if (VoxelMap.isSolid(v)) ys.push(v.sy / v.n);
     if (ys.length < 60) return null;
     ys.sort((a, b) => a - b);
-    return (ys[Math.floor(ys.length * 0.04)] + 0.5) * this.size;
+    return ys[Math.floor(ys.length * 0.04)];
   }
 
   /**
-   * Find the most useful under-captured area near the camera: clusters weak voxels on a 1 m grid
-   * and prefers big clusters roughly in front of the user.
+   * Under-captured surfaces grouped on a coarse grid (scan area only):
+   * [{key, center, count, deficit, dirs: [unit vectors already used]}]
    */
-  findGap(camPos, camFwd, maxDist = 5) {
+  weakClusters(cell = 0.8, minCount = 3) {
     const cells = new Map();
-    const s = this.size;
     for (const v of this.vox.values()) {
-      if (!VoxelMap.isSolid(v) || VoxelMap.quality(v) >= 2) continue;
-      const p = [(v.ix + 0.5) * s, (v.iy + 0.5) * s, (v.iz + 0.5) * s];
-      const d = v3.dist(p, camPos);
-      if (d < 0.4 || d > maxDist) continue;
-      const ck = `${Math.floor(p[0])},${Math.floor(p[1])},${Math.floor(p[2])}`;
+      if (!VoxelMap.isSolid(v) || !this.inBounds(v)) continue;
+      const q = VoxelMap.quality(v);
+      if (q >= 3) continue;
+      const p = VoxelMap.centroid(v);
+      const ck = `${Math.floor(p[0] / cell)},${Math.floor(p[1] / cell)},${Math.floor(p[2] / cell)}`;
       let c = cells.get(ck);
-      if (!c) cells.set(ck, (c = { n: 0, sx: 0, sy: 0, sz: 0 }));
-      c.n++;
+      if (!c) cells.set(ck, (c = { key: ck, count: 0, deficit: 0, sx: 0, sy: 0, sz: 0, dirs: [] }));
+      c.count++;
+      c.deficit += 3 - q;
       c.sx += p[0]; c.sy += p[1]; c.sz += p[2];
+      for (const d of v.dirs) if (c.dirs.length < 24) c.dirs.push(d);
     }
-    let best = null, bestScore = 0;
+    const out = [];
     for (const c of cells.values()) {
-      if (c.n < 4) continue;
-      const center = [c.sx / c.n, c.sy / c.n, c.sz / c.n];
-      const dir = v3.norm(v3.sub(center, camPos));
+      if (c.count < minCount) continue;
+      c.center = [c.sx / c.count, c.sy / c.count, c.sz / c.count];
+      out.push(c);
+    }
+    return out;
+  }
+
+  /** Simple nearest weak area (used when no guide is available). */
+  findGap(camPos, camFwd, maxDist = 5) {
+    let best = null, bestScore = 0;
+    for (const c of this.weakClusters(1, 4)) {
+      const dist = v3.dist(c.center, camPos);
+      if (dist < 0.4 || dist > maxDist) continue;
+      const dir = v3.norm(v3.sub(c.center, camPos));
       const facing = (v3.dot(dir, camFwd) + 1.5) / 2.5; // 0.2 (behind) .. 1 (ahead)
-      const score = c.n * facing;
+      const score = c.deficit * facing;
       if (score > bestScore) {
         bestScore = score;
-        best = { center, count: c.n };
+        best = { center: c.center, count: c.count };
       }
     }
     return best;
   }
 
-  /** Flat arrays for rendering: positions (xyz) and quality per solid voxel. */
+  /** Flat arrays for rendering: surface positions (xyz) and quality per solid voxel (4 = outside the scan area). */
   renderArrays() {
     const pos = [], qual = [];
-    const s = this.size;
     for (const v of this.vox.values()) {
       if (!VoxelMap.isSolid(v)) continue;
-      pos.push((v.ix + 0.5) * s, (v.iy + 0.5) * s, (v.iz + 0.5) * s);
-      qual.push(VoxelMap.quality(v));
+      pos.push(v.sx / v.n, v.sy / v.n, v.sz / v.n);
+      qual.push(this.inBounds(v) ? VoxelMap.quality(v) : 4);
     }
     return { pos: new Float32Array(pos), qual: new Uint8Array(qual) };
   }
+}
 
-  serialize() {
-    const out = [];
-    for (const v of this.vox.values()) {
-      if (!VoxelMap.isSolid(v)) continue;
-      out.push([v.ix, v.iy, v.iz, v.hits, v.kfs, v.dirs.map((d) => d.map((x) => Math.round(x * 100)))]);
-    }
-    return { size: this.size, voxels: out };
-  }
-
-  static deserialize(data, maxObsDist = 5) {
-    const m = new VoxelMap(data.size, maxObsDist);
-    for (const [ix, iy, iz, hits, kfs, dirs] of data.voxels) {
-      m.vox.set(m.key(ix, iy, iz), { ix, iy, iz, hits, kfs, dirs: dirs.map((d) => v3.norm(d)) });
-    }
-    return m;
-  }
+function addDir(v, dx, dy, dz) {
+  if (v.dirs.length >= MAX_DIRS) return;
+  const l = Math.hypot(dx, dy, dz) || 1;
+  const ux = dx / l, uy = dy / l, uz = dz / l;
+  for (const o of v.dirs) if (o[0] * ux + o[1] * uy + o[2] * uz > DIR_SEP_COS) return;
+  v.dirs.push([ux, uy, uz]);
 }

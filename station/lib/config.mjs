@@ -53,6 +53,7 @@ const DEFAULTS = {
   workDir: join(homedir(), 'SplatStation'),
   preset: 'standard',
   usePoses: true, // use SplatScout AR poses to guide COLMAP when available
+  cropToBounds: true, // crop splats to the scan area marked in SplatScout 2.0
   adbAutoImport: true, // pull new SplatScout ZIPs from a USB-connected phone's Download folder
   matcher: 'auto', // auto | exhaustive | sequential
   tools: {},

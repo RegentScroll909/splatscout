@@ -14,6 +14,10 @@ import { colmapText, transformsJson } from '../app/js/core/formats.js';
 import { ZipWriter, crc32 } from '../app/js/core/zip.js';
 import { Coach } from '../app/js/core/coach.js';
 import { analyzeCapture } from '../app/js/core/score.js';
+import { Bounds } from '../app/js/core/bounds.js';
+import { planPass, Guide } from '../app/js/core/guide.js';
+import { getTemplate } from '../app/js/core/plans.js';
+import { depthToPoints, unprojectIntr } from '../app/js/core/depth.js';
 
 let passed = 0;
 const near = (a, b, eps = 1e-4, msg = '') => {
@@ -147,15 +151,123 @@ test('direction sphere counts distinct viewpoints', () => {
   assert.equal(s.bins[hit[0]].distinct, 2);
 });
 
-test('voxel map counts observation angles', () => {
-  const v = new VoxelMap(0.2, 5);
-  const pts = new Float32Array([0.1, 1, -2, 0.1, 1, -2]);
-  v.observe(pts, [0, 1.5, 0], true);
-  v.observe(pts, [1.5, 1.5, -0.5], true);
-  v.observe(pts, [-1.5, 1.2, -0.5], true);
+/** A flat wall at z = -3 (x -1..1, y 0.5..2) as world points. */
+function wallPoints() {
+  const w = [];
+  for (let x = -1; x <= 1; x += 0.05) for (let y = 0.5; y <= 2; y += 0.05) w.push(x, y, -3);
+  return new Float32Array(w);
+}
+
+test('voxel map: depth noise in mid-air is carved away, real surfaces stay', () => {
+  const v = new VoxelMap(0.2, 7);
+  const wall = wallPoints();
+  for (let i = 0; i < 3; i++) v.integrate(wall, [0, 1.4, 0]);
+  // A blob of noise between the camera and the wall, seen in two frames...
+  v.integrate(new Float32Array([0.1, 1.3, -1.5]), [0, 1.4, 0]);
+  v.integrate(new Float32Array([0.1, 1.3, -1.5]), [0.05, 1.4, 0]);
+  assert.ok(v.isSolidAt(0.1, 1.3, -1.5), 'noise first looks solid');
+  // ...then the wall behind it is seen straight through it a few more times.
+  for (let i = 0; i < 6; i++) v.integrate(wall, [0, 1.4, 0]);
+  assert.ok(!v.isSolidAt(0.1, 1.3, -1.5), 'noise carved');
+  assert.ok(v.isSolidAt(0.1, 1.3, -2.99), 'wall kept');
+});
+
+test('voxel map counts the angles each surface was photographed from', () => {
+  const v = new VoxelMap(0.2, 7);
+  const wall = wallPoints();
+  const intr = { fx: 900, fy: 900, cx: 640, cy: 360, w: 1280, h: 720 };
+  const shots = [[0, 1.4, 0], [1, 1.4, 0], [-1, 1.4, 0]];
+  for (const p of shots) v.integrate(wall, p);
+  for (const p of shots) {
+    const pose = poseLookDir(p, [-p[0] / 3, 0, -1]);
+    // Depth image of the wall as this camera sees it.
+    const nx = 40, ny = 30, d = new Float32Array(nx * ny);
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const dc = [((i + 0.5) / nx * intr.w - intr.cx) / intr.fx, -((j + 0.5) / ny * intr.h - intr.cy) / intr.fy, -1];
+      const dw = [pose[0] * dc[0] + pose[4] * dc[1] + pose[8] * dc[2], pose[1] * dc[0] + pose[5] * dc[1] + pose[9] * dc[2], pose[2] * dc[0] + pose[6] * dc[1] + pose[10] * dc[2]];
+      const t = (-3 - p[2]) / dw[2];
+      const hit = [p[0] + dw[0] * t, p[1] + dw[1] * t];
+      if (t > 0 && Math.abs(hit[0]) <= 1 && hit[1] >= 0.5 && hit[1] <= 2) d[j * nx + i] = t;
+    }
+    v.observeView(pose, intr, { d, nx, ny });
+  }
   const st = v.stats();
-  assert.equal(st.solid, 1);
-  assert.equal(st.q3, 1);
+  assert.ok(st.solid > 50, 'wall mapped');
+  assert.ok(st.q3 / st.solid > 0.5, `most of the wall seen from 3 angles: ${JSON.stringify(st)}`);
+});
+
+test('depth filter drops flying pixels between a near object and the wall behind it', () => {
+  const intr = { fx: 500, fy: 500, cx: 320, cy: 240, w: 640, h: 480 };
+  const nx = 40, ny = 30, D = new Float32Array(nx * ny);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    // Near box on the left, wall on the right, and the sensor's smoothing in between.
+    D[j * nx + i] = i < 18 ? 1.5 : i === 18 ? 2.2 : i === 19 ? 3.0 : 4;
+  }
+  const pose = poseLookDir([0, 0, 0], [0, 0, -1]);
+  const r = depthToPoints(D, nx, ny, unprojectIntr(intr), pose);
+  for (let j = 1; j < ny - 1; j++) {
+    assert.equal(r.d[j * nx + 18], 0, 'smeared sample dropped');
+    assert.equal(r.d[j * nx + 19], 0, 'smeared sample dropped');
+    assert.ok(r.d[j * nx + 10] > 0 && r.d[j * nx + 30] > 0, 'surfaces kept');
+  }
+});
+
+test('scan area: outline with margin, floor, skipped spots', () => {
+  const b = new Bounds({ poly: [[0, 0], [0, 4], [6, 4], [6, 0]], floorY: 0 });
+  assert.ok(b.contains(3, 1, 2), 'inside');
+  assert.ok(b.contains(6.2, 1, 2), 'wall on the outline counts');
+  assert.ok(!b.contains(8, 1, 2), 'seen through a window');
+  assert.ok(!b.contains(3, -1, 2), 'below the floor');
+  b.addSkip([3, 1, 2], 0.5);
+  assert.ok(!b.contains(3.2, 1, 2), 'skipped spot');
+  assert.ok(Math.abs(b.area - 24) < 1e-9);
+});
+
+test('guide: a room lap faces into the room and sidesteps to the right', () => {
+  const room = getTemplate('room');
+  const b = new Bounds({ poly: [[-4, -3.5], [4, -3.5], [4, 3.5], [-4, 3.5]], floorY: 0 });
+  const st = planPass(room.passes[0].guide, b, room.passes[0], [0, 1.4, 2.4]);
+  assert.ok(st.length > 40);
+  const s0 = st[0], s1 = st[1];
+  assert.ok(Math.abs(s0.pos[2] - 2.5) < 0.05 && Math.abs(s0.pos[1] - 1.4) < 1e-6, 'starts on the near side, 1 m from the wall');
+  assert.ok(s0.aim[2] < -0.8, 'aims across the room');
+  const walk = [s1.pos[0] - s0.pos[0], s1.pos[2] - s0.pos[2]];
+  const right = [-s0.aim[2], s0.aim[0]]; // right of a horizontal heading (x, z)
+  assert.ok(walk[0] * right[0] + walk[1] * right[1] > 0, 'walks to the right');
+});
+
+test('guide: photos along the path complete the pass', () => {
+  const room = getTemplate('room');
+  const b = new Bounds({ poly: [[0, 0], [5, 0], [5, 4], [0, 4]], floorY: 0 });
+  const g = new Guide({ template: room, bounds: b, voxels: new VoxelMap(0.2, 7) });
+  g.setPass(room.passes[0], [2.5, 1.4, 3]);
+  let state = g.update({ pos: [2.5, 1.4, 3], fwd: [0, 0, -1], t: 0 });
+  assert.ok(state.next && state.instruction, 'has a target');
+  for (const st of g.stations) g.onPhoto(poseLookDir(st.pos, st.aim));
+  state = g.update({ pos: g.stations[g.stations.length - 1].pos, fwd: [0, 0, -1], t: 1 });
+  assert.equal(g.progress(), 1);
+  assert.ok(state.complete, 'pass complete');
+});
+
+test('keyframer takes sharp photos while walking (no need to stop)', () => {
+  const k = new Keyframer({ hfovDeg: 65, tracking: '6dof' });
+  let photos = 0, rushed = 0, t = 0;
+  k.committed({ t: 0, pose: poseLookDir([0, 1.4, 0], [0, 0, -1]), odo: 0 });
+  // Crab walk at 0.3 m/s, 2 m from the wall; candidates at ~8 Hz with ordinary sharpness.
+  for (let i = 0; i < 80; i++) {
+    t += 0.125;
+    const pose = poseLookDir([0.3 * t, 1.4, 0], [0, 0, -1]);
+    const novelty = k.novelty({ t, pose, depthMed: 2 });
+    if (novelty < 0.6 && !k.seeking) continue;
+    const d = k.offer({ t, relSharp: 0.7 + 0.25 * Math.sin(i * 1.7), blurRisk: 0.45, ok: true, novelty, data: null });
+    if (d) {
+      photos++;
+      if (d.rushed) rushed++;
+      k.committed({ t, pose, odo: 0 });
+    }
+  }
+  assert.ok(photos >= 10, `photos ${photos}`);
+  assert.equal(rushed, 0);
 });
 
 test('keyframer novelty grows with rotation and translation', () => {
@@ -265,6 +377,24 @@ test('station picks matching pairs from AR poses (neighbours + loop closures)', 
   assert.ok(pairs.includes('0001.jpg 0002.jpg'), 'temporal neighbour');
   assert.ok(pairs.includes('0005.jpg 0065.jpg'), 'loop closure between laps');
   assert.ok(pairs.length < (80 * 79) / 2 / 3, 'far fewer pairs than exhaustive');
+});
+
+const { cropPly } = await import('../station/lib/crop.mjs');
+test('station crops a splat to the scan area', () => {
+  // Tiny 3DGS-style PLY: x, y, z, opacity per splat.
+  const pts = [[1, 1, 1], [5, 1, 1], [1, -2, 1], [2.9, 0.5, 2.9], [3.4, 0.5, 1]]; // the last one is within the 0.5 m margin
+  const header = `ply\nformat binary_little_endian 1.0\nelement vertex ${pts.length}\nproperty float x\nproperty float y\nproperty float z\nproperty float opacity\nend_header\n`;
+  const body = Buffer.alloc(pts.length * 16);
+  pts.forEach((p, i) => { body.writeFloatLE(p[0], i * 16); body.writeFloatLE(p[1], i * 16 + 4); body.writeFloatLE(p[2], i * 16 + 8); body.writeFloatLE(i, i * 16 + 12); });
+  const dir = mkdtempSync(join(tmpdir(), 'ssc-'));
+  writeFileSync(join(dir, 'in.ply'), Buffer.concat([Buffer.from(header, 'latin1'), body]));
+  const r = cropPly(join(dir, 'in.ply'), join(dir, 'out.ply'), { poly: [[0, 0], [3, 0], [3, 3], [0, 3]], floorY: 0 });
+  assert.deepEqual(r, { kept: 3, removed: 2 }); // outside x, below the floor
+  const out = readFileSync(join(dir, 'out.ply'));
+  const txt = out.toString('latin1');
+  assert.match(txt, /element vertex 3\n/);
+  const start = txt.indexOf('end_header\n') + 11;
+  assert.deepEqual([0, 1, 2].map((i) => out.readFloatLE(start + i * 16 + 12)), [0, 3, 4]);
 });
 
 console.log(`\n${passed} checks passed`);

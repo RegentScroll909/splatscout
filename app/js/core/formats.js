@@ -91,14 +91,18 @@ export function colmapText(frames, points) {
   return { cameras: cams, images: imgs, points3D: pts, rigs, frames: frs };
 }
 
-/** Merge per-keyframe depth points and thin them to one point per `cell` metres. */
-export function mergePoints(frames, cell = 0.03) {
+/**
+ * Merge per-keyframe depth points and thin them to one point per `cell` metres.
+ * @param {(x:number, y:number, z:number) => boolean} [keep] optional filter
+ */
+export function mergePoints(frames, cell = 0.03, keep = null) {
   const seen = new Map();
   const xyz = [], rgb = [];
   for (const f of frames) {
     if (!f.pts || !f.rgb) continue;
     for (let i = 0, n = f.pts.length / 3; i < n; i++) {
       const x = f.pts[3 * i], y = f.pts[3 * i + 1], z = f.pts[3 * i + 2];
+      if (keep && !keep(x, y, z)) continue;
       const k = `${Math.floor(x / cell)},${Math.floor(y / cell)},${Math.floor(z / cell)}`;
       if (seen.has(k)) continue;
       seen.set(k, 1);

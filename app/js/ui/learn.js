@@ -5,7 +5,6 @@ import { h, mount } from './dom.js';
 const SECTIONS = [
   {
     title: 'Why capture quality decides everything',
-    open: true,
     body: `
 <p>A Gaussian splat is only as good as its photos. Training first works out where every photo was taken (structure-from-motion), then optimises millions of small coloured blobs until they reproduce the photos. Almost every bad splat traces back to the capture:</p>
 <ul>
@@ -18,10 +17,24 @@ const SECTIONS = [
 <p>SplatScout watches all of this live, so you find problems while you're still standing in the room.</p>`,
   },
   {
+    title: 'Guided capture: the fast way to a complete scan',
+    open: true,
+    body: `
+<ol>
+<li><b>Hold the phone sideways (landscape).</b> The AR camera sees 70° across in landscape but only 35° upright, so a sideways scan finishes much sooner.</li>
+<li><b>Mark the scan area.</b> When AR starts, aim the centre dot at the floor in each corner of the space and tap <b>＋ Corner</b> (or tap the spot on screen). Tap <b>Done</b>. Only surfaces inside the outline count, so you can capture half a hallway, or leave out what you can see through a window.</li>
+<li><b>Follow the path.</b> Each pass draws a glowing trail on the floor and a blue <b>aim ring</b>. Keep the ring near the centre of the screen and move the way the arrow at the bottom says ("Sidestep right"). The trail fills in on the map as you go, and the next pass starts by itself.</li>
+<li><b>Keep walking.</b> Photos are taken automatically while you move at a slow, steady pace. You don't need to stop. If you see "A little slower", ease off a bit.</li>
+<li><b>Fill the gaps.</b> The last pass sends you to the spots that still need angles: walk to the ring on the floor, aim at the red area inside the blue ring, and hold for a second. Repeat until the app says the area is complete (about <b>85%</b>).</li>
+<li><b>Skip what you can't capture.</b> Tap <b>⊘ Skip spot</b>, then tap a window, mirror or a corner you can't reach. It stops counting. Can't reach a marker? Pass sheet → <b>Skip this spot</b>.</li>
+</ol>
+<p class="small muted">Every dot doesn't have to be green. Corners behind furniture and the tops of tall cabinets rarely matter. The area percentage weighs green fully and amber half, and 85% trains well.</p>`,
+  },
+  {
     title: 'The 8 golden rules',
     body: `
 <ol>
-<li><b>Slow is fast.</b> Move at museum pace and pause for a beat now and then. The app takes the sharpest photo in each moment.</li>
+<li><b>Slow and steady.</b> Walk at museum pace without stopping. The app keeps the sharpest frame of every stretch.</li>
 <li><b>Move, don't pivot.</b> Every new photo should be taken from a slightly different <i>position</i>, not just a different angle. Sidestep ("crab walk") along walls.</li>
 <li><b>Three angles minimum.</b> Every surface should be photographed from 3 or more clearly different directions. In AR mode that's the colour: red → amber → green.</li>
 <li><b>Stay about 1 m from surfaces.</b> Closer and frames can't overlap; much farther and detail is lost. In big halls, walk up to the things that matter.</li>
@@ -37,10 +50,13 @@ const SECTIONS = [
 <ul>
 <li><b>Coach banner</b> (top): the single most important thing to fix right now. Red = stop and fix, amber = adjust, blue = tip, green = all good.</li>
 <li><b>Chips</b> (right): Speed, Sharp, Light, Detail, Depth (parallax) and Track. Keep them green.</li>
-<li><b>AR colours on surfaces</b>: <span class="red">red</span> = photographed from 1 angle, <span class="amber">amber</span> = 2 angles, <span class="green">green</span> = 3+ angles, faint blue = seen but not photographed yet.</li>
-<li><b>Cyan beacon and edge arrow</b>: the most useful area to capture next. Walk to a <i>new spot</i> and photograph it from there.</li>
-<li><b>Map</b> (bottom left): the floor plan of what's scanned, your path, and where you are. Tap it to enlarge. In camera mode it's a panorama of every direction around you.</li>
-<li><b>Pass pill</b> (top): the current step of the plan and its progress. Tap it for instructions and to switch passes.</li>
+<li><b>AR colours on surfaces</b>: <span class="red">red</span> = photographed from 1 angle, <span class="amber">amber</span> = 2 angles, <span class="green">green</span> = 3+ angles, faint blue = seen but not photographed yet, grey = outside the scan area or skipped. Dots behind walls and furniture are hidden.</li>
+<li><b>Yellow outline</b>: the scan area you marked.</li>
+<li><b>Glowing trail and chevrons on the floor</b>: the path for this pass. The arrow at the bottom says which way to step.</li>
+<li><b>Blue aim ring</b> (green when you're on target) and <b>edge arrow</b>: where to point the phone. In gap mode a ring on the floor and a ghost phone show where to stand.</li>
+<li><b>Tools</b> (left): <b>Area</b> redraws the outline, <b>⊘ Skip spot</b> stops counting a surface you tap, <b>Guide</b> shows or hides the path.</li>
+<li><b>Map</b> (bottom left): the floor plan of what's scanned, the scan area, the planned path (green where done), and where you are. Tap it to enlarge. In camera mode it's a panorama of every direction around you.</li>
+<li><b>Pass pill</b> (top): the current step of the plan and its progress. Tap it for instructions, to switch passes, or to change the scan area. <b>Area %</b> next to it is how complete the whole scan area is.</li>
 <li><b>Shutter</b> (bottom right): forces a photo. Normally unnecessary, since photos are automatic.</li>
 <li><b>Done</b>: grades the capture on the spot, so you can keep going if something's missing.</li>
 </ul>`,
@@ -95,7 +111,7 @@ const SECTIONS = [
     body: `
 <ol>
 <li>Review → <b>Export ZIP</b> → Save. On Android the ZIP goes to <i>Downloads</i>.</li>
-<li>Move it to your PC (USB cable, Quick Share, Google Drive…) and unzip it.</li>
+<li>With <b>SplatStation</b> running on the PC, plug the phone in over USB and it imports and trains the ZIP by itself. Otherwise move it to your PC (Quick Share, Google Drive…) and unzip it.</li>
 <li>Point your pipeline at <code>images/</code>. These are already sharp, well-spaced keyframes, so skip any "extract frames from video" step.</li>
 <li>All photos come from one camera with fixed settings, so treat them as a single camera (e.g. COLMAP <code>--ImageReader.single_camera 1</code>).</li>
 <li>If your pipeline only takes video: <code>ffmpeg -framerate 4 -i images/%04d.jpg -c:v libx264 -crf 14 -pix_fmt yuv420p capture.mp4</code></li>

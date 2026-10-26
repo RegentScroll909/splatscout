@@ -1,12 +1,17 @@
 // Keyframe selection: decides WHEN a new photo is needed (novelty) and WHICH frame to keep
-// (the sharpest steady frame inside a short search window).
+// (the sharpest frame seen while the photo is due). It works while walking: the search starts a
+// little before the photo is due and keeps the best frame of the stretch, it doesn't wait for the
+// user to stop.
 
 import { DEG, clamp, poseForward, posePosition, angleBetween, v3 } from './math.js';
 
+// overlap: scales the spacing between photos. minRelSharp: sharpness (relative to the best recent
+// frames) that counts as good. calmRisk: predicted motion blur below which a frame counts as good
+// regardless (a plain wall is never "sharp"). window: how long to look for a better frame once due.
 export const STRICTNESS = {
-  relaxed: { overlap: 1.25, minRelSharp: 0.5, window: 0.9 },
-  standard: { overlap: 1.0, minRelSharp: 0.6, window: 0.7 },
-  strict: { overlap: 0.8, minRelSharp: 0.72, window: 0.6 },
+  relaxed: { overlap: 1.2, minRelSharp: 0.45, calmRisk: 0.35, window: 0.35 },
+  standard: { overlap: 1.0, minRelSharp: 0.55, calmRisk: 0.25, window: 0.45 },
+  strict: { overlap: 0.8, minRelSharp: 0.7, calmRisk: 0.15, window: 0.6 },
 };
 
 export class Keyframer {
@@ -24,8 +29,8 @@ export class Keyframer {
   }
 
   setFov(hfovDeg) {
-    // ~12% of the field of view per keyframe keeps ~85% overlap between neighbours.
-    this.rotTrigger = clamp(0.12 * hfovDeg, 6, 14) * this.cfg.overlap;
+    // ~15% of the field of view per keyframe keeps ~85% overlap between neighbours.
+    this.rotTrigger = clamp(0.15 * hfovDeg, 7, 16) * this.cfg.overlap;
   }
 
   reset() {
@@ -34,6 +39,12 @@ export class Keyframer {
     this.seeking = false;
     this.seekStart = 0;
     this.best = null;
+    this.forced = false;
+  }
+
+  /** Make a photo due now (the user is standing where the guide wants a new viewpoint). */
+  request() {
+    this.forced = true;
   }
 
   /** Accumulate image motion between analysis ticks (camera mode). */
@@ -52,7 +63,8 @@ export class Keyframer {
     let trans = 0;
     if (this.tracking === '6dof' && this.last.pos) {
       const depth = s.depthMed > 0 ? s.depthMed : 2.5;
-      const trig = clamp(0.08 * depth, 0.1, 0.45) * this.cfg.overlap;
+      // About a tenth of the distance to the surfaces: ~90% overlap, plenty of parallax.
+      const trig = clamp(0.1 * depth, 0.15, 0.5) * this.cfg.overlap;
       trans = v3.dist(posePosition(s.pose), this.last.pos) / trig;
     } else {
       trans = Math.max(this.disp / (0.12 * this.cfg.overlap), Math.abs(s.odo - this.last.odo) / (0.09 * this.cfg.overlap));
@@ -60,6 +72,7 @@ export class Keyframer {
     let n = Math.max(rot, trans);
     // Don't let a slowly drifting user go too long without a photo.
     if (s.t - this.last.t > 3.5 && n > 0.35) n = Math.max(n, 1);
+    if (this.forced) n = Math.max(n, 1.05);
     return n;
   }
 
@@ -70,7 +83,7 @@ export class Keyframer {
    */
   offer(c) {
     // The user turned back towards the last photo: nothing new to capture after all.
-    if (c.novelty < 0.6 && !c.manual) {
+    if (c.novelty < 0.45 && !c.manual) {
       if (c.data && c.data.release) c.data.release();
       this.cancel();
       return null;
@@ -90,15 +103,15 @@ export class Keyframer {
     const waited = c.t - this.seekStart;
     const b = this.best;
     if (!b) return null;
-    // "Acceptable": sharp relative to recent frames, or taken while the camera was nearly still
-    // (then a low score just means a plain surface, not blur).
-    const good = b.relSharp >= this.cfg.minRelSharp || b.blurRisk < 0.15;
-    // Searching starts a little before a photo is due (novelty ~0.75), so the chosen frame lands
-    // close to the intended spacing.
-    if (c.novelty >= 0.9 && b.relSharp >= 0.9 && b.blurRisk < 0.35) return this._take(false);
-    if (c.novelty >= 1 && waited >= this.cfg.window && good) return this._take(false);
+    // "Good": sharp relative to recent frames, or taken while the camera was calm (then a low score
+    // just means a plain surface, not blur).
+    const good = b.relSharp >= this.cfg.minRelSharp || b.blurRisk < this.cfg.calmRisk;
+    // Searching starts before a photo is due (novelty ~0.6), so the chosen frame lands close to the
+    // intended spacing even while walking.
+    if (c.novelty >= 0.85 && b.relSharp >= 0.85 && b.blurRisk < 0.5) return this._take(false);
+    if (c.novelty >= 1 && good && (waited >= this.cfg.window || c.novelty >= 1.2)) return this._take(false);
     // The user is moving on: take the best we have so overlap has no hole. "Rushed" = it isn't sharp.
-    if (c.novelty >= 1.8 || waited > 2.5) return this._take(!good);
+    if (c.novelty >= 1.5 || waited > 2) return this._take(!good);
     return null;
   }
 
@@ -125,9 +138,10 @@ export class Keyframer {
       odo: s.odo || 0,
     };
     this.disp = 0;
+    this.forced = false;
   }
 }
 
 function quality(c) {
-  return c.relSharp - 0.5 * c.blurRisk;
+  return Math.min(1.1, c.relSharp) - 0.35 * c.blurRisk;
 }

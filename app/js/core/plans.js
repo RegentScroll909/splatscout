@@ -13,29 +13,31 @@ export const TEMPLATES = [
     desc: 'Classroom, office, lab, lounge: an enclosed space up to about 12 m across.',
     voxel: 0.2,
     maxObsDist: 7,
+    viewDist: 1.6,
     framesPerM2: 6,
     minFrames: 150,
+    boundsHint: 'Aim the centre dot at the floor in each corner of the room and tap ＋ Corner.',
     passes: [
       {
-        id: 'mid', name: 'Eye-level lap', height: 'chest', loop: true, bands: ['mid'],
-        short: 'Walk a slow lap close to the walls, aiming across the room.',
+        id: 'mid', name: 'Eye-level lap', height: 'chest', loop: true, bands: ['mid'], guide: { kind: 'loop', inset: 1.0, pitch: -8, yaw: 15 },
+        short: 'Follow the path around the room, about 1 m from the walls, aiming across the room.',
         steps: [
-          'Start in a corner. Hold the phone at chest height, aimed across the room.',
-          'Walk the perimeter slowly, about 1 m from the walls, with small sidesteps.',
+          'Follow the dotted path about 1 m from the walls, phone at chest height, aimed across the room.',
+          'Keep the blue ring near the centre of the screen and sidestep slowly to your right.',
           'Keep the far wall and the floor–wall line in frame.',
           'Finish a little past where you started so the loop closes.',
         ],
       },
       {
-        id: 'high', name: 'Overhead lap', height: 'high', loop: true, bands: ['low'],
+        id: 'high', name: 'Overhead lap', height: 'high', loop: true, bands: ['low'], guide: { kind: 'loop', inset: 0.9, pitch: -35, yaw: 15 },
         short: 'Same lap with the phone above your head, tilted down about 30°.',
         steps: [
           'Raise the phone above your head and tilt it down so you see the floor and the lower walls.',
-          'Walk the same loop. This captures tabletops, floor and furniture from above.',
+          'Follow the same loop. This captures tabletops, floor and furniture from above.',
         ],
       },
       {
-        id: 'low', name: 'Low lap', height: 'low', loop: true, bands: ['high'],
+        id: 'low', name: 'Low lap', height: 'low', loop: true, bands: ['high'], guide: { kind: 'loop', inset: 0.9, pitch: 28, yaw: 15 },
         short: 'Lap at waist height, tilted up about 30°.',
         steps: [
           'Hold the phone at waist or knee height, tilted up toward the ceiling–wall line.',
@@ -43,19 +45,19 @@ export const TEMPLATES = [
         ],
       },
       {
-        id: 'cross', name: 'Cross the room', height: 'chest', loop: false, bands: ['mid', 'low'],
+        id: 'cross', name: 'Cross the room', height: 'chest', loop: false, bands: ['mid', 'low'], guide: { kind: 'lanes', inset: 1.2, spacing: 1.8, pitch: -15 },
         short: 'Zig-zag through the middle, aiming at the walls and furniture.',
         steps: [
-          'Walk an X or zig-zag through the middle of the room, aimed outward at the walls.',
-          'Circle around big furniture (tables, desks, pillars) so every side is seen.',
-          'Follow the red areas in the AR view until they turn green.',
+          'Follow the zig-zag lanes through the middle of the room, aimed to the side.',
+          'Walk around big furniture where the path is blocked; blocked spots are skipped automatically.',
         ],
       },
       {
-        id: 'detail', name: 'Details & doorways', height: null, loop: false, bands: ['ceil', 'floor', 'high', 'low'],
-        short: 'Corners, ceiling, floor, and every doorway to the next space.',
+        id: 'detail', name: 'Fill the gaps', height: null, loop: false, bands: ['ceil', 'floor', 'high', 'low'], guide: { kind: 'gaps' },
+        short: 'The app picks the spots that still need angles: stand on each marker and aim at the ring.',
         steps: [
-          'Fill corners and any spot the map still shows red or empty.',
+          'Walk to the ring on the floor, then aim at the red area inside the blue ring. Each one takes a few seconds.',
+          'Can\'t get there? Tap "Skip this spot" in this sheet, or mark it with ⊘ so it no longer counts.',
           'Look straight up at the ceiling and straight down at the floor while moving slowly.',
           'For each doorway, walk through slowly in both directions so rooms can be joined later.',
         ],
@@ -69,34 +71,32 @@ export const TEMPLATES = [
     desc: 'Corridors and walkways: long, narrow, often with plain walls.',
     voxel: 0.2,
     maxObsDist: 7,
+    viewDist: 1.4,
     framesPerM2: 7,
     minFrames: 120,
+    boundsHint: 'Tap the floor at the 4 corners of the stretch you want, e.g. just half the hallway.',
     passes: [
       {
-        id: 'side-a', name: 'Crab walk — side A', height: 'chest', loop: false, bands: ['mid'],
-        short: 'Walk sideways along one wall, aimed at the opposite wall.',
+        id: 'crab', name: 'Crab walk, both walls', height: 'chest', loop: true, bands: ['mid'], guide: { kind: 'loop', inset: 0.6, pitch: -5, yaw: 30 },
+        short: 'Sidestep along each wall, aimed at the opposite wall and a little ahead.',
         steps: [
-          'Put your back near one wall and aim at the opposite wall, angled about 30° down the hall.',
-          'Sidestep down the whole hallway. Never aim straight down a long hall without moving.',
+          'Follow the path: down one wall and back along the other.',
+          'Face the opposite wall, angled about 30° down the hall, and sidestep. Never aim straight down a long hall without moving.',
         ],
       },
       {
-        id: 'side-b', name: 'Crab walk — side B', height: 'chest', loop: false, bands: ['mid'],
-        short: 'Come back along the other wall.',
-        steps: ['Switch walls and sidestep back, aimed at the first wall, now angled the other way.'],
+        id: 'center-high', name: 'Centre, phone high', height: 'high', loop: true, bands: ['low'], guide: { kind: 'loop', inset: 'center', pitch: -35, yaw: 20 },
+        short: 'Down the middle and back with the phone overhead, tilted down.',
+        steps: ['Raise the phone above your head, tilt it down at the floor and lower walls, and follow the path.'],
       },
       {
-        id: 'center', name: 'Centre line, two heights', height: null, loop: false, bands: ['low', 'high'],
-        short: 'Walk the middle forward and back, once high and once low.',
-        steps: [
-          'Walk down the middle with the phone overhead, tilted down.',
-          'Walk back at waist height, tilted up to catch the ceiling.',
-          'Sweep gently left and right as you go, so walls are seen at an angle.',
-        ],
+        id: 'center-low', name: 'Centre, phone low', height: 'low', loop: true, bands: ['high'], guide: { kind: 'loop', inset: 'center', pitch: 28, yaw: 20 },
+        short: 'Down the middle and back at waist height, tilted up.',
+        steps: ['Hold the phone at waist height, tilted up at the ceiling and upper walls, and follow the path.'],
       },
       {
-        id: 'detail', name: 'Doors, ends & features', height: null, loop: false, bands: ['ceil', 'floor', 'high', 'low'],
-        short: 'Doorways, end walls, signage, fountains, display cases.',
+        id: 'detail', name: 'Doors, ends & features', height: null, loop: false, bands: ['ceil', 'floor', 'high', 'low'], guide: { kind: 'gaps' },
+        short: 'Fill the remaining gaps: doorways, end walls, signage, display cases.',
         steps: [
           'Capture each end wall from a few steps away, moving side to side.',
           'Step into each doorway and out again so connected rooms can be linked.',
@@ -111,11 +111,13 @@ export const TEMPLATES = [
     desc: 'Lecture hall, atrium, lobby, gym, library floor: bigger than about 12 m.',
     voxel: 0.35,
     maxObsDist: 12,
+    viewDist: 2.5,
     framesPerM2: 3,
     minFrames: 300,
+    boundsHint: 'Tap the floor at the corners of the space (or of the part you want to capture).',
     passes: [
       {
-        id: 'perimeter', name: 'Perimeter lap', height: 'chest', loop: true, bands: ['mid'],
+        id: 'perimeter', name: 'Perimeter lap', height: 'chest', loop: true, bands: ['mid'], guide: { kind: 'loop', inset: 1.5, pitch: -5, yaw: 20 },
         short: 'Lap around the edge, aimed into the space.',
         steps: [
           'Walk the outside edge slowly, aimed across the hall.',
@@ -123,7 +125,7 @@ export const TEMPLATES = [
         ],
       },
       {
-        id: 'lanes', name: 'Lanes', height: 'chest', loop: false, bands: ['mid', 'low'],
+        id: 'lanes', name: 'Lanes', height: 'chest', loop: false, bands: ['mid', 'low'], guide: { kind: 'lanes', inset: 2, spacing: 3, pitch: -10 },
         short: 'Walk parallel lanes about 3 m apart (lawnmower pattern).',
         steps: [
           'Cross the hall in straight lanes about 3 m apart, aimed to one side.',
@@ -132,12 +134,12 @@ export const TEMPLATES = [
         ],
       },
       {
-        id: 'up', name: 'Ceiling & upper walls', height: 'low', loop: true, bands: ['high', 'ceil'],
+        id: 'up', name: 'Ceiling & upper walls', height: 'low', loop: true, bands: ['high', 'ceil'], guide: { kind: 'loop', inset: 1.5, pitch: 35, yaw: 15 },
         short: 'Lap again, tilted up at balconies, ceiling and upper walls.',
         steps: ['Tilt up about 40° and walk another lap. Move slower: things far away blur more.'],
       },
       {
-        id: 'detail', name: 'Features up close', height: null, loop: false, bands: ['low', 'floor', 'mid'],
+        id: 'detail', name: 'Features up close', height: null, loop: false, bands: ['low', 'floor', 'mid'], guide: { kind: 'gaps' },
         short: 'Get within about 2 m of important features and orbit them.',
         steps: [
           'Far surfaces get few pixels. Walk up to stages, podiums, plaques and art, then orbit them.',
@@ -153,8 +155,10 @@ export const TEMPLATES = [
     desc: 'Stairs, landings and vertical spaces.',
     voxel: 0.2,
     maxObsDist: 6,
+    viewDist: 1.3,
     framesPerM2: 10,
     minFrames: 150,
+    boundsHint: 'Stairwells span several floors, so you can skip this step.',
     passes: [
       {
         id: 'up', name: 'Walk up', height: 'chest', loop: false, bands: ['mid', 'high'],
@@ -183,26 +187,29 @@ export const TEMPLATES = [
     desc: 'Statue, display case, fireplace, architectural detail: something you can walk around.',
     voxel: 0.1,
     maxObsDist: 3,
+    viewDist: 1.0,
+    boundsMargin: 0.5,
     framesPerM2: 0,
     minFrames: 90,
+    boundsHint: 'Tap the floor at 3–4 points around the base of the object.',
     passes: [
       {
-        id: 'ring-mid', name: 'Orbit — eye level', height: 'chest', loop: true, bands: ['mid'],
+        id: 'ring-mid', name: 'Orbit — eye level', height: 'chest', loop: true, bands: ['mid'], guide: { kind: 'orbit', radius: 1.2, pitch: -10 },
         short: 'Circle the object at about 1–1.5 m, always aimed at it.',
         steps: ['Keep the object centred and a constant distance away. About one photo per 10°.'],
       },
       {
-        id: 'ring-high', name: 'Orbit — from above', height: 'high', loop: true, bands: ['low'],
+        id: 'ring-high', name: 'Orbit — from above', height: 'high', loop: true, bands: ['low'], guide: { kind: 'orbit', radius: 1.0, pitch: -40 },
         short: 'Circle again from above, tilted down.',
         steps: ['Raise the phone and look down at the top of the object while circling.'],
       },
       {
-        id: 'ring-low', name: 'Orbit — from below', height: 'low', loop: true, bands: ['high'],
+        id: 'ring-low', name: 'Orbit — from below', height: 'low', loop: true, bands: ['high'], guide: { kind: 'orbit', radius: 1.0, pitch: 22 },
         short: 'Circle again from low, tilted up.',
         steps: ['Crouch and look up at the underside and the base while circling.'],
       },
       {
-        id: 'context', name: 'Context ring', height: 'chest', loop: true, bands: ['mid', 'low'],
+        id: 'context', name: 'Context ring', height: 'chest', loop: true, bands: ['mid', 'low'], guide: { kind: 'orbit', radius: 2.2, pitch: -15 },
         short: 'One wider circle (2–3 m) so the object sits in its surroundings.',
         steps: ['Step back and circle once more, including the floor and nearby walls.'],
       },
@@ -215,12 +222,14 @@ export const TEMPLATES = [
     desc: 'No plan. Just follow the coverage map and the live tips.',
     voxel: 0.2,
     maxObsDist: 7,
+    viewDist: 1.6,
     framesPerM2: 6,
     minFrames: 100,
+    boundsHint: 'Tap the floor at the corners of the area you want to capture, or skip.',
     passes: [
       {
-        id: 'free', name: 'Free capture', height: null, loop: false, bands: ['floor', 'low', 'mid', 'high', 'ceil'],
-        short: 'Cover everything. Follow the red areas until the map is green.',
+        id: 'free', name: 'Free capture', height: null, loop: false, bands: ['floor', 'low', 'mid', 'high', 'ceil'], guide: { kind: 'gaps' },
+        short: 'Cover everything. Follow the markers to the spots that still need angles.',
         steps: ['Move slowly, keep about 1 m from surfaces, and step sideways often.'],
       },
     ],
@@ -264,5 +273,5 @@ export const PREFLIGHT = [
   { id: 'people', text: 'No people or moving things in the space. Ask others to step out.' },
   { id: 'doors', text: 'Doors and chairs set how you want them archived. Don\'t move anything mid-capture.' },
   { id: 'battery', text: 'Battery over 40% and at least 2 GB free.' },
-  { id: 'orientation', text: 'Pick portrait or landscape and keep it for the whole capture.' },
+  { id: 'orientation', text: 'Hold the phone sideways (landscape) and keep it that way. It sees twice as wide, so the scan finishes much faster.' },
 ];

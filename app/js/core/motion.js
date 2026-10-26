@@ -72,12 +72,20 @@ export class Parallax3DoF {
   }
 }
 
-/** Expected motion blur risk (0..1) from rotation and translation speed. */
-export function blurRisk(rotSpeedDeg, linSpeed, depthM, hfovDeg) {
-  // Image motion as a fraction of the frame width per second.
-  const rotFrac = rotSpeedDeg / hfovDeg;
-  const linFrac = linSpeed != null && depthM > 0 ? (linSpeed / depthM) / (2 * Math.tan((hfovDeg * DEG) / 2)) : 0;
-  const frac = rotFrac + linFrac;
-  // ~8%/s is safe indoors; ~40%/s almost always blurs.
-  return clamp((frac - 0.08) / 0.32, 0, 1);
+/**
+ * Expected motion blur risk (0..1) from rotation and translation speed: the image motion in pixels
+ * during a typical indoor exposure (~1/60 s), measured at a 1920 px long side (the resolution splats
+ * are trained at). ~1.5 px is invisible, ~8 px is clearly smeared. Using the camera's real focal
+ * length matters: the Pixel's AR camera is only ~35° wide in portrait, so a frame-width measure would
+ * call gentle motion blurry.
+ * @param {number} rotSpeedDeg rotation speed (°/s)
+ * @param {number|null} linSpeed translation speed (m/s), null when unknown
+ * @param {number} depthM distance to the surfaces (m)
+ * @param {{fx:number, w:number, h:number}} [intr] camera intrinsics
+ */
+export function blurRisk(rotSpeedDeg, linSpeed, depthM, intr) {
+  const f = intr && intr.fx ? (intr.fx * 1920) / Math.max(intr.w, intr.h) : 1500;
+  const ang = rotSpeedDeg * DEG + (linSpeed != null && depthM > 0 ? linSpeed / depthM : 0);
+  const px = (ang * f) / 60;
+  return clamp((px - 1.5) / 6.5, 0, 1);
 }

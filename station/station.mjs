@@ -297,7 +297,7 @@ const server = createServer(async (req, res) => {
       return sendJson(res, {
         tools: Object.fromEntries(Object.entries(cfg.tools).map(([k, v]) => [k, v ? basename(v) : null])),
         workDir: cfg.workDir, inbox: cfg.dirs.inbox, library: cfg.dirs.library,
-        preset: cfg.preset, presets: PRESETS, usePoses: cfg.usePoses, adbAutoImport: cfg.adbAutoImport,
+        preset: cfg.preset, presets: PRESETS, usePoses: cfg.usePoses, cropToBounds: cfg.cropToBounds !== false, adbAutoImport: cfg.adbAutoImport,
         lan: lanUrls(), gpu, phone: phone.status, running: current ? current.job.id : null,
       });
     }
@@ -315,6 +315,7 @@ const server = createServer(async (req, res) => {
       const b = await readBody(req);
       if (b.preset && PRESETS[b.preset]) cfg.preset = b.preset;
       if (typeof b.usePoses === 'boolean') cfg.usePoses = b.usePoses;
+      if (typeof b.cropToBounds === 'boolean') cfg.cropToBounds = b.cropToBounds;
       if (typeof b.adbAutoImport === 'boolean') cfg.adbAutoImport = b.adbAutoImport;
       saveConfig(cfg);
       return sendJson(res, { ok: true });

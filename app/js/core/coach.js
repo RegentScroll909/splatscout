@@ -47,9 +47,9 @@ const RULES = [
   },
   {
     id: 'blur', level: 'warn', on: 0.8, off: 1.2, voice: 'Frames are blurry',
-    test: (s) => s.relSharp < 0.55 && s.blurRisk > 0.3 && {
+    test: (s) => s.relSharp < 0.45 && s.blurRisk > 0.45 && {
       title: 'Frames are blurry',
-      detail: 'Move slower and pause for a beat at each spot. Brace your elbows against your body.',
+      detail: 'Move a little slower and keep the phone steady, elbows in. You don\'t need to stop.',
     },
   },
   {
@@ -96,9 +96,9 @@ const RULES = [
   },
   {
     id: 'speedwarn', level: 'warn', on: 0.6, off: 0.8, voice: null,
-    test: (s, L) => (s.rotSpeed > L.rotWarn || (s.linSpeed != null ? s.linSpeed > L.linWarn : s.flowSpeed > L.flowWarn)) && {
+    test: (s, L) => (s.rotSpeed > L.rotWarn || s.blurRisk > 0.75 || (s.linSpeed != null ? s.linSpeed > L.linWarn : s.flowSpeed > L.flowWarn)) && {
       title: 'A little slower',
-      detail: 'Slow and steady gives sharper photos and more overlap.',
+      detail: s.depthMed > 0 && s.depthMed < 1.2 ? 'Close to a surface, the view slides by fast. Slow down or step back a little.' : 'A steady walking pace gives sharper photos and more overlap.',
     },
   },
   {

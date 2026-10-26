@@ -1,5 +1,5 @@
 // The capture engine: consumes frames from a source (AR, camera or practice), analyses quality,
-// tracks coverage, picks sharp keyframes, coaches the user and saves photos.
+// tracks coverage, picks sharp keyframes, guides and coaches the user, and saves photos.
 
 import { analyzeImage, downsample2, FlowTracker, SharpnessReference } from '../core/analyzer.js';
 import { DirectionSphere, VoxelMap } from '../core/coverage.js';
@@ -7,16 +7,20 @@ import { Keyframer } from '../core/keyframer.js';
 import { Coach } from '../core/coach.js';
 import { MotionWindow, Parallax3DoF, blurRisk } from '../core/motion.js';
 import { heightHint } from '../core/plans.js';
+import { Bounds, polyArea, polyCentroid } from '../core/bounds.js';
+import { Guide } from '../core/guide.js';
+import { boundsGeometry, chevronTrail, standMarker, ghostPhone, cursorGeometry } from './guideDraw.js';
 import { crc32 } from '../core/zip.js';
 import {
-  DEG, v3, angularVelocity, dirToAzEl, fovFromIntrinsics, posePosition, poseForward, rotationDelta, clamp,
+  DEG, v3, angularVelocity, dirToAzEl, fovFromIntrinsics, posePosition, poseForward, rotationDelta, clamp, transformDir, percentile,
 } from '../core/math.js';
 import * as store from '../data/store.js';
 import { uid } from '../data/store.js';
 
 const ANALYSIS_INTERVAL = 0.1; // s
-const DEPTH_SEEN_INTERVAL = 0.5; // s
-const GUIDE_INTERVAL = 1.0; // s
+const DEPTH_SEEN_INTERVAL = 0.25; // s
+const GUIDE_INTERVAL = 0.5; // s
+const AREA_DONE = 0.85; // weighted surface coverage that counts as a complete scan area
 
 export class CaptureSession {
   /**
@@ -54,6 +58,22 @@ export class CaptureSession {
     this.motionWin = new MotionWindow(3);
     this.par3 = null;
 
+    // Scan area. A new AR session has its own coordinates, so an earlier area only carries over in
+    // the practice room (its coordinates never change).
+    this.bounds = null;
+    if (this.sixdof && capture.bounds && (capture.bounds.segment === this.segment || String(capture.engine).startsWith('demo'))) {
+      this.bounds = Bounds.from({ ...capture.bounds, segment: this.segment });
+      if (this.bounds) this.voxels.setBounds(this.bounds);
+    }
+    this.guide = this.sixdof ? new Guide({ template, bounds: this.bounds, voxels: this.voxels }) : null;
+    this.guidePending = true;
+    this.boundsDraft = null; // {corners: [[x, z], ...]} while the user marks the scan area
+    this.boundsCursor = null;
+    this.floorHits = [];
+    this.events = []; // {type, ...} for the UI: pass complete, next pass, area complete
+    this.passCompleteAt = 0;
+    this.areaDone = false;
+
     this.recording = false;
     this.paused = false;
     this.manualPending = false;
@@ -65,6 +85,9 @@ export class CaptureSession {
     this.t0 = 0;
     this.lastT = 0;
     this.prevPose = null;
+    this.lastPose = null;
+    this.displayIntr = null;
+    this.lastHit = null;
     this.rotSpeed = 0;
     this.linSpeed = this.sixdof ? 0 : null;
     this.lastAnalysis = null;
@@ -81,7 +104,7 @@ export class CaptureSession {
     this.gapUntil = 0;
     this.lensUntil = 0;
     this.prevMean = null;
-    this.target = null; // {point | dir, text}
+    this.target = null; // {point | dir, title, detail, kind}
     this.stats = {
       activeSec: (capture.stats && capture.stats.activeSec) || 0,
       lostSec: (capture.stats && capture.stats.lostSec) || 0,
@@ -91,7 +114,7 @@ export class CaptureSession {
     };
     this.baseWarnings = { ...((capture.stats && capture.stats.warnings) || {}) };
     this.live = {
-      t: 0, trackState: 'n/a', chips: {}, primary: null, passProgress: 0, coverage: 0,
+      t: 0, trackState: 'n/a', chips: {}, primary: null, passProgress: 0, coverage: 0, guide: null,
       targetScreen: null, height: null, camRes: '', depth: false, frames: this.frames.length,
     };
   }
@@ -112,6 +135,7 @@ export class CaptureSession {
     this.live.depth = !!this.source.info.depth;
     this.recording = true;
     this.paused = false;
+    this._boundsDirty = true;
   }
 
   pause() {
@@ -126,10 +150,20 @@ export class CaptureSession {
 
   setPass(i) {
     this.passIndex = clamp(i, 0, this.template.passes.length - 1);
+    this._resetPassGuide();
   }
 
   nextPass() {
-    if (this.passIndex < this.template.passes.length - 1) this.passIndex++;
+    if (this.passIndex < this.template.passes.length - 1) {
+      this.passIndex++;
+      this._resetPassGuide();
+    }
+  }
+
+  _resetPassGuide() {
+    this.guidePending = true;
+    this.passCompleteAt = 0;
+    this.lastGuide = 0;
   }
 
   shoot() {
@@ -160,6 +194,139 @@ export class CaptureSession {
     await store.putCapture(this.capture);
   }
 
+  // ------------------------------------------------------------------ scan area
+
+  /** Start marking the scan area. Photos pause until it's done or skipped. */
+  beginBounds() {
+    this.boundsDraft = { corners: [] };
+    this.pause();
+  }
+
+  /** The floor point under a screen point (CSS pixels), or null. */
+  floorPoint(sx, sy) {
+    const pose = this.lastPose, di = this.displayIntr;
+    if (!pose || !di) return null;
+    const fy = this.floorHeight();
+    const d = v3.norm(transformDir(pose, [(sx - di.cx) / di.fx, -(sy - di.cy) / di.fy, -1]));
+    const o = posePosition(pose);
+    if (d[1] > -0.03) return null;
+    const t = (fy - o[1]) / d[1];
+    if (!(t > 0.2 && t < 20)) return null;
+    return [o[0] + d[0] * t, fy, o[2] + d[2] * t];
+  }
+
+  /** True once there's evidence where the floor is (AR floor hits, mapped floor, or a scan area). */
+  floorKnown() {
+    return !!(this.bounds && this.bounds.poly) || this.floorHits.length >= 3 || this.voxels.floorY() != null;
+  }
+
+  /** The floor point under the centre dot (AR hit test when it lands on the floor). */
+  centerFloorPoint() {
+    const di = this.displayIntr;
+    if (!di || !this.floorKnown()) return null;
+    const fy = this.floorHeight();
+    const h = this.lastHit;
+    if (h && Math.abs(h.p[1] - fy) < 0.15) return [h.p[0], fy, h.p[2]];
+    return this.floorPoint(di.w / 2, di.h / 2);
+  }
+
+  /** The surface under a screen point (from the coverage map), or null. */
+  surfacePoint(sx, sy) {
+    const pose = this.lastPose, di = this.displayIntr;
+    if (!pose || !di) return null;
+    const d = v3.norm(transformDir(pose, [(sx - di.cx) / di.fx, -(sy - di.cy) / di.fy, -1]));
+    const hit = this.voxels.raycast(posePosition(pose), d, 10, 0.2);
+    return hit ? hit.point : null;
+  }
+
+  addCorner(p) {
+    if (!this.boundsDraft || !p) return false;
+    this.boundsDraft.corners.push([p[0], p[2]]);
+    return true;
+  }
+
+  undoCorner() {
+    if (this.boundsDraft) this.boundsDraft.corners.pop();
+  }
+
+  draftArea() {
+    const c = this.boundsDraft ? this.boundsDraft.corners : [];
+    return c.length >= 3 ? Math.abs(polyArea(c)) : 0;
+  }
+
+  finishBounds() {
+    const c = this.boundsDraft && this.boundsDraft.corners;
+    if (!c || c.length < 3) return false;
+    const skips = this.bounds ? this.bounds.skips : [];
+    this.setBounds(new Bounds({ poly: c, floorY: this.floorHeight(), margin: this.template.boundsMargin || 0.35, skips, segment: this.segment }));
+    this.boundsDraft = null;
+    this.boundsCursor = null;
+    this.resume();
+    return true;
+  }
+
+  cancelBounds() {
+    this.boundsDraft = null;
+    this.boundsCursor = null;
+    this._boundsDirty = true;
+    this.resume();
+  }
+
+  setBounds(b) {
+    this.bounds = b;
+    this.voxels.setBounds(b);
+    if (this.guide) this.guide.setBounds(b);
+    this.capture.bounds = b ? b.toJSON() : null;
+    this._boundsDirty = true;
+    this.areaDone = false;
+    this._resetPassGuide();
+  }
+
+  /** Stop counting the surface around p (windows, mirrors, places you can't reach). */
+  skipSpot(p, r = 0.5) {
+    if (!p) return false;
+    if (!this.bounds) {
+      this.bounds = new Bounds({ poly: null, floorY: null, segment: this.segment });
+      this.voxels.setBounds(this.bounds);
+      if (this.guide) this.guide.bounds = this.bounds;
+    }
+    this.bounds.addSkip(p, r);
+    this.voxels.boundsChanged();
+    this.capture.bounds = this.bounds.toJSON();
+    if (this.guide) this.guide.gap = null;
+    return true;
+  }
+
+  undoSkip() {
+    if (!this.bounds || !this.bounds.skips.length) return false;
+    this.bounds.removeLastSkip();
+    this.voxels.boundsChanged();
+    this.capture.bounds = this.bounds.toJSON();
+    return true;
+  }
+
+  /** Skip the spot the guide is currently pointing at. */
+  skipGuideSpot() {
+    if (this.guide) this.guide.skipGap(this.lastT);
+    this.lastGuide = 0;
+  }
+
+  /** Best floor height estimate: the scan area's, else AR floor hits, else the coverage map. */
+  floorHeight() {
+    if (this.bounds && this.bounds.poly) return this.bounds.floorY;
+    if (this.floorHits.length >= 3) return percentile(this.floorHits, 0.2);
+    const fy = this.voxels.floorY();
+    if (fy != null) return fy;
+    if (this.startY != null) return this.startY - 1.35;
+    return this.lastPose ? this.lastPose[13] - 1.35 : 0;
+  }
+
+  /** Where the practice room's autopilot should walk and aim next. */
+  autopilotTarget() {
+    if (!this.guide || !this.lastPose || this.boundsDraft) return null;
+    return this.guide.autopilot(posePosition(this.lastPose));
+  }
+
   // ------------------------------------------------------------------ per frame
   _onFrame(fi) {
     const t = fi.t;
@@ -171,7 +338,15 @@ export class CaptureSession {
     L.t = t;
     L.trackState = fi.trackState;
     if (fi.intr) L.camRes = `${fi.intr.w}×${fi.intr.h}`;
+    if (fi.displayIntr) this.displayIntr = fi.displayIntr;
+    this.lastHit = fi.hit || null;
 
+    // Photo spacing when turning follows the real field of view (the Pixel's AR camera is 70° x 35°).
+    if (fi.intr && !this.fovSet) {
+      const fov = fovFromIntrinsics(fi.intr);
+      this.keyframer.setFov((fov.h + fov.v) / 2);
+      this.fovSet = true;
+    }
     // Orientation lock: portrait/landscape must not change mid-capture.
     if (fi.intr) {
       const portrait = fi.intr.h > fi.intr.w;
@@ -186,6 +361,7 @@ export class CaptureSession {
       return;
     }
     const pose = fi.pose;
+    this.lastPose = pose;
     const pos = posePosition(pose);
     const fwd = poseForward(pose);
     const tracked6 = this.sixdof && fi.trackState === 'ok';
@@ -202,7 +378,13 @@ export class CaptureSession {
     this.prevPose = pose;
     if (this.startY === null && tracked6) this.startY = pos[1];
 
-    // Depth: median distance, and "seen geometry" integration.
+    // Floor: horizontal AR hits well below the phone (the lowest ones, so tabletops don't count).
+    if (fi.hit && fi.hit.n && fi.hit.n[1] > 0.9 && fi.hit.p[1] < pos[1] - 0.5 && fi.hit.p[1] > pos[1] - 2.3) {
+      this.floorHits.push(fi.hit.p[1]);
+      if (this.floorHits.length > 60) this.floorHits.shift();
+    }
+
+    // Depth: median distance, and the coverage map (surfaces seen, empty space carved).
     if (fi.depth && tracked6) {
       if (t - this.lastMed > 0.25) {
         this.lastMed = t;
@@ -210,9 +392,15 @@ export class CaptureSession {
       }
       if (t - this.lastDepthSeen > DEPTH_SEEN_INTERVAL && this.recording) {
         this.lastDepthSeen = t;
-        const g = fi.depth.grid(16, 12);
-        if (g.xyz.length) this.voxels.observe(g.xyz, pos, false);
+        const g = fi.depth.grid(24, 18);
+        if (g.xyz.length) this.voxels.integrate(g.xyz, pos);
       }
+    }
+
+    // Marking the scan area: the floor cursor follows the centre dot.
+    if (this.boundsDraft) {
+      this.boundsCursor = this.centerFloorPoint();
+      this._drawBoundsDraft();
     }
 
     // Image analysis at ~10 Hz.
@@ -225,33 +413,39 @@ export class CaptureSession {
         .finally(() => (this.analysisPending = false));
     }
 
-    // Keyframe selection.
+    // Keyframe selection. Candidates are evaluated whenever a photo is (nearly) due, also while
+    // moving: the keyframer keeps the sharpest one instead of waiting for the user to stop.
     const canShoot = this.recording && !this.paused && !this.orientationChanged && fi.requestCandidate &&
       !(this.sixdof && fi.trackState === 'lost');
+    // Standing on a gap marker, aimed at the ring: that's the photo the guide asked for.
+    const gs = this.live.guide;
+    if (canShoot && gs && gs.mode === 'gaps' && gs.next && this.guide.gap === gs.next && !this.keyframer.forced) {
+      const at = Math.hypot(gs.next.pos[0] - pos[0], gs.next.pos[2] - pos[2]) < 0.6;
+      const aimed = v3.dot(fwd, gs.next.aim) > Math.cos(22 * DEG);
+      const last = this.frames.length ? this.frames[this.frames.length - 1] : null;
+      const recent = last && last.segment === this.segment && this.t0 + last.t > t - 1;
+      if (at && aimed && !recent && this.rotSpeed < 25) this.keyframer.request();
+    }
     if (canShoot && !this.candidatePending && this.saving < 4) {
       const kstate = { t, pose, odo: this.par3 ? this.par3.odo : 0, depthMed: this.depthMed };
       const novelty = this.keyframer.novelty(kstate);
-      const want = this.manualPending || novelty >= 0.75 || this.keyframer.seeking;
+      const want = this.manualPending || novelty >= 0.6 || this.keyframer.seeking;
       if (want && t - (this.lastCand || 0) >= 0.12) {
-        const hfov = fi.intr ? fovFromIntrinsics(fi.intr).h : 65;
-        const risk = blurRisk(this.rotSpeed, this.linSpeed, this.depthMed || 2.5, hfov);
-        const waited = this.keyframer.seeking ? t - this.keyframer.seekStart : 0;
-        if (this.manualPending || risk < 0.55 || waited > 0.6) {
-          const snap = {
-            t, pose: pose.slice(), intr: { ...fi.intr }, novelty, risk, tracked: tracked6,
-            rotSpeed: this.rotSpeed, linSpeed: this.linSpeed, depthMed: this.depthMed,
-            odo: this.par3 ? this.par3.odo : 0, height: this.live.height,
-            depth: fi.depth && tracked6 ? fi.depth.grid(40, 30) : null,
-            manual: this.manualPending, pass: this.pass.id,
-          };
-          this.manualPending = false;
-          this.candidatePending = true;
-          this.lastCand = t;
-          fi.requestCandidate()
-            .then((c) => this._onCandidate(c, snap))
-            .catch((e) => console.warn('candidate', e))
-            .finally(() => (this.candidatePending = false));
-        }
+        const risk = blurRisk(this.rotSpeed, this.linSpeed, this.depthMed || 2.5, fi.intr);
+        const snap = {
+          t, pose: pose.slice(), intr: { ...fi.intr }, novelty, risk, tracked: tracked6,
+          rotSpeed: this.rotSpeed, linSpeed: this.linSpeed, depthMed: this.depthMed,
+          odo: this.par3 ? this.par3.odo : 0, height: this.live.height,
+          depth: fi.depth && tracked6 ? fi.depth.grid(40, 30) : null,
+          manual: this.manualPending, pass: this.pass.id,
+        };
+        this.manualPending = false;
+        this.candidatePending = true;
+        this.lastCand = t;
+        fi.requestCandidate()
+          .then((c) => this._onCandidate(c, snap))
+          .catch((e) => console.warn('candidate', e))
+          .finally(() => (this.candidatePending = false));
       }
       // Nothing usable for a long time while a photo is due: that's an overlap gap.
       if (this.keyframer.seeking && !this.keyframer.best && t - this.keyframer.seekStart > 3) {
@@ -264,14 +458,36 @@ export class CaptureSession {
     // Guidance target and overlay data.
     if (t - this.lastGuide > GUIDE_INTERVAL) {
       this.lastGuide = t;
-      this._updateGuidance(pos, fwd, tracked6);
+      this._updateGuidance(pos, fwd, tracked6, t);
     }
-    if (t - this.lastOverlay > 0.25) {
+    if (t - this.lastOverlay > 0.2) {
       this.lastOverlay = t;
       this._updateOverlay(pos, fwd);
     }
-    L.targetScreen = this.target && fi.toScreen ? fi.toScreen(this.target.point || this.target.dir, !this.target.point) : null;
+    const tp = this.target && (this.target.point || this.target.dir);
+    L.targetScreen = tp && fi.toScreen ? fi.toScreen(tp, !this.target.point) : null;
+    L.aimOk = !!(this.target && this.target.point && v3.dot(fwd, v3.norm(v3.sub(this.target.point, pos))) > Math.cos(12 * DEG));
+    L.walk = this._walkHint(pos, pose);
     L.pose = pose;
+  }
+
+  /** Which way to walk to the guide's next point, relative to where the phone faces: {angle (deg, 0 = ahead, 90 = right), dist}. */
+  _walkHint(pos, pose) {
+    const gs = this.live.guide;
+    if (!gs || !gs.next || this.paused || this.boundsDraft) return null;
+    let goal = gs.next.pos;
+    const S = gs.mode === 'path' && this.guide.stations;
+    if (S && gs.distTo < 1.2) goal = S[Math.min(S.length - 1, S.indexOf(gs.next) + 1)].pos;
+    const vx = goal[0] - pos[0], vz = goal[2] - pos[2];
+    const dist = Math.hypot(vx, vz);
+    if (dist < 0.25) return null;
+    // Heading = where the phone points, or the top of the screen when it points straight down.
+    let f = poseForward(pose);
+    if (Math.abs(f[1]) > 0.95) f = [pose[4], 0, pose[6]];
+    const l = Math.hypot(f[0], f[2]) || 1;
+    const fx = f[0] / l, fz = f[2] / l;
+    const angle = Math.atan2(vx * -fz + vz * fx, vx * fx + vz * fz) / DEG;
+    return { angle, dist };
   }
 
   // ------------------------------------------------------------------ analysis tick
@@ -318,11 +534,13 @@ export class CaptureSession {
     let height = null;
     if (this.sixdof) {
       const y = snap.pose[13];
-      if (this.floorY !== null && y - this.floorY > 0.15 && y - this.floorY < 3) height = y - this.floorY;
+      const fy = this.bounds && this.bounds.poly ? this.bounds.floorY : this.floorY;
+      if (fy !== null && y - fy > 0.15 && y - fy < 3) height = y - fy;
       else if (this.startY !== null) height = 1.35 + (y - this.startY);
     }
     this.live.height = height;
 
+    const marking = !!this.boundsDraft;
     const signals = {
       t: snap.t,
       trackState: this.live.trackState,
@@ -330,7 +548,7 @@ export class CaptureSession {
       linSpeed: this.sixdof ? this.linSpeed : null,
       flowSpeed,
       relSharp,
-      blurRisk: blurRisk(this.rotSpeed, this.linSpeed, this.depthMed || 2.5, snap.intr ? fovFromIntrinsics(snap.intr).h : 65),
+      blurRisk: blurRisk(this.rotSpeed, this.linSpeed, this.depthMed || 2.5, snap.intr),
       mean: A.mean,
       clipHi: A.clipHi,
       clipLo: A.clipLo,
@@ -342,21 +560,34 @@ export class CaptureSession {
       lensSwitch: snap.t < this.lensUntil,
       exposureJumps: this.expJumps.length,
       heightHint: this.recording && !this.paused ? heightHint(this.pass, height) : null,
-      guidance: this.paused
-        ? { title: 'Paused', detail: 'Tap ▶ to continue capturing.' }
-        : this.target
-          ? { title: this.target.title, detail: this.target.detail }
-          : null,
+      guidance: marking
+        ? this._boundsGuidance()
+        : this.paused
+          ? { title: 'Paused', detail: 'Tap ▶ to continue capturing.' }
+          : this.target
+            ? { title: this.target.title, detail: this.target.detail }
+            : null,
       goodTitle: 'Looking good — keep going',
       goodDetail: this.pass.short,
     };
     const res = this.coach.update(signals);
+    // While marking the scan area, the instructions matter more than capture tips.
+    if (marking && res.primary && res.primary.level !== 'bad') res.primary = { id: 'bounds', level: 'info', ...signals.guidance };
     Object.assign(this.live, {
       primary: res.primary,
       active: res.active,
       chips: res.chips,
       metrics: { ...A, relSharp, flowSpeed, rotSpeed: this.rotSpeed, linSpeed: this.linSpeed, depthMed: this.depthMed },
     });
+  }
+
+  _boundsGuidance() {
+    const n = this.boundsDraft.corners.length;
+    if (!this.floorKnown()) return { title: 'Finding the floor…', detail: 'Point the phone at the floor and move it slowly from side to side.' };
+    if (!this.boundsCursor) return { title: 'Aim lower, at the floor', detail: 'Point the centre dot at the floor where a corner of the area is.' };
+    if (n === 0) return { title: 'Mark the scan area', detail: this.template.boundsHint || 'Aim the centre dot at the floor in each corner and tap ＋ Corner.' };
+    if (n < 3) return { title: `Corner ${n + 1}`, detail: 'Aim at the next corner on the floor and tap ＋ Corner (or tap the spot on screen).' };
+    return { title: `${n} corners · ${this.draftArea().toFixed(0)} m²`, detail: 'Add more corners, or tap Done when the outline matches the area.' };
   }
 
   // ------------------------------------------------------------------ candidates & keyframes
@@ -388,7 +619,7 @@ export class CaptureSession {
 
     const flags = [];
     if (rushed) flags.push('rushed');
-    if (relSharp < 0.6) flags.push('blurry');
+    if (relSharp < 0.5) flags.push('blurry');
     if (A.mean < 45) flags.push('dark');
     if (A.clipHi > 0.1) flags.push('highlights');
     if (A.texture < 0.02) flags.push('lowtex');
@@ -424,13 +655,14 @@ export class CaptureSession {
       rotFromPrev: round3(rotFromPrev),
     };
 
-    let pts = null, rgb = null;
-    if (snap.depth && snap.depth.xyz.length) {
-      pts = snap.depth.xyz;
-      rgb = c.image.sampleColors(snap.depth.uv);
-    }
-    meta.pts = pts;
-    meta.rgb = rgb;
+    // Depth points (flying pixels already removed) with their colours, and the photo's coarse depth
+    // image, which lets coverage be rebuilt later exactly as it was measured live.
+    const dg = snap.depth;
+    meta.pts = dg && dg.xyz.length ? dg.xyz : null;
+    meta.rgb = meta.pts ? c.image.sampleColors(dg.uv) : null;
+    meta.dimg = dg ? Uint16Array.from(dg.d, (v) => Math.round(v * 1000)) : null;
+    meta.dnx = dg ? dg.nx : 0;
+    meta.dny = dg ? dg.ny : 0;
 
     // Coverage.
     const vp = { pos: this.sixdof && snap.tracked ? pos : null, odo: snap.odo || 0 };
@@ -441,7 +673,9 @@ export class CaptureSession {
     if (vp.pos) {
       const center = this._roomCenter();
       if (center) ps.sectors.add(Math.floor(((Math.atan2(pos[0] - center[0], -(pos[2] - center[2])) / DEG + 360) % 360) / 30));
-      if (pts) this.voxels.observe(pts, pos, true);
+      if (meta.pts) this.voxels.integrate(meta.pts, pos);
+      if (dg) this.voxels.observeView(snap.pose, snap.intr, dg);
+      if (this.guide) this.guide.onPhoto(snap.pose);
     }
     this.frames.push(meta);
     this.live.frames = this.frames.length;
@@ -466,14 +700,18 @@ export class CaptureSession {
   }
 
   _roomCenter() {
+    if (this.bounds && this.bounds.poly) {
+      const [x, z] = polyCentroid(this.bounds.poly);
+      return [x, 0, z];
+    }
     if (this._center && this.lastT - this._centerT < 2) return this._center;
     let sx = 0, sz = 0, n = 0;
     for (const v of this.voxels.vox.values()) {
       if (!VoxelMap.isSolid(v)) continue;
-      sx += v.ix; sz += v.iz; n++;
+      sx += v.sx / v.n; sz += v.sz / v.n; n++;
     }
     let c = null;
-    if (n > 50) c = [((sx / n) + 0.5) * this.voxels.size, 0, ((sz / n) + 0.5) * this.voxels.size];
+    if (n > 50) c = [sx / n, 0, sz / n];
     else {
       const ps = this.frames.filter((f) => f.segment === this.segment && f.tracked).map((f) => posePosition(f.pose));
       if (ps.length > 5) c = [ps.reduce((s, p) => s + p[0], 0) / ps.length, 0, ps.reduce((s, p) => s + p[2], 0) / ps.length];
@@ -485,6 +723,7 @@ export class CaptureSession {
 
   /** Progress of the current pass (0..1). */
   passProgress() {
+    if (this.guide && this.guide.hasPath) return this.guide.progress();
     const pass = this.pass;
     const ps = this.passSpheres.get(pass.id);
     if (!ps) return 0;
@@ -501,33 +740,84 @@ export class CaptureSession {
     return { value: bc.fraction, kind: 'directions', stats: bc };
   }
 
-  _updateGuidance(pos, fwd, tracked6) {
+  _emit(type, data = {}) {
+    this.events.push({ type, ...data });
+  }
+
+  _updateGuidance(pos, fwd, tracked6, t) {
     if (this.sixdof && tracked6) {
       const fy = this.voxels.floorY();
       if (fy !== null) this.floorY = fy;
     }
-    const vs = this.voxels.stats();
     this.target = null;
-    this.live.passProgress = this.passProgress();
-    // During a lap everything is still red, so gap hints only make sense once the lap is nearly
-    // done or in the free-form passes; until then the pass instruction stays the main message.
-    const hintGaps = !this.pass.loop || this.live.passProgress >= 0.85;
-    if (hintGaps && this.sixdof && tracked6 && vs.solid > 50) {
-      const gap = this.voxels.findGap(pos, fwd, this.template.maxObsDist);
-      if (gap) {
-        const to = v3.sub(gap.center, pos);
-        this.target = { point: gap.center, title: `Capture the red area ${describeDir(fwd, to, true)}`, detail: 'Photograph it from a new spot. Step sideways, don\'t just aim.' };
+    this.live.guide = null;
+    this.live.coverage = this.coverage();
+    if (this.boundsDraft) {
+      this.live.passProgress = 0;
+      return;
+    }
+    const vs = this.voxels.stats();
+    const g = this.guide;
+    if (g && tracked6) {
+      if (this.guidePending) {
+        g.setPass(this.pass, pos);
+        this.guidePending = false;
       }
-    } else if (hintGaps) {
-      const tgt = this.sphere.nextTarget(fwd, this.pass.bands, 2);
+      let gs = null;
+      if (g.hasPath) {
+        gs = g.update({ pos, fwd, t });
+        this.live.passProgress = gs.progress;
+      } else {
+        this.live.passProgress = this.passProgress();
+        // Without a path, point at gaps in the free-form passes, or once a lap is nearly done
+        // (during a lap everything is still red, so the lap instruction stays the main message).
+        const hintGaps = !this.pass.loop || this.live.passProgress >= 0.85;
+        if (hintGaps && vs.solid > 30) gs = g.update({ pos, fwd, t });
+      }
+      this.live.guide = gs;
+      if (gs && gs.next && gs.instruction && !this.paused) {
+        this.target = { point: gs.aimPoint, title: gs.instruction.title, detail: gs.instruction.detail, kind: gs.mode };
+      }
+      // A walked path is done: say so, then move on to the next pass by itself.
+      if (gs && gs.complete && g.hasPath) {
+        if (!this.passCompleteAt) {
+          this.passCompleteAt = t;
+          this._emit('passComplete', { pass: this.pass, last: this.passIndex >= this.template.passes.length - 1 });
+        } else if (t - this.passCompleteAt > 2.5 && this.passIndex < this.template.passes.length - 1 && this.settings.autoAdvance !== false) {
+          this.nextPass();
+          this._emit('passStart', { pass: this.pass, index: this.passIndex });
+        }
+      }
+    } else if (this.sixdof) {
+      this.live.passProgress = this.passProgress();
+    } else {
+      this.live.passProgress = this.passProgress();
+      const hintGaps = !this.pass.loop || this.live.passProgress >= 0.85;
+      const tgt = hintGaps ? this.sphere.nextTarget(fwd, this.pass.bands, 2) : null;
       if (tgt) {
         this.target = { dir: tgt.bin.dir, binIndex: tgt.index, title: `Next: aim ${describeDir(fwd, tgt.bin.dir, false)}`, detail: 'Fill the white dots. Move a step between photos so each dot is seen from two spots.' };
       }
     }
-    this.live.coverage = this.coverage();
+    // The whole scan area is covered well enough to train.
+    if (this.sixdof && this.bounds && this.bounds.poly && vs.solid > 50) {
+      if (!this.areaDone && vs.coverage >= AREA_DONE) {
+        this.areaDone = true;
+        this._emit('areaComplete', { coverage: vs.coverage });
+      } else if (this.areaDone && vs.coverage < AREA_DONE - 0.08) {
+        this.areaDone = false;
+      }
+    }
   }
 
-  _updateOverlay(pos, fwd) {
+  _drawBoundsDraft() {
+    const ov = this.source.overlay;
+    if (!ov) return;
+    const c = this.boundsDraft.corners;
+    ov.setTris('bounds', new Float32Array(boundsGeometry(c, this.floorHeight(), { closed: false, cursor: this.boundsCursor, posts: true })));
+    ov.setTris('cursor', this.boundsCursor ? new Float32Array(cursorGeometry(this.boundsCursor, true)) : null);
+  }
+
+  _updateOverlay(pos) {
     const ov = this.source.overlay;
     if (!ov) return;
     if (this.sixdof && this.voxels.version !== this._voxVersion) {
@@ -536,6 +826,7 @@ export class CaptureSession {
       ov.setVoxels(r.pos, r.qual, this.voxels.size);
     }
     ov.visible.voxels = this.settings.overlayVoxels !== false;
+    ov.visible.guide = true;
     if (this._overlayKeyframesDirty) {
       this._overlayKeyframesDirty = false;
       if (this.sixdof) {
@@ -546,13 +837,34 @@ export class CaptureSession {
         );
       }
     }
-    if (!this.sixdof || this.voxels.stats().solid <= 50) {
+    if (!this.sixdof || (this.voxels.stats().solid <= 50 && !(this.bounds && this.bounds.poly))) {
       const counts = this.sphere.counts();
       ov.setDirectionDots(this.sphere.bins.map((b) => b.dir), counts, pos, this.target && this.target.binIndex != null ? this.target.binIndex : -1, 2);
     } else {
       ov.clearDirectionDots();
     }
-    ov.setTarget(this.target && this.target.point ? this.target.point : null);
+    if (!this.sixdof) return;
+
+    // Scan-area outline.
+    if (!this.boundsDraft && this._boundsDirty) {
+      this._boundsDirty = false;
+      const b = this.bounds;
+      ov.setTris('bounds', b && b.poly ? new Float32Array(boundsGeometry(b.poly, b.floorY)) : null);
+      ov.setTris('cursor', null);
+    }
+    // Guide: floor trail, "stand here" ring and ghost phone.
+    const gs = this.live.guide;
+    const fy = this.floorHeight();
+    if (gs && gs.next && !this.paused && this.settings.guide !== false) {
+      const out = gs.trail.length ? chevronTrail([[pos[0], fy, pos[2]], ...gs.trail.slice(1)]) : [];
+      if (gs.stand) standMarker(out, gs.stand);
+      if (gs.ghost) ghostPhone(out, gs.ghost.pos, gs.ghost.aim, fy, this.orientation !== false);
+      ov.setTris('guide', new Float32Array(out));
+    } else {
+      ov.setTris('guide', null);
+    }
+    // Beacon on the surface to fill (gap mode); paths use the on-screen ring only.
+    ov.setTarget(this.target && this.target.point && this.target.kind !== 'path' ? this.target.point : null);
   }
 }
 

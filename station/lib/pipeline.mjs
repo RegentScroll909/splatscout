@@ -8,6 +8,7 @@ import { reconstruct, viewHint } from './colmap.mjs';
 import { trainBrush } from './trainer.mjs';
 import { selectFrames, extractFrames } from './video.mjs';
 import { run } from './run.mjs';
+import { cropPly } from './crop.mjs';
 import { PRESETS, saveConfig } from './config.mjs';
 
 export const STAGES = [
@@ -84,6 +85,7 @@ export async function processJob(job, ctx) {
   // ---------------------------------------------------------------- camera hint & AR poses
   let camera = null;
   let posed = null;
+  let arFrames = null; // AR camera poses, also used to put an SfM solve into the AR frame
   if (manifest && manifest.frames && manifest.frames.length) {
     const intrs = manifest.frames.map((f) => f.intrinsics).filter(Boolean);
     const key = (i) => [i.w, i.h, i.fx.toFixed(1), i.fy.toFixed(1), i.cx.toFixed(1), i.cy.toFixed(1)].join('|');
@@ -100,12 +102,13 @@ export async function processJob(job, ctx) {
       camera = { model: 'SIMPLE_RADIAL', params: null, single: false };
     }
     const sparseIn = join(dataset, 'poses', 'colmap', 'sparse', '0');
-    if (cfg.usePoses && job.usePoses !== false && tracking === '6dof' && existsSync(join(sparseIn, 'images.txt'))) {
+    if (tracking === '6dof' && existsSync(join(sparseIn, 'images.txt'))) {
       const names = new Set(
         readFileSync(join(sparseIn, 'images.txt'), 'utf8').split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.trim().split(/\s+/)).filter((p) => p.length >= 10).map((p) => p[9]),
       );
       const frames = manifest.frames.filter((f) => f.pose && names.has(basename(f.file))).map((f) => ({ name: basename(f.file), pose: f.pose }));
-      if (frames.length >= 20) posed = { modelDir: sparseIn, frames };
+      if (frames.length >= 10) arFrames = frames;
+      if (cfg.usePoses && job.usePoses !== false && frames.length >= 20) posed = { modelDir: sparseIn, frames };
     }
   }
   if (posed) ctx.say(`Using AR poses for ${posed.frames.length} of ${nImages} photos as a starting point.`);
@@ -117,6 +120,7 @@ export async function processJob(job, ctx) {
     work: join(dir, 'colmap'),
     camera,
     posed,
+    align: arFrames,
     matcher: cfg.matcher || 'auto',
     progress: (stage, f, note) => ctx.stage(stage, f, note),
     say: ctx.say,
@@ -170,7 +174,19 @@ export async function processJob(job, ctx) {
   const lib = libraryFolder(cfg, job);
   mkdirSync(lib, { recursive: true });
   const finalPly = join(lib, 'scene.ply');
-  copyFileSync(tr.ply, finalPly);
+  // Crop to the scan area marked on the phone (only possible when the splat is in the AR frame).
+  let crop = null;
+  const bounds = manifest && manifest.bounds;
+  if (cfg.cropToBounds !== false && bounds && bounds.poly && bounds.poly.length >= 3 && /^(ar-poses|sfm-ar)$/.test(rec.mode)) {
+    try {
+      crop = cropPly(tr.ply, finalPly, bounds);
+      ctx.say(`Cropped to the scan area: removed ${crop.removed.toLocaleString()} of ${(crop.kept + crop.removed).toLocaleString()} splats outside it.`);
+    } catch (e) {
+      ctx.say('Could not crop to the scan area: ' + e.message);
+      crop = null;
+    }
+  }
+  if (!crop) copyFileSync(tr.ply, finalPly);
   const thumbSrc = pickThumb(rec.imagesDir);
   const thumb = join(lib, 'thumb.jpg');
   if (thumbSrc) {
@@ -189,7 +205,8 @@ export async function processJob(job, ctx) {
   const info = {
     building: job.building, room: job.room, created: new Date().toISOString(), jobId: job.id, view,
     photos: nImages, placed: rec.stats.images, colmap: { ...rec.stats, mode: rec.mode },
-    training: { preset: job.preset || cfg.preset, steps: tr.iter, seconds: Math.round(tr.seconds), splats: tr.splats },
+    training: { preset: job.preset || cfg.preset, steps: tr.iter, seconds: Math.round(tr.seconds), splats: crop ? crop.kept : tr.splats },
+    crop: crop ? { removed: crop.removed, uncropped: tr.ply } : null,
     capture: job.capture || null, source: basename(job.source.file),
     sizeMB: +(statSync(finalPly).size / 1048576).toFixed(1),
   };

@@ -40,6 +40,7 @@ async function loadStatus() {
   const sel = $('#preset');
   sel.replaceChildren(...Object.entries(status.presets).map(([k, p]) => h('option', { value: k, selected: k === status.preset }, p.label)));
   $('#usePoses').checked = status.usePoses;
+  $('#cropToBounds').checked = status.cropToBounds;
   $('#adb').checked = status.adbAutoImport;
   renderPhone();
   const t = status.tools;
@@ -70,6 +71,7 @@ function renderGpu(g) {
 
 $('#preset').addEventListener('change', (e) => api('/api/settings', { preset: e.target.value }));
 $('#usePoses').addEventListener('change', (e) => api('/api/settings', { usePoses: e.target.checked }));
+$('#cropToBounds').addEventListener('change', (e) => api('/api/settings', { cropToBounds: e.target.checked }));
 $('#adb').addEventListener('change', (e) => api('/api/settings', { adbAutoImport: e.target.checked }).then(loadStatus));
 
 // ------------------------------------------------------------------ uploads

@@ -3,15 +3,24 @@
 SplatScout is a phone app (a web app you install from Chrome, with no app store) that helps you capture
 building interiors well enough to make **clean Gaussian splats**. While you scan, it:
 
+- **Guides you around the space in AR (2.0)**: you mark the scan area by tapping its corners on the floor,
+  then each pass draws a glowing path on the floor, an aim ring, and a "sidestep right" arrow. Passes advance
+  by themselves, and the last pass sends you straight to the spots that still need angles (stand on the ring,
+  aim at the red area). The practice room reaches a complete scan in about 7–8 minutes.
+- **Scan bounds (2.0)**: only what's inside the outline counts (half a hallway, one end of a lobby), and you
+  can tap ⊘ to skip spots you can't capture well, like windows and mirrors. SplatStation crops the
+  finished splat to the same outline.
 - **Paints coverage onto the real surfaces in AR**: red = captured from 1 angle, amber = 2, green = 3+.
-  The goal is to make the room green.
-- **Takes the photos for you.** It picks the sharpest frame each time you've moved far enough for good
-  overlap, and skips blurry, dark and duplicate frames.
+  Dots sit on the actual surfaces and hide behind furniture and walls; depth noise floating in mid-air is
+  filtered out and carved away.
+- **Takes the photos for you, while you walk.** It keeps the sharpest frame of each stretch once you've
+  moved far enough for good overlap, without making you stop, and skips blurry, dark and duplicate frames.
 - **Coaches you live**, one instruction at a time: slow down, you're turning in place, too close, blank
   wall, window blowing out, tracking lost, gap in overlap, wrong height for this pass… Optional voice coaching.
 - **Walks you through a capture plan** for the type of space (room, hallway, large hall, stairwell,
   object, freestyle), pass by pass (eye level, overhead, low, cross, details), with progress for each pass.
-- **Points you at what's missing** with an AR beacon and an edge arrow, and shows a live floor-plan map.
+- **Points you at what's missing** with an AR beacon and an edge arrow, and shows a live floor-plan map with
+  the scan area and the path.
 - **Grades the capture (A–F) before you leave the room**, with concrete fixes ("23% of surfaces were seen
   from one angle — walk the red areas"; "4 photos are soft — remove them").
 - **Exports a ZIP** of sharp, well-spaced photos for your splat pipeline. AR mode also includes the camera
@@ -74,9 +83,12 @@ mode automatically.
 ## 2. Capture
 
 1. **New capture** → building, room, type of space → AR tracked → tick the pre-flight checklist.
-2. **Start AR capture.** Follow the pass shown at the top; tap it for step-by-step instructions and to switch passes.
-3. Move slowly and keep the chips green. Photos are automatic. The shutter button is only for extra detail shots.
-4. Walk until the surfaces are green. In later passes, follow the cyan beacon/arrow to the remaining red areas.
+2. **Start AR capture**, then **mark the scan area**: aim the centre dot at the floor in each corner and tap
+   **＋ Corner** (or tap the spot on screen), then **Done**. *Skip* scans without an outline.
+3. **Follow the path** on the floor at a slow, steady walk, keeping the blue ring near the centre of the screen.
+   Photos are automatic and you don't need to stop. Each pass moves on to the next by itself.
+4. **Fill the gaps**: the last pass puts a ring on the floor where to stand and a ring on the surface to aim at.
+   The capture is complete at about **Area 85%**. Use **⊘ Skip spot** for windows, mirrors or unreachable corners.
 5. **Done** grades the capture on the spot: *Keep capturing* or *Finish & review*.
 6. In Review: check the fixes, remove blurry photos, and **Export ZIP**.
 
@@ -88,10 +100,10 @@ lighting, tricky surfaces, and a "splat symptom → capture fix" table.
 ```
 Building_Room_YYYYMMDD/
   images/0001.jpg …            ← point your splat pipeline here
-  splatscout.json              per-photo metrics, flags, poses, capture metadata
+  splatscout.json              per-photo metrics, flags, poses, capture metadata, scan area ("bounds")
   poses/transforms.json        AR camera poses (Nerfstudio / Instant-NGP, OpenGL convention)
   poses/colmap/sparse/0/       same poses as a COLMAP text model (cameras/images/points3D + rigs/frames)
-  poses/points.ply             coloured AR depth points (splat initialisation)
+  poses/points.ply             coloured AR depth points on confirmed surfaces inside the scan area
   coverage.png, README.txt
 ```
 
@@ -101,6 +113,8 @@ Building_Room_YYYYMMDD/
   ```bash
   ffmpeg -framerate 4 -i images/%04d.jpg -c:v libx264 -crf 14 -pix_fmt yuv420p capture.mp4
   ```
+- `bounds` in `splatscout.json` is the scan area in the pose coordinates: a floor polygon `[[x, z], …]` at
+  `floorY` (y up, metres). Crop your trained splat to it to drop floaters outside the area.
 - The AR poses are optional. They are phone tracking (centimetre-level drift), useful to seed or check
   reconstruction of plain-walled rooms where SfM struggles. The COLMAP model loads directly in COLMAP 4.x
   (`model_analyzer`, `point_triangulator`, …).
@@ -113,9 +127,13 @@ Gaussian splat automatically:
 ```
 SplatScout ZIP  ─┐                        ┌─ COLMAP 4 (GPU SIFT + matching)
 phone video     ─┼─► inbox / upload / USB ─┤   • AR poses → triangulate + bundle-adjust (fast, robust)
-                 │                        │   • no poses → global SfM + level the scene
+                 │                        │   • no poses → global SfM, moved into the AR frame when the phone had poses
                  │                        └─ Brush (trains the splat on the GPU) ─► library/<Building>/<Room>/<date>/scene.ply
 ```
+
+With a SplatScout 2.0 capture that has a scan area, the finished splat is **cropped to that outline** (plus 0.5 m),
+which removes floaters seen through windows or past the area. The uncropped splat stays in the job folder.
+Turn it off on the dashboard (*Crop splats to the scan area*).
 
 **Start it:** double-click **`start-station.cmd`** (or run `node station/station.mjs`), then open
 **http://localhost:8787**. The dashboard shows the queue, a progress bar for each stage, live GPU load and VRAM,
@@ -156,12 +174,18 @@ SuperSplat** to crop and clean floaters.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (15 checks): sensor/screen orientation maths, projection, angular
-  velocity, sharpness and texture detection, image-motion tracking, coverage counting, keyframe triggers,
-  coaching priority/hysteresis, scoring, COLMAP/transforms export and ZIP validity.
-- **Full simulated captures** in the Practice room (AR and Camera mode), driven frame by frame through the real
-  pipeline: auto-capture, coaching, pass progress, coverage, saving, grading, review and export.
-  In the AR simulation, a 4-pass tour gave 231 photos at about 23 cm spacing, 1 rushed photo, and grade B.
+- **Core checks**: `npm run check` (24 checks): sensor/screen orientation maths, projection, angular
+  velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
+  depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, photos while
+  walking, coaching priority/hysteresis, scoring, COLMAP/transforms export, ZIP validity and splat cropping.
+- **Full guided captures** in the Practice room, simulated with the Pixel's AR camera geometry (860×1920,
+  35° wide in portrait), driven frame by frame through the real pipeline with an autopilot that follows the
+  guide at walking pace: marking the scan area, all five passes advancing by themselves, gap filling,
+  coverage, saving, grading, review and export. The 51 m² room reaches "scan area complete" (85%) after about
+  7.5 minutes and 92% after 9.
+- **Tuned on your first real Pixel captures**: in v1, photos came every 2.2 s (median) because a photo was only
+  attempted once the phone was nearly still. 2.0 evaluates frames while you move and uses a blur model
+  calibrated to the AR camera's real focal length.
 - **Pose export checked with COLMAP 4.2**: the exported model loads directly. Triangulating with the app's poses
   held fixed gives 0.65 px mean reprojection error. COLMAP's own SfM agrees with the exported camera positions
   to a median of 1.5 mm.
@@ -172,18 +196,21 @@ Not yet tested, because it needs real hardware: a live ARCore session on your Pi
 - The camera resolution Chrome provides (shown in Settings → *Show live debug numbers*, `cam` line).
 - If AR photos ever come out **upside down**, turn off Settings → *AR frame orientation fix*.
 - Coaching thresholds (speed, blur) may want small tweaks once real indoor footage is in. Settings →
-  *Coaching strictness* gives three presets.
+  *Photo pace* gives three presets.
+- Marking corners relies on ARCore finding the floor: point the phone at the floor and move it slowly until the
+  cursor appears.
 
 ## 5. For developers
 
 ```
-app/js/core/      platform-independent logic (analysis, coverage, keyframes, coaching, plans, scoring, export formats)
+app/js/core/      platform-independent logic (analysis, coverage, depth filter, scan bounds, guide, keyframes,
+                  coaching, plans, scoring, export formats)
 app/js/sources/   xrSource (WebXR/ARCore), cameraSource (getUserMedia + orientation), demoSource/demoScene (practice room)
-app/js/capture/   session engine, 3D overlay, minimap, audio
+app/js/capture/   session engine, 3D overlay (+ guide geometry), minimap, audio
 app/js/data/      IndexedDB storage, settings, ZIP export
 app/js/ui/        screens
 tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs
-station/          SplatStation: station.mjs (server, queue, inbox), lib/ (zip, COLMAP, Brush, video, adb), web/ (dashboard, viewer)
+station/          SplatStation: station.mjs (server, queue, inbox), lib/ (zip, COLMAP, Brush, crop, video, adb), web/ (dashboard, viewer)
 ```
 
 - `npm start`: local server on http://localhost:8080

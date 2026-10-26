@@ -32,10 +32,11 @@ async function thumbFrom(source, sw, sh, maxW) {
 
 /** Top-down RGBA pixels (from the AR camera readback). */
 export class RgbaImage {
-  constructor(rgba, w, h) {
+  constructor(rgba, w, h, recycle = null) {
     this.rgba = rgba;
     this.w = w;
     this.h = h;
+    this.recycle = recycle; // returns the pixel array to the reader's pool
   }
   _canvas() {
     const c = canvasOf(this.w, this.h);
@@ -70,7 +71,9 @@ export class RgbaImage {
     return out;
   }
   release() {
+    if (this.rgba && this.recycle) this.recycle();
     this.rgba = null;
+    this.recycle = null;
   }
 }
 

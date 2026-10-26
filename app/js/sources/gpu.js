@@ -53,6 +53,10 @@ export class TextureReader {
     this.targets = new Map(); // "w x h" -> {fbo, tex}
     this.pending = [];
     this.vao = gl.createVertexArray();
+    // Pixel buffers and result arrays are reused: full-resolution frames are 8 MB each, and
+    // allocating one per candidate photo makes the garbage collector stall the AR view.
+    this.pbos = new Map(); // byte size -> [PBO]
+    this.bufs = new Map(); // byte size -> [Uint8Array]
   }
 
   _target(w, h) {
@@ -94,9 +98,15 @@ export class TextureReader {
     gl.uniform1f(this.uFlip, flip ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-    const pbo = gl.createBuffer();
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
-    gl.bufferData(gl.PIXEL_PACK_BUFFER, w * h * 4, gl.STREAM_READ);
+    const size = w * h * 4;
+    let pbo = (this.pbos.get(size) || []).pop();
+    if (pbo) {
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+    } else {
+      pbo = gl.createBuffer();
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+      gl.bufferData(gl.PIXEL_PACK_BUFFER, size, gl.STREAM_READ);
+    }
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, 0);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -118,18 +128,33 @@ export class TextureReader {
       const st = gl.clientWaitSync(p.sync, 0, 0);
       p.age++;
       if (st === gl.ALREADY_SIGNALED || st === gl.CONDITION_SATISFIED || p.age > 30) {
-        const out = new Uint8Array(p.w * p.h * 4);
+        const size = p.w * p.h * 4;
+        const out = (this.bufs.get(size) || []).pop() || new Uint8Array(size);
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, p.pbo);
         gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, out);
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
         gl.deleteSync(p.sync);
-        gl.deleteBuffer(p.pbo);
-        p.resolve({ rgba: out, w: p.w, h: p.h });
+        const free = this.pbos.get(size) || [];
+        if (free.length < 4) {
+          free.push(p.pbo);
+          this.pbos.set(size, free);
+        } else {
+          gl.deleteBuffer(p.pbo);
+        }
+        p.resolve({ rgba: out, w: p.w, h: p.h, recycle: () => this.recycle(out) });
       } else {
         still.push(p);
       }
     }
     this.pending = still;
+  }
+
+  /** Hand a result array back for reuse once nothing reads it any more. */
+  recycle(buf) {
+    if (!buf) return;
+    const list = this.bufs.get(buf.length) || [];
+    if (list.length < 3 && !list.includes(buf)) list.push(buf);
+    this.bufs.set(buf.length, list);
   }
 
   dispose() {
@@ -140,6 +165,9 @@ export class TextureReader {
       p.reject(new Error('disposed'));
     }
     this.pending = [];
+    for (const list of this.pbos.values()) for (const b of list) gl.deleteBuffer(b);
+    this.pbos.clear();
+    this.bufs.clear();
     for (const t of this.targets.values()) {
       gl.deleteFramebuffer(t.fbo);
       gl.deleteTexture(t.tex);

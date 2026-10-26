@@ -5,7 +5,8 @@ import { TextureReader } from './gpu.js';
 import { analysisSize, screenProject } from './common.js';
 import { RgbaImage } from './frameImage.js';
 import { rgbaToGray } from '../core/analyzer.js';
-import { intrinsicsFromProjection, mat4InvertRigid, transformPoint } from '../core/math.js';
+import { intrinsicsFromProjection, mat4InvertRigid } from '../core/math.js';
+import { depthToPoints, unprojectGL } from '../core/depth.js';
 import { Overlay3D } from '../capture/overlay3d.js';
 
 export async function xrSupport() {
@@ -43,7 +44,7 @@ export class XRSource {
     // requestSession must be the first await so it still counts as a user gesture.
     const session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['local', 'camera-access'],
-      optionalFeatures: ['dom-overlay', 'depth-sensing'],
+      optionalFeatures: ['dom-overlay', 'depth-sensing', 'hit-test'],
       domOverlay: { root: this.overlayRoot },
       depthSensing: {
         usagePreference: ['cpu-optimized'],
@@ -61,6 +62,17 @@ export class XRSource {
     this.gl = gl;
     session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl, { alpha: true, antialias: false }) });
     this.refSpace = await session.requestReferenceSpace('local');
+    // Hit testing against ARCore's planes: used to find the floor when marking the scan area.
+    this.hitSource = null;
+    if (!feats || feats.includes('hit-test')) {
+      try {
+        const viewer = await session.requestReferenceSpace('viewer');
+        this.hitSource = await session.requestHitTestSource({ space: viewer });
+      } catch {
+        this.hitSource = null;
+      }
+    }
+    this.frameNo = 0;
     this.binding = new XRWebGLBinding(session, gl);
     this.reader = new TextureReader(gl);
     this.overlay = new Overlay3D(gl);
@@ -102,10 +114,12 @@ export class XRSource {
       trackState: 'lost',
       intr: null,
       depth: null,
+      hit: null,
       requestAnalysis: null,
       requestCandidate: null,
       toScreen: null,
     };
+    this.frameNo++;
 
     let view = null;
     if (viewerPose && viewerPose.views.length) {
@@ -130,16 +144,20 @@ export class XRSource {
         fi.intr = intrinsicsFromProjection(P, cw, ch);
         const as = analysisSize(cw, ch);
         const flip = this.flip;
-        fi.requestAnalysis = () =>
-          this.reader.read(camTex, as.w, as.h, flip).then(({ rgba, w, h }) => ({ gray: rgbaToGray(rgba, w, h), w, h }));
+        const grayOf = (r) => {
+          const gray = rgbaToGray(r.rgba, r.w, r.h);
+          r.recycle();
+          return gray;
+        };
+        fi.requestAnalysis = () => this.reader.read(camTex, as.w, as.h, flip).then((r) => ({ gray: grayOf(r), w: r.w, h: r.h }));
         fi.requestCandidate = () => {
           const small = this.reader.read(camTex, as.w, as.h, flip);
           const full = this.reader.read(camTex, cw, ch, flip);
           return Promise.all([small, full]).then(([s, f]) => ({
-            gray: rgbaToGray(s.rgba, s.w, s.h),
+            gray: grayOf(s),
             w: s.w,
             h: s.h,
-            image: new RgbaImage(f.rgba, f.w, f.h),
+            image: new RgbaImage(f.rgba, f.w, f.h, f.recycle),
           }));
         };
       }
@@ -153,6 +171,19 @@ export class XRSource {
           depthInfo = null;
         }
         if (depthInfo) fi.depth = makeDepthSampler(depthInfo, view, pose, this.maxDepth);
+      }
+      // Coarse depth image for hiding overlay markers behind real surfaces.
+      if (this.frameNo % 4 === 0) this.overlay.setOcclusion(fi.depth ? fi.depth.raw(32, 24, 0.1, 20) : null, 32, 24);
+
+      if (this.hitSource) {
+        try {
+          const hits = frame.getHitTestResults(this.hitSource);
+          const hp = hits.length ? hits[0].getPose(this.refSpace) : null;
+          if (hp) {
+            const m = hp.transform.matrix;
+            fi.hit = { p: [m[12], m[13], m[14]], n: [m[4], m[5], m[6]] }; // pose y axis = surface normal
+          }
+        } catch {}
       }
 
       // Screen projection for HUD arrows (DOM overlay covers the whole screen).
@@ -176,12 +207,12 @@ export class XRSource {
     if (view && fi.pose) {
       const vp = layer.getViewport(view);
       gl.viewport(vp.x, vp.y, vp.width, vp.height);
-      this.overlay.draw(mat4InvertRigid(fi.pose), view.projectionMatrix, vp.height, t);
+      this.overlay.draw(mat4InvertRigid(fi.pose), view.projectionMatrix, [vp.x, vp.y, vp.width, vp.height], t);
     }
   }
 }
 
-/** Returns an object that samples depth on a grid and unprojects to world points. */
+/** Samples ARCore depth on grids and turns it into world points (flying pixels removed). */
 function makeDepthSampler(depthInfo, view, pose, maxDepth) {
   const P = view.projectionMatrix;
   const get =
@@ -191,16 +222,20 @@ function makeDepthSampler(depthInfo, view, pose, maxDepth) {
         ? (u, v) => depthInfo.getDepth(u, v)
         : null;
   if (!get) return null;
+  const sample = (u, v) => {
+    try {
+      return get(u, v) || 0;
+    } catch {
+      return 0;
+    }
+  };
   return {
     /** Median depth over a coarse grid (metres), or 0. */
     median(nx = 9, ny = 7) {
       const ds = [];
       for (let j = 0; j < ny; j++) {
         for (let i = 0; i < nx; i++) {
-          let d = 0;
-          try {
-            d = get((i + 0.5) / nx, (j + 0.5) / ny);
-          } catch {}
+          const d = sample((i + 0.5) / nx, (j + 0.5) / ny);
           if (d > 0.1 && d < 15) ds.push(d);
         }
       }
@@ -208,26 +243,20 @@ function makeDepthSampler(depthInfo, view, pose, maxDepth) {
       ds.sort((a, b) => a - b);
       return ds[ds.length >> 1];
     },
-    /** World points on an nx x ny grid with their image uv (top-left origin). */
-    grid(nx, ny, minD = 0.25, maxD = maxDepth) {
-      const xyz = [], uv = [];
+    /** Planar depth on an nx x ny grid (top-left origin), 0 outside [minD, maxD]. */
+    raw(nx, ny, minD = 0.25, maxD = maxDepth) {
+      const D = new Float32Array(nx * ny);
       for (let j = 0; j < ny; j++) {
         for (let i = 0; i < nx; i++) {
-          const u = (i + 0.5) / nx, v = (j + 0.5) / ny;
-          let d = 0;
-          try {
-            d = get(u, v);
-          } catch {}
-          if (!(d > minD && d < maxD)) continue;
-          const xn = 2 * u - 1, yn = 1 - 2 * v;
-          const X = (d * (xn + P[8])) / P[0];
-          const Y = (d * (yn + P[9])) / P[5];
-          const w = transformPoint(pose, [X, Y, -d]);
-          xyz.push(w[0], w[1], w[2]);
-          uv.push(u, v);
+          const d = sample((i + 0.5) / nx, (j + 0.5) / ny);
+          if (d > minD && d < maxD) D[j * nx + i] = d;
         }
       }
-      return { xyz: new Float32Array(xyz), uv: new Float32Array(uv) };
+      return D;
+    },
+    /** World points on an nx x ny grid with their image uv and the filtered depth image. */
+    grid(nx, ny, minD = 0.25, maxD = maxDepth) {
+      return depthToPoints(this.raw(nx, ny, minD, maxD), nx, ny, unprojectGL(P), pose);
     },
   };
 }

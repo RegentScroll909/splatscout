@@ -4,30 +4,39 @@
 import { DirectionSphere, VoxelMap, BANDS } from './coverage.js';
 import { posePosition, clamp } from './math.js';
 import { getTemplate } from './plans.js';
+import { Bounds } from './bounds.js';
 
 /**
- * Rebuild coverage structures from saved frames (poses + depth points).
- * Each AR session ("segment") has its own coordinate frame, so surface coverage is rebuilt
- * from the largest segment only.
+ * Rebuild coverage structures from saved frames (poses, depth points and depth images), the same
+ * way it was measured live. Each AR session ("segment") has its own coordinate frame, so surface
+ * coverage is rebuilt from the largest segment only, and the scan area only applies to the session
+ * it was marked in (or to any session in the practice room, whose coordinates never change).
  */
-export function rebuildCoverage(frames, template) {
+export function rebuildCoverage(frames, template, capture = {}) {
   const sphere = new DirectionSphere();
   const voxels = new VoxelMap(template.voxel, template.maxObsDist);
   const segCounts = new Map();
   for (const f of frames) segCounts.set(f.segment || 0, (segCounts.get(f.segment || 0) || 0) + 1);
   let mainSeg = 0, best = -1;
   for (const [s, n] of segCounts) if (n > best) [mainSeg, best] = [s, n];
+  const bd = capture.bounds;
+  const bounds = bd && (bd.segment == null || bd.segment === mainSeg || String(capture.engine || '').startsWith('demo')) ? Bounds.from(bd) : null;
+  if (bounds) voxels.setBounds(bounds);
   frames.forEach((f, i) => {
     if (!f.pose || !f.intr) return;
     const pos = f.tracking === '6dof' && f.tracked ? posePosition(f.pose) : null;
     sphere.addView(f.pose, f.intr, { pos, odo: f.odo || 0 }, i);
-    if (pos && (f.segment || 0) === mainSeg && f.pts && f.pts.length) voxels.observe(f.pts, pos, true);
+    if (!pos || (f.segment || 0) !== mainSeg || !f.pts || !f.pts.length) return;
+    voxels.integrate(f.pts, pos);
+    if (f.dimg && f.dnx) voxels.observeView(f.pose, f.intr, { d: Float32Array.from(f.dimg, (v) => v / 1000), nx: f.dnx, ny: f.dny });
+    else voxels.observePoints(f.pts, pos);
   });
-  return { sphere, voxels, segments: segCounts.size, mainSegment: mainSeg };
+  return { sphere, voxels, bounds, segments: segCounts.size, mainSegment: mainSeg };
 }
 
-/** Rough floor-plan area (m²) from the voxel footprint. */
+/** Rough floor-plan area (m²): the scan area, else the voxel footprint. */
 export function footprintArea(voxels) {
+  if (voxels.bounds && voxels.bounds.poly) return voxels.bounds.area;
   const cols = new Set();
   for (const v of voxels.vox.values()) if (VoxelMap.isSolid(v)) cols.add(v.ix * 4096 + v.iz);
   return cols.size * voxels.size * voxels.size;
@@ -43,7 +52,7 @@ const GRADES = [
 
 export function analyzeCapture(frames, capture) {
   const template = getTemplate(capture.template);
-  const { sphere, voxels, segments } = rebuildCoverage(frames, template);
+  const { sphere, voxels, segments, bounds } = rebuildCoverage(frames, template, capture);
   const vstats = voxels.stats();
   const n = frames.length;
   const sixdof = capture.tracking === '6dof';
@@ -60,16 +69,43 @@ export function analyzeCapture(frames, capture) {
     // 20% weighted coverage is what a single quick lap gives; 80% is a thorough capture.
     coverage = clamp((vstats.coverage - 0.2) / 0.6, 0, 1);
     const weak = vstats.q0 + vstats.q1;
-    parts.push({ id: 'coverage', label: 'Surface coverage', weight: 0.35, value: coverage,
+    parts.push({ id: 'coverage', label: bounds && bounds.poly ? 'Scan area coverage' : 'Surface coverage', weight: 0.35, value: coverage,
       detail: `${Math.round((vstats.q3 / vstats.solid) * 100)}% of surfaces from 3+ angles, ${Math.round((weak / vstats.solid) * 100)}% from 0–1 angles` });
     if (coverage < 0.8) fixes.push({ level: coverage < 0.5 ? 'bad' : 'warn',
-      text: `${Math.round((weak / vstats.solid) * 100)}% of surfaces were seen from one angle or fewer. Tap "Capture more" and walk until the red areas turn green, viewing each from a different spot.` });
+      text: `${Math.round((weak / vstats.solid) * 100)}% of surfaces were seen from one angle or fewer. Tap "Capture more" and follow the guide's markers ("Fill the gaps") until the area reaches about 85%.` });
   } else {
     coverage = clamp((mid.fraction * 0.8 + poles.fraction * 0.2) / 0.85, 0, 1);
     parts.push({ id: 'coverage', label: 'View coverage', weight: 0.35, value: coverage,
       detail: `${Math.round(mid.fraction * 100)}% of directions seen from 2+ spots; floor/ceiling ${Math.round(poles.fraction * 100)}%` });
   }
-  for (const band of BANDS) {
+  if (hasDepth) {
+    // With surfaces mapped, judge the floor and ceiling by how they were photographed, not by which
+    // way the phone pointed (a floor is covered fine from a tilted-down overhead lap).
+    const ys = [];
+    for (const v of voxels.vox.values()) if (VoxelMap.isSolid(v) && voxels.inBounds(v)) ys.push(v.sy / v.n);
+    ys.sort((a, b) => a - b);
+    const fy = voxels.floorY();
+    const top = ys.length ? ys[Math.floor(ys.length * 0.98)] : null;
+    const groups = { floor: [0, 0], ceil: [0, 0] };
+    for (const v of voxels.vox.values()) {
+      if (!VoxelMap.isSolid(v) || !voxels.inBounds(v)) continue;
+      const y = v.sy / v.n;
+      const g = fy != null && y < fy + 0.15 ? groups.floor : top != null && fy != null && top - fy > 2 && y > top - 0.2 ? groups.ceil : null;
+      if (!g) continue;
+      g[0]++;
+      if (VoxelMap.quality(v) <= 1) g[1]++;
+    }
+    const hint = {
+      floor: ['floor', 'Do the overhead lap: phone above your head, tilted down.'],
+      ceil: ['ceiling', 'Do the low lap: phone at waist height, tilted up.'],
+    };
+    for (const [k, [total, weak]] of Object.entries(groups)) {
+      if (total >= 30 && weak / total > 0.4) {
+        fixes.push({ level: 'warn', text: `${Math.round((weak / total) * 100)}% of the ${hint[k][0]} was photographed from one angle or fewer. ${hint[k][1]}` });
+      }
+    }
+  }
+  for (const band of hasDepth ? [] : BANDS) {
     const bc = sphere.bandCoverage([band.id], band.id === 'floor' || band.id === 'ceil' ? 1 : 2);
     if (bc.fraction < 0.5 && n > 20) {
       const hint = {
@@ -84,7 +120,7 @@ export function analyzeCapture(frames, capture) {
   }
 
   // --- Sharpness ---
-  const sharpOk = frames.filter((f) => f.m && f.m.relSharp >= 0.7 && !hasFlag(f, 'blurry')).length;
+  const sharpOk = frames.filter((f) => f.m && f.m.relSharp >= 0.6 && !hasFlag(f, 'blurry')).length;
   const blurry = frames.filter((f) => hasFlag(f, 'blurry')).length;
   const sharpFrac = n ? sharpOk / n : 0;
   parts.push({ id: 'sharp', label: 'Sharpness', weight: 0.2, value: clamp((sharpFrac - 0.5) / 0.45, 0, 1),
@@ -152,7 +188,7 @@ export function analyzeCapture(frames, capture) {
   }
   if (!fixes.length) fixes.push({ level: 'good', text: 'No problems found. This capture is ready for your splat pipeline.' });
 
-  return { score, grade, verdict, parts, fixes, target, area, vstats, sphere, voxels, segments };
+  return { score, grade, verdict, parts, fixes, target, area, vstats, sphere, voxels, bounds, segments };
 }
 
 function hasFlag(f, flag) {

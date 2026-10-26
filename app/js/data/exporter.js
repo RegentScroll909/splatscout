@@ -3,7 +3,7 @@
 //   splatscout.json               capture metadata, per-photo quality metrics and poses
 //   poses/transforms.json         AR camera poses (Nerfstudio / Instant-NGP format)
 //   poses/colmap/sparse/0/*.txt   the same poses as a COLMAP text model (PINHOLE)
-//   poses/points.ply              coloured AR depth points (splat initialisation)
+//   poses/points.ply              coloured AR depth points (splat initialisation), mid-air noise removed
 //   coverage.png                  coverage map snapshot
 //   README.txt
 
@@ -12,7 +12,7 @@ import { transformsJson, colmapText, mergePoints, plyBlob } from '../core/format
 import { analyzeCapture } from '../core/score.js';
 import { drawTopDown, drawPanorama } from '../capture/minimap.js';
 
-export const APP_VERSION = '1.0.0';
+export const APP_VERSION = '2.0.0';
 
 export function slugify(s) {
   return (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'capture';
@@ -61,6 +61,9 @@ export async function buildExport(capture, frames, { includePoses = true } = {},
       device: capture.device,
       stats: capture.stats,
     },
+    // Scan area in the AR session's coordinates (same frame as the poses below): a floor-plan
+    // polygon [[x, z], ...] at floorY, plus skipped spots [x, y, z, radius]. Useful to crop splats.
+    bounds: analysis.bounds ? { ...analysis.bounds.toJSON(), poseFrame: 'poses/transforms.json' } : null,
     score: { score: analysis.score, grade: analysis.grade, verdict: analysis.verdict, parts: analysis.parts.map(({ id, label, value, detail }) => ({ id, label, value: +value.toFixed(3), detail })), fixes: analysis.fixes },
     conventions: {
       pose: 'camera-to-world 4x4, column-major, OpenGL camera (x right, y up, looks down -z), world y-up, metres',
@@ -96,7 +99,10 @@ export async function buildExport(capture, frames, { includePoses = true } = {},
     for (const list of bySeg.values()) if (list.length > main.length) main = list;
     if (main.length >= 3) {
       onProgress(0.9, 'Writing poses');
-      const pts = mergePoints(main);
+      // Keep only points on confirmed surfaces (seen by several depth frames, never seen through)
+      // and inside the scan area: no floaters to seed the splat with.
+      const vm = analysis.voxels, b = analysis.bounds;
+      const pts = mergePoints(main, 0.03, (x, y, z) => vm.isSolidAt(x, y, z) && (!b || b.contains(x, y, z)));
       const hasPts = pts.xyz.length > 0;
       await zip.add(`${base}/poses/transforms.json`, transformsJson(main.map((f) => ({ name: `images/${f.name}`, pose: f.pose, intr: f.intr })), hasPts ? 'points.ply' : null));
       const col = colmapText(main.map((f) => ({ name: f.name, pose: f.pose, intr: f.intr })), hasPts ? pts : null);
@@ -127,7 +133,7 @@ async function coveragePng(analysis, frames, capture) {
     ctx.fillStyle = '#101418';
     ctx.fillRect(0, 0, 1024, 1024);
     if (capture.tracking === '6dof' && analysis.vstats.solid > 50) {
-      drawTopDown(c, { voxels: analysis.voxels, frames, pose: null, target: null, segment: null });
+      drawTopDown(c, { voxels: analysis.voxels, frames, pose: null, target: null, segment: null, bounds: analysis.bounds });
     } else {
       c.height = 512;
       ctx.fillStyle = '#101418';
@@ -162,12 +168,15 @@ images/
 poses/   (${posedNote})
   transforms.json        Nerfstudio/Instant-NGP format (OpenGL camera-to-world, metres)
   colmap/sparse/0/       COLMAP text model with the AR poses (PINHOLE cameras) + depth points
-  points.ply             coloured AR depth points, for splat initialisation
+  points.ply             coloured AR depth points, for splat initialisation (only points on
+                         confirmed surfaces inside the scan area)
   The AR poses are approximate (phone tracking drifts by centimetres). Use them as a starting
   point, e.g. COLMAP point_triangulator + bundle_adjuster, or simply ignore them and run
   normal structure-from-motion on images/.
 
 splatscout.json
+  "bounds" holds the scan area (floor polygon in the pose coordinates) if one was marked:
+  crop the trained splat to it to drop anything seen through windows or past the area.
   Per-photo metrics (relative sharpness, brightness, clipped highlights, texture, speeds),
   quality flags and poses.
 

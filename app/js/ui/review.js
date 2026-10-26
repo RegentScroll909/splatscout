@@ -33,7 +33,7 @@ export async function reviewScreen(root, { captureId, navigate }) {
 
     const map = h('canvas.review-map', { width: 640, height: capture.tracking === '6dof' && a.vstats.solid > 50 ? 640 : 320 });
     if (capture.tracking === '6dof' && a.vstats.solid > 50) {
-      drawTopDown(map, { voxels: a.voxels, frames, pose: null, target: null, segment: null });
+      drawTopDown(map, { voxels: a.voxels, frames, pose: null, target: null, segment: null, bounds: a.bounds });
     } else {
       drawPanorama(map, { sphere: a.sphere, pose: null });
     }

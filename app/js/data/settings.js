@@ -14,6 +14,8 @@ export const DEFAULTS = {
   arFlipY: true,
   showDebug: false,
   overlayVoxels: true,
+  guide: true, // AR: mark the scan area and follow the path
+  autoAdvance: true, // go to the next pass when the path is done
   stationUrl: '', // SplatStation on your PC, e.g. http://192.168.1.20:8787
 };
 

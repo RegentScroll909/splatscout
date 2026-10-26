@@ -124,6 +124,7 @@ export function posePairs(frames, { temporal = 10, spatial = 25, maxAngleDeg = 7
  * @param {string} p.work working folder for databases and models
  * @param {object|null} p.camera {model, params, single} camera hint
  * @param {object|null} p.posed {modelDir, frames:[{name, pose}]} AR prior, or null
+ * @param {Array|null} [p.align] [{name, pose}] AR poses: an SfM solve is moved into their frame
  * @param {string} p.matcher auto | exhaustive | sequential
  * @param {(stage:string, fraction:number, note?:string)=>void} p.progress
  * @param {(msg:string)=>void} p.say
@@ -283,21 +284,41 @@ async function unposedReconstruction(p, db, nImages) {
   if (best.stats.images < nImages * 0.8) {
     say(`Warning: only ${best.stats.images} of ${nImages} photos were placed. The capture probably has a gap in overlap.`);
   }
-  // Level the scene (gravity / Manhattan-world alignment) so viewers start upright.
   const aligned = join(work, 'sfm_aligned');
   if (existsSync(aligned)) rmSync(aligned, { recursive: true, force: true });
   mkdirSync(aligned, { recursive: true });
   let modelDir = best.path;
-  try {
-    progress('mapping', 0.95, 'levelling the scene');
-    await run(colmap, ['model_orientation_aligner', '--image_path', imagesDir, '--input_path', best.path, '--output_path', aligned,
-      '--method', 'MANHATTAN-WORLD'], { log, token });
-    modelDir = aligned;
-  } catch (e) {
-    if (e.cancelled) throw e;
+  let mode = 'sfm';
+  // With phone AR poses: move the model into the AR frame (metric scale, gravity up, same
+  // coordinates as the scan area). Otherwise level it (Manhattan world) so viewers start upright.
+  if (p.align && p.align.length >= 10) {
+    try {
+      progress('mapping', 0.95, 'aligning to the phone\'s AR frame');
+      const ref = join(work, 'ar_centres.txt');
+      writeFileSync(ref, p.align.map((f) => `${f.name} ${f.pose[12]} ${f.pose[13]} ${f.pose[14]}`).join('\n') + '\n');
+      await run(colmap, ['model_aligner', '--input_path', best.path, '--output_path', aligned, '--ref_images_path', ref,
+        '--ref_is_gps', '0', '--alignment_type', 'custom', '--alignment_max_error', '0.3'], { log, token });
+      if (existsSync(join(aligned, 'images.bin')) || existsSync(join(aligned, 'images.txt'))) {
+        modelDir = aligned;
+        mode = 'sfm-ar';
+        say('Aligned the solve to the phone\'s AR coordinates.');
+      }
+    } catch (e) {
+      if (e.cancelled) throw e;
+    }
+  }
+  if (mode === 'sfm') {
+    try {
+      progress('mapping', 0.95, 'levelling the scene');
+      await run(colmap, ['model_orientation_aligner', '--image_path', imagesDir, '--input_path', best.path, '--output_path', aligned,
+        '--method', 'MANHATTAN-WORLD'], { log, token });
+      modelDir = aligned;
+    } catch (e) {
+      if (e.cancelled) throw e;
+    }
   }
   progress('mapping', 1);
   say(`Model: ${best.stats.images}/${nImages} photos, ${best.stats.points} points, ${best.stats.reprojError.toFixed(2)} px error.`);
   const model = camera ? camera.model : 'SIMPLE_RADIAL';
-  return { modelDir, stats: best.stats, mode: 'sfm', needsUndistort: !/PINHOLE/.test(model) };
+  return { modelDir, stats: best.stats, mode, needsUndistort: !/PINHOLE/.test(model) };
 }
