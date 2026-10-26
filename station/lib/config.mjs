@@ -54,7 +54,9 @@ const DEFAULTS = {
   preset: 'standard',
   usePoses: true, // use SplatScout AR poses to guide COLMAP when available
   cropToBounds: true, // crop splats to the scan area marked in SplatScout 2.0
-  adbAutoImport: true, // pull new SplatScout ZIPs from a USB-connected phone's Download folder
+  adbAutoImport: true, // watch for a phone plugged in over USB and list the SplatScout ZIPs on it
+  phoneAutoImport: false, // copy every new export from the phone by itself (otherwise you pick them)
+  autoProcess: false, // start processing new captures by themselves (otherwise they wait for "Process")
   matcher: 'auto', // auto | exhaustive | sequential
   tools: {},
 };

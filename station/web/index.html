@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090b0e">
   <title>SplatStation</title>
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
@@ -13,47 +14,75 @@
       <img src="icon.svg" alt="" class="logo">
       <div>
         <h1>SplatStation</h1>
-        <div class="muted small">Captures in, Gaussian splats out</div>
+        <div class="sub">Captures in, Gaussian splats out</div>
       </div>
     </div>
-    <div id="gpu" class="gpu">GPU…</div>
+    <div id="gpu" class="gpu mono">GPU —</div>
   </header>
 
   <main>
-    <section class="card add">
-      <div id="drop" class="drop">
-        <input id="file" type="file" accept=".zip,video/*" multiple hidden>
-        <div class="drop-icon">⬆</div>
-        <div><b>Drop SplatScout ZIPs or videos here</b></div>
-        <div class="muted small">or <button class="link" id="pick">choose files</button></div>
+    <div class="grid">
+      <section class="panel">
+        <div class="panel-head"><h2>Add captures</h2></div>
+        <div id="drop" class="drop">
+          <input id="file" type="file" accept=".zip,video/*" multiple hidden>
+          <div class="drop-icon" id="dropIcon"></div>
+          <div><b>Drop SplatScout ZIPs or videos</b></div>
+          <div class="muted small">or <button class="link" id="pick">choose files</button></div>
+        </div>
+        <label class="check"><input type="checkbox" id="startNow"> <span>Start processing as soon as they arrive</span></label>
         <div id="uploads"></div>
+        <div class="sub-head">
+          <h3>Phone over USB</h3>
+          <button class="btn small ghost" id="phoneRefresh">Refresh</button>
+        </div>
+        <div id="phone" class="phone"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Defaults</h2></div>
+        <label class="field"><span class="lbl">Quality</span><select id="preset"></select></label>
+        <label class="check"><input type="checkbox" id="usePoses"> <span>Use the phone's AR positions when available</span></label>
+        <label class="check"><input type="checkbox" id="cropToBounds"> <span>Crop splats to the scan area</span></label>
+        <label class="check"><input type="checkbox" id="adb"> <span>Look for a phone plugged in over USB</span></label>
+        <label class="check"><input type="checkbox" id="phoneAutoImport"> <span>Copy new exports from the phone by themselves</span></label>
+        <label class="check"><input type="checkbox" id="autoProcess"> <span>Process new captures by themselves</span></label>
+        <div id="paths" class="paths"></div>
+      </section>
+    </div>
+
+    <section>
+      <div class="section-head">
+        <h2>Ready to process</h2><span class="count mono" id="waitingCount"></span>
+        <span class="grow"></span>
+        <button class="btn small primary hidden" id="processAll">Process all</button>
       </div>
-      <div class="settings">
-        <label class="field">Quality
-          <select id="preset"></select>
-        </label>
-        <label class="toggle"><input type="checkbox" id="usePoses"> Use phone AR poses when available</label>
-        <label class="toggle"><input type="checkbox" id="cropToBounds"> Crop splats to the scan area</label>
-        <label class="toggle"><input type="checkbox" id="adb"> Auto-import from a phone plugged in over USB</label>
-        <div id="phone" class="small muted"></div>
-        <div id="paths" class="small muted"></div>
-      </div>
+      <div id="waiting" class="list"></div>
     </section>
 
     <section>
-      <h2>Jobs</h2>
-      <div id="jobs"><p class="muted">Loading…</p></div>
+      <div class="section-head">
+        <h2>Queue</h2><span class="count mono" id="queueCount"></span>
+        <span class="grow"></span>
+        <label class="check inline"><input type="checkbox" id="pauseQueue"> <span>Pause after the current job</span></label>
+      </div>
+      <div id="queue" class="list"></div>
     </section>
 
     <section>
-      <h2>Library</h2>
+      <div class="section-head"><h2>History</h2><span class="count mono" id="historyCount"></span></div>
+      <div id="history" class="list"></div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Library</h2><span class="count mono" id="libraryCount"></span></div>
       <div id="library" class="lib"></div>
     </section>
 
     <section>
-      <details class="card">
+      <details class="panel">
         <summary>Activity log</summary>
-        <pre id="log" class="log"></pre>
+        <pre id="log" class="log mono"></pre>
       </details>
     </section>
   </main>

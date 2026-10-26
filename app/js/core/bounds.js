@@ -160,15 +160,17 @@ export class Bounds {
    * @param {number|null} [o.top] optional height limit
    * @param {number} [o.margin] surfaces this far outside the outline still count (walls sit on it)
    * @param {number[][]} [o.skips] spots to ignore: [[x, y, z, r], ...]
-   * @param {number} [o.segment] AR session these coordinates belong to
+   * @param {number} [o.segment] AR session it was marked in
+   * @param {number} [o.space] coordinate space it belongs to (see spaces.js)
    */
-  constructor({ poly, floorY, top = null, margin = 0.35, skips = [], segment = null }) {
+  constructor({ poly, floorY, top = null, margin = 0.35, skips = [], segment = null, space = null }) {
     this.poly = poly && poly.length >= 3 ? ccw(poly.map((p) => [p[0], p[1]])) : null;
     this.floorY = floorY;
     this.top = top;
     this.margin = margin;
     this.skips = skips.map((s) => s.slice());
     this.segment = segment;
+    this.space = space;
     let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
     for (const [x, z] of this.poly || []) {
       x0 = Math.min(x0, x); x1 = Math.max(x1, x);
@@ -229,6 +231,7 @@ export class Bounds {
       margin: this.margin,
       skips: this.skips.map((s) => s.map(r)),
       segment: this.segment,
+      space: this.space,
     };
   }
 

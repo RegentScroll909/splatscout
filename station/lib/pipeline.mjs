@@ -177,7 +177,8 @@ export async function processJob(job, ctx) {
   // Crop to the scan area marked on the phone (only possible when the splat is in the AR frame).
   let crop = null;
   const bounds = manifest && manifest.bounds;
-  if (cfg.cropToBounds !== false && bounds && bounds.poly && bounds.poly.length >= 3 && /^(ar-poses|sfm-ar)$/.test(rec.mode)) {
+  const cropOn = job.crop != null ? job.crop : cfg.cropToBounds !== false;
+  if (cropOn && bounds && bounds.poly && bounds.poly.length >= 3 && /^(ar-poses|sfm-ar)$/.test(rec.mode)) {
     try {
       crop = cropPly(tr.ply, finalPly, bounds);
       ctx.say(`Cropped to the scan area: removed ${crop.removed.toLocaleString()} of ${(crop.kept + crop.removed).toLocaleString()} splats outside it.`);

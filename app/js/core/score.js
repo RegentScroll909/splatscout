@@ -5,33 +5,40 @@ import { DirectionSphere, VoxelMap, BANDS } from './coverage.js';
 import { posePosition, clamp } from './math.js';
 import { getTemplate } from './plans.js';
 import { Bounds } from './bounds.js';
+import { spaceOf, boundsFor, mainSpace, spaceCount } from './spaces.js';
 
 /**
  * Rebuild coverage structures from saved frames (poses, depth points and depth images), the same
- * way it was measured live. Each AR session ("segment") has its own coordinate frame, so surface
- * coverage is rebuilt from the largest segment only, and the scan area only applies to the session
- * it was marked in (or to any session in the practice room, whose coordinates never change).
+ * way it was measured live. Surface coverage needs one set of coordinates, so it is rebuilt from the
+ * main space (the AR sessions that were lined up with each other, see spaces.js), and the scan area
+ * only applies when it was marked in that space.
  */
 export function rebuildCoverage(frames, template, capture = {}) {
   const sphere = new DirectionSphere();
   const voxels = new VoxelMap(template.voxel, template.maxObsDist);
-  const segCounts = new Map();
-  for (const f of frames) segCounts.set(f.segment || 0, (segCounts.get(f.segment || 0) || 0) + 1);
-  let mainSeg = 0, best = -1;
-  for (const [s, n] of segCounts) if (n > best) [mainSeg, best] = [s, n];
-  const bd = capture.bounds;
-  const bounds = bd && (bd.segment == null || bd.segment === mainSeg || String(capture.engine || '').startsWith('demo')) ? Bounds.from(bd) : null;
+  const main = mainSpace(frames, capture);
+  const space = main ? main.space : null;
+  const bd = boundsFor(capture, space);
+  const bounds = bd ? Bounds.from(bd) : null;
   if (bounds) voxels.setBounds(bounds);
   frames.forEach((f, i) => {
     if (!f.pose || !f.intr) return;
     const pos = f.tracking === '6dof' && f.tracked ? posePosition(f.pose) : null;
     sphere.addView(f.pose, f.intr, { pos, odo: f.odo || 0 }, i);
-    if (!pos || (f.segment || 0) !== mainSeg || !f.pts || !f.pts.length) return;
+  });
+  integrateFrames(voxels, frames.filter((f) => f.tracked && spaceOf(f, capture) === space));
+  return { sphere, voxels, bounds, segments: spaceCount(frames, capture), mainSpace: space };
+}
+
+/** Add saved photos' depth to a coverage map (all in the same coordinates). */
+export function integrateFrames(voxels, frames) {
+  for (const f of frames) {
+    if (!f.pose || !f.intr || !f.pts || !f.pts.length) continue;
+    const pos = posePosition(f.pose);
     voxels.integrate(f.pts, pos);
     if (f.dimg && f.dnx) voxels.observeView(f.pose, f.intr, { d: Float32Array.from(f.dimg, (v) => v / 1000), nx: f.dnx, ny: f.dny });
     else voxels.observePoints(f.pts, pos);
-  });
-  return { sphere, voxels, bounds, segments: segCounts.size, mainSegment: mainSeg };
+  }
 }
 
 /** Rough floor-plan area (m²): the scan area, else the voxel footprint. */
@@ -52,7 +59,7 @@ const GRADES = [
 
 export function analyzeCapture(frames, capture) {
   const template = getTemplate(capture.template);
-  const { sphere, voxels, segments, bounds } = rebuildCoverage(frames, template, capture);
+  const { sphere, voxels, segments, bounds, mainSpace } = rebuildCoverage(frames, template, capture);
   const vstats = voxels.stats();
   const n = frames.length;
   const sixdof = capture.tracking === '6dof';
@@ -184,11 +191,11 @@ export function analyzeCapture(frames, capture) {
   const order = { bad: 0, warn: 1, info: 2 };
   fixes.sort((a, b) => order[a.level] - order[b.level]);
   if (sixdof && segments > 1) {
-    fixes.push({ level: 'info', text: `This capture has ${segments} AR sessions. Each has its own coordinate frame, so surface coverage is shown for the largest one. All photos are still exported.` });
+    fixes.push({ level: 'info', text: `This capture has ${segments} separate AR maps (sessions that weren't lined up with each other). Coverage and AR poses come from the largest one; the others are still exported as photos.` });
   }
   if (!fixes.length) fixes.push({ level: 'good', text: 'No problems found. This capture is ready for your splat pipeline.' });
 
-  return { score, grade, verdict, parts, fixes, target, area, vstats, sphere, voxels, bounds, segments };
+  return { score, grade, verdict, parts, fixes, target, area, vstats, sphere, voxels, bounds, segments, mainSpace };
 }
 
 function hasFlag(f, flag) {

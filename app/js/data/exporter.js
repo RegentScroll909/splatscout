@@ -11,8 +11,9 @@ import { ZipWriter } from '../core/zip.js';
 import { transformsJson, colmapText, mergePoints, plyBlob } from '../core/formats.js';
 import { analyzeCapture } from '../core/score.js';
 import { drawTopDown, drawPanorama } from '../capture/minimap.js';
+import { mainSpace, spaceOf, spaceCount } from '../core/spaces.js';
 
-export const APP_VERSION = '2.0.0';
+export const APP_VERSION = '2.1.0';
 
 export function slugify(s) {
   return (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'capture';
@@ -26,10 +27,12 @@ export function exportName(capture) {
 
 /**
  * @param capture capture record
- * @param frames full frame records (with jpeg blobs) in order
+ * @param frames full frame records (with jpeg blobs) in order: the photos chosen for export
+ * @param o.includePoses write the AR poses
+ * @param o.selection what was left out, recorded in the manifest ({total, left: {reason: count}})
  * @param onProgress (fraction, label)
  */
-export async function buildExport(capture, frames, { includePoses = true } = {}, onProgress = () => {}) {
+export async function buildExport(capture, frames, { includePoses = true, selection = null } = {}, onProgress = () => {}) {
   const base = exportName(capture);
   const zip = new ZipWriter();
   const names = frames.map((_, i) => `${String(i + 1).padStart(4, '0')}.jpg`);
@@ -59,11 +62,13 @@ export async function buildExport(capture, frames, { includePoses = true } = {},
       createdAt: new Date(capture.createdAt).toISOString(),
       segments: capture.segments,
       device: capture.device,
+      alignLog: capture.alignLog || [],
       stats: capture.stats,
     },
     // Scan area in the AR session's coordinates (same frame as the poses below): a floor-plan
     // polygon [[x, z], ...] at floorY, plus skipped spots [x, y, z, radius]. Useful to crop splats.
     bounds: analysis.bounds ? { ...analysis.bounds.toJSON(), poseFrame: 'poses/transforms.json' } : null,
+    selection: selection || { total: frames.length, left: {} },
     score: { score: analysis.score, grade: analysis.grade, verdict: analysis.verdict, parts: analysis.parts.map(({ id, label, value, detail }) => ({ id, label, value: +value.toFixed(3), detail })), fixes: analysis.fixes },
     conventions: {
       pose: 'camera-to-world 4x4, column-major, OpenGL camera (x right, y up, looks down -z), world y-up, metres',
@@ -73,6 +78,7 @@ export async function buildExport(capture, frames, { includePoses = true } = {},
       file: `images/${names[i]}`,
       seq: f.seq,
       segment: f.segment,
+      space: spaceOf(f, capture),
       pass: f.pass,
       t: f.t,
       tracked: f.tracked,
@@ -86,17 +92,13 @@ export async function buildExport(capture, frames, { includePoses = true } = {},
   };
   await zip.add(`${base}/splatscout.json`, JSON.stringify(manifest, null, 1));
 
-  // Poses from the largest AR session (each session has its own coordinate frame).
+  // Poses from the main space: AR sessions that were lined up with each other share coordinates.
   let posedNote = 'No AR poses (camera mode or tracking unavailable).';
   if (includePoses && capture.tracking === '6dof') {
-    const bySeg = new Map();
-    frames.forEach((f, i) => {
-      if (!f.tracked || !f.pose || !f.intr) return;
-      if (!bySeg.has(f.segment)) bySeg.set(f.segment, []);
-      bySeg.get(f.segment).push({ ...f, name: names[i] });
-    });
-    let main = [];
-    for (const list of bySeg.values()) if (list.length > main.length) main = list;
+    const posed = (f) => f.tracked && f.pose && f.intr;
+    const ms = mainSpace(frames, capture, posed);
+    const main = ms ? frames.map((f, i) => ({ ...f, name: names[i] })).filter((f) => posed(f) && spaceOf(f, capture) === ms.space) : [];
+    const others = spaceCount(frames, capture) - 1;
     if (main.length >= 3) {
       onProgress(0.9, 'Writing poses');
       // Keep only points on confirmed surfaces (seen by several depth frames, never seen through)
@@ -112,7 +114,8 @@ export async function buildExport(capture, frames, { includePoses = true } = {},
       await zip.add(`${base}/poses/colmap/sparse/0/rigs.txt`, col.rigs);
       await zip.add(`${base}/poses/colmap/sparse/0/frames.txt`, col.frames);
       if (hasPts) await zip.add(`${base}/poses/points.ply`, new Uint8Array(await plyBlob(pts).arrayBuffer()));
-      posedNote = `AR poses for ${main.length} of ${frames.length} photos (largest AR session)` + (bySeg.size > 1 ? `; ${bySeg.size - 1} other session(s) not included because their coordinates are not aligned.` : '.');
+      const sessions = new Set(main.map((f) => f.segment)).size;
+      posedNote = `AR poses for ${main.length} of ${frames.length} photos` + (sessions > 1 ? ` (${sessions} AR sessions lined up into one map)` : '') + (others > 0 ? `; ${others} other map(s) not included because they weren't lined up with this one.` : '.');
     }
   }
 
@@ -133,7 +136,7 @@ async function coveragePng(analysis, frames, capture) {
     ctx.fillStyle = '#101418';
     ctx.fillRect(0, 0, 1024, 1024);
     if (capture.tracking === '6dof' && analysis.vstats.solid > 50) {
-      drawTopDown(c, { voxels: analysis.voxels, frames, pose: null, target: null, segment: null, bounds: analysis.bounds });
+      drawTopDown(c, { voxels: analysis.voxels, frames, pose: null, target: null, space: analysis.mainSpace, capture, bounds: analysis.bounds });
     } else {
       c.height = 512;
       ctx.fillStyle = '#101418';

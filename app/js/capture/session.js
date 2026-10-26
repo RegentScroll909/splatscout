@@ -9,6 +9,9 @@ import { MotionWindow, Parallax3DoF, blurRisk } from '../core/motion.js';
 import { heightHint } from '../core/plans.js';
 import { Bounds, polyArea, polyCentroid } from '../core/bounds.js';
 import { Guide } from '../core/guide.js';
+import { Relocalizer } from './relocalizer.js';
+import { spaceOf, boundsFor, mainSpace } from '../core/spaces.js';
+import { integrateFrames } from '../core/score.js';
 import { boundsGeometry, chevronTrail, standMarker, ghostPhone, cursorGeometry } from './guideDraw.js';
 import { crc32 } from '../core/zip.js';
 import {
@@ -46,6 +49,8 @@ export class CaptureSession {
     this.frames = existingFrames.map(stripBlobs);
     this.seq = this.frames.reduce((m, f) => Math.max(m, f.seq), 0);
     this.segment = (capture.segments || 0) + 1;
+    this.space = this.segment * 100; // this session's own coordinates until it's lined up with an earlier one
+    this.splits = 0;
     this.passIndex = 0;
 
     this.sphere = new DirectionSphere();
@@ -58,13 +63,10 @@ export class CaptureSession {
     this.motionWin = new MotionWindow(3);
     this.par3 = null;
 
-    // Scan area. A new AR session has its own coordinates, so an earlier area only carries over in
-    // the practice room (its coordinates never change).
+    // Scan area. A new AR session has its own coordinates: the earlier area comes back once the
+    // session has been lined up with the scan (resume()).
     this.bounds = null;
-    if (this.sixdof && capture.bounds && (capture.bounds.segment === this.segment || String(capture.engine).startsWith('demo'))) {
-      this.bounds = Bounds.from({ ...capture.bounds, segment: this.segment });
-      if (this.bounds) this.voxels.setBounds(this.bounds);
-    }
+    this.reloc = this.sixdof ? new Relocalizer(this) : null;
     this.guide = this.sixdof ? new Guide({ template, bounds: this.bounds, voxels: this.voxels }) : null;
     this.guidePending = true;
     this.boundsDraft = null; // {corners: [[x, z], ...]} while the user marks the scan area
@@ -138,12 +140,73 @@ export class CaptureSession {
     this._boundsDirty = true;
   }
 
+  /**
+   * What an earlier AR session left to continue: the main space of the saved photos, if it has depth.
+   * @returns {{space, count, frames: Array}|null}
+   */
+  resumable() {
+    if (!this.sixdof) return null;
+    const withDepth = (f) => f.tracked && f.pose && f.pts && f.pts.length;
+    const main = mainSpace(this.frames, this.capture, withDepth);
+    if (!main || main.count < 8) return null;
+    const frames = this.frames.filter((f) => withDepth(f) && spaceOf(f, this.capture) === main.space);
+    return { space: main.space, count: main.count, frames };
+  }
+
+  /**
+   * Continue an earlier scan: rebuild its coverage map, scan area and pass, then search for where
+   * this AR session is in it. Photos wait until it's found (or the user starts a new map).
+   */
+  resume() {
+    const r = this.resumable();
+    if (!r) return false;
+    this.space = r.space;
+    this.voxels.reset();
+    integrateFrames(this.voxels, r.frames);
+    const b = boundsFor(this.capture, r.space);
+    if (b) {
+      this.bounds = Bounds.from({ ...b, space: r.space });
+      this.voxels.setBounds(this.bounds);
+      if (this.guide) this.guide.bounds = this.bounds;
+    }
+    for (const fr of r.frames) {
+      this.sphere.addView(fr.pose, fr.intr, { pos: posePosition(fr.pose), odo: 0 }, 0);
+    }
+    if (this.capture.passIndex != null) this.passIndex = clamp(this.capture.passIndex, 0, this.template.passes.length - 1);
+    this.resumed = r;
+    this._resetPassGuide();
+    this._emit('searching', { reason: 'resume' });
+    this.reloc.begin('resume', this.lastT || 0);
+    return true;
+  }
+
+  /** Stop trying to line up: this session gets its own coordinates and a fresh map. */
+  startNewMap() {
+    if (!this.reloc) return;
+    this.reloc.abandon();
+    // A space id no photo uses yet.
+    this.space = this.segment * 100 + ++this.splits;
+    while (this.frames.some((fr) => spaceOf(fr, this.capture) === this.space)) this.space++;
+    this.resumed = null;
+    this.voxels.reset();
+    // The earlier map keeps its scan area; this one starts without.
+    this.bounds = null;
+    this.voxels.setBounds(null);
+    if (this.guide) this.guide.setBounds(null);
+    this._boundsDirty = true;
+    this.areaDone = false;
+    this._resetPassGuide();
+    this.sphere.reset();
+    this.passSpheres.clear();
+    this._overlayKeyframesDirty = true;
+  }
+
   pause() {
     this.paused = true;
     this.keyframer.cancel();
   }
 
-  resume() {
+  unpause() {
     this.paused = false;
     this.flow.reset();
   }
@@ -184,6 +247,8 @@ export class CaptureSession {
     this.stats.warnings = mergeCounts(this.baseWarnings, this.coach.counts);
     this.capture.frameCount = this.frames.length;
     this.capture.stats = { ...this.stats };
+    this.capture.passIndex = this.passIndex;
+    if (this.reloc && this.reloc.log.length) this.capture.alignLog = [...(this.capture.alignLog || []), ...this.reloc.log.splice(0)].slice(-50);
     this.capture.device = {
       ua: navigator.userAgent,
       camera: this.source.info.label,
@@ -258,10 +323,10 @@ export class CaptureSession {
     const c = this.boundsDraft && this.boundsDraft.corners;
     if (!c || c.length < 3) return false;
     const skips = this.bounds ? this.bounds.skips : [];
-    this.setBounds(new Bounds({ poly: c, floorY: this.floorHeight(), margin: this.template.boundsMargin || 0.35, skips, segment: this.segment }));
+    this.setBounds(new Bounds({ poly: c, floorY: this.floorHeight(), margin: this.template.boundsMargin || 0.35, skips, segment: this.segment, space: this.space }));
     this.boundsDraft = null;
     this.boundsCursor = null;
-    this.resume();
+    this.unpause();
     return true;
   }
 
@@ -269,14 +334,14 @@ export class CaptureSession {
     this.boundsDraft = null;
     this.boundsCursor = null;
     this._boundsDirty = true;
-    this.resume();
+    this.unpause();
   }
 
   setBounds(b) {
     this.bounds = b;
     this.voxels.setBounds(b);
     if (this.guide) this.guide.setBounds(b);
-    this.capture.bounds = b ? b.toJSON() : null;
+    this._saveBounds();
     this._boundsDirty = true;
     this.areaDone = false;
     this._resetPassGuide();
@@ -286,13 +351,13 @@ export class CaptureSession {
   skipSpot(p, r = 0.5) {
     if (!p) return false;
     if (!this.bounds) {
-      this.bounds = new Bounds({ poly: null, floorY: null, segment: this.segment });
+      this.bounds = new Bounds({ poly: null, floorY: null, segment: this.segment, space: this.space });
       this.voxels.setBounds(this.bounds);
       if (this.guide) this.guide.bounds = this.bounds;
     }
     this.bounds.addSkip(p, r);
     this.voxels.boundsChanged();
-    this.capture.bounds = this.bounds.toJSON();
+    this._saveBounds();
     if (this.guide) this.guide.gap = null;
     return true;
   }
@@ -301,13 +366,20 @@ export class CaptureSession {
     if (!this.bounds || !this.bounds.skips.length) return false;
     this.bounds.removeLastSkip();
     this.voxels.boundsChanged();
-    this.capture.bounds = this.bounds.toJSON();
+    this._saveBounds();
     return true;
+  }
+
+  /** Remember the scan area with the capture, per coordinate space. */
+  _saveBounds() {
+    const json = this.bounds ? this.bounds.toJSON() : null;
+    this.capture.bounds = json;
+    this.capture.boundsBySpace = { ...(this.capture.boundsBySpace || {}), [this.space]: json };
   }
 
   /** Skip the spot the guide is currently pointing at. */
   skipGuideSpot() {
-    if (this.guide) this.guide.skipGap(this.lastT);
+    if (this.guide) this.guide.skip(this.lastT);
     this.lastGuide = 0;
   }
 
@@ -323,7 +395,8 @@ export class CaptureSession {
 
   /** Where the practice room's autopilot should walk and aim next. */
   autopilotTarget() {
-    if (!this.guide || !this.lastPose || this.boundsDraft) return null;
+    // While re-aligning there's no guide target: the practice tour just looks around.
+    if (!this.guide || !this.lastPose || this.boundsDraft || (this.reloc && this.reloc.holding)) return null;
     return this.guide.autopilot(posePosition(this.lastPose));
   }
 
@@ -333,6 +406,11 @@ export class CaptureSession {
     if (!this.t0) this.t0 = t;
     const dt = this.lastT ? clamp(t - this.lastT, 0, 0.25) : 0;
     this.lastT = t;
+    // Line the pose up with the scan. In place: the screen projection, depth points and overlay all
+    // share this array, so they follow.
+    const raw = this.reloc && fi.pose ? this.reloc.apply(fi) : null;
+    if (this.reloc) this.reloc.frame(fi, raw, t, dt);
+    const holding = !!(this.reloc && this.reloc.holding);
     if (this.recording && !this.paused) this.stats.activeSec += dt;
     const L = this.live;
     L.t = t;
@@ -379,7 +457,7 @@ export class CaptureSession {
     if (this.startY === null && tracked6) this.startY = pos[1];
 
     // Floor: horizontal AR hits well below the phone (the lowest ones, so tabletops don't count).
-    if (fi.hit && fi.hit.n && fi.hit.n[1] > 0.9 && fi.hit.p[1] < pos[1] - 0.5 && fi.hit.p[1] > pos[1] - 2.3) {
+    if (fi.hit && !holding && fi.hit.n && fi.hit.n[1] > 0.9 && fi.hit.p[1] < pos[1] - 0.5 && fi.hit.p[1] > pos[1] - 2.3) {
       this.floorHits.push(fi.hit.p[1]);
       if (this.floorHits.length > 60) this.floorHits.shift();
     }
@@ -390,12 +468,23 @@ export class CaptureSession {
         this.lastMed = t;
         this.depthMed = fi.depth.median() || this.depthMed;
       }
-      if (t - this.lastDepthSeen > DEPTH_SEEN_INTERVAL && this.recording) {
+      // While the position is being checked, depth only feeds the alignment (more of it, and
+      // nothing goes into the map until it's lined up).
+      if (t - this.lastDepthSeen > (holding ? 0.2 : DEPTH_SEEN_INTERVAL) && this.recording) {
         this.lastDepthSeen = t;
-        const g = fi.depth.grid(24, 18);
-        if (g.xyz.length) this.voxels.integrate(g.xyz, pos);
+        const g = holding ? fi.depth.grid(32, 24) : fi.depth.grid(24, 18);
+        if (!holding && g.xyz.length) {
+          this.voxels.integrate(g.xyz, pos);
+          if (this.reloc) this.reloc.mapUpdated(t);
+        }
+        if (this.reloc) this.reloc.addDepth(g, raw, fi.intr, t);
       }
     }
+    if (this.reloc && this.recording) {
+      const ev = this.reloc.tick(t);
+      if (ev) this._onRelocEvent(ev);
+    }
+    this.live.reloc = this.reloc && this.reloc.mode ? this._relocState() : null;
 
     // Marking the scan area: the floor cursor follows the centre dot.
     if (this.boundsDraft) {
@@ -415,7 +504,7 @@ export class CaptureSession {
 
     // Keyframe selection. Candidates are evaluated whenever a photo is (nearly) due, also while
     // moving: the keyframer keeps the sharpest one instead of waiting for the user to stop.
-    const canShoot = this.recording && !this.paused && !this.orientationChanged && fi.requestCandidate &&
+    const canShoot = this.recording && !this.paused && !holding && !this.orientationChanged && fi.requestCandidate &&
       !(this.sixdof && fi.trackState === 'lost');
     // Standing on a gap marker, aimed at the ring: that's the photo the guide asked for.
     const gs = this.live.guide;
@@ -425,6 +514,12 @@ export class CaptureSession {
       const last = this.frames.length ? this.frames[this.frames.length - 1] : null;
       const recent = last && last.segment === this.segment && this.t0 + last.t > t - 1;
       if (at && aimed && !recent && this.rotSpeed < 25) this.keyframer.request();
+    }
+    // Same on a path: standing on the next spot, aimed, a photo is due even without moving on.
+    if (canShoot && gs && gs.mode === 'path' && gs.wantPhoto && !this.keyframer.forced) {
+      const last = this.frames.length ? this.frames[this.frames.length - 1] : null;
+      const recent = last && last.segment === this.segment && this.t0 + last.t > t - 1.2;
+      if (!recent && this.rotSpeed < 25) this.keyframer.request();
     }
     if (canShoot && !this.candidatePending && this.saving < 4) {
       const kstate = { t, pose, odo: this.par3 ? this.par3.odo : 0, depthMed: this.depthMed };
@@ -467,27 +562,127 @@ export class CaptureSession {
     const tp = this.target && (this.target.point || this.target.dir);
     L.targetScreen = tp && fi.toScreen ? fi.toScreen(tp, !this.target.point) : null;
     L.aimOk = !!(this.target && this.target.point && v3.dot(fwd, v3.norm(v3.sub(this.target.point, pos))) > Math.cos(12 * DEG));
-    L.walk = this._walkHint(pos, pose);
+    L.cue = this._cue(pos, pose, t);
+    L.stuck = !!(this.live.guide && this.live.guide.stuck && !this.paused);
     L.pose = pose;
   }
 
-  /** Which way to walk to the guide's next point, relative to where the phone faces: {angle (deg, 0 = ahead, 90 = right), dist}. */
-  _walkHint(pos, pose) {
+  _onRelocEvent(ev) {
+    if (ev.type === 'searching') this.keyframer.cancel();
+    if (ev.type === 'realigned' || ev.type === 'trackingBack' || ev.type === 'corrected') {
+      this._boundsDirty = true;
+      this._overlayKeyframesDirty = true;
+      this.flow.reset();
+      this.lastGuide = 0;
+      if (ev.type === 'realigned' && this.resumed) this.resumed = null;
+    }
+    this._emit(ev.type, ev);
+  }
+
+  /** Alignment status for the HUD. */
+  _relocState() {
+    const r = this.reloc, st = r.state || {};
+    return {
+      mode: r.mode, reason: st.reason, status: st.status, confidence: st.confidence || 0, preview: !!st.preview,
+      manual: !!st.manual, since: this.lastT - (st.t0 || this.lastT), frames: st.frames ? st.frames.length : 0, metrics: st.metrics || null,
+    };
+  }
+
+  /** Line up by hand while searching (drag on screen). */
+  nudgeAlignment(right, forward, turnDeg) {
+    if (this.reloc && this.reloc.mode === 'search') this.reloc.nudge(right, forward, turnDeg, this.reloc.prevRaw || this._rawNow());
+  }
+
+  /** Accept the alignment shown on screen. */
+  acceptAlignment() {
+    if (!this.reloc || this.reloc.mode !== 'search') return;
+    const ev = this.reloc.acceptPreview(this.lastT);
+    if (ev) this._onRelocEvent(ev);
+  }
+
+  /** "I'm standing where this photo was taken." */
+  hintAlignment(frame) {
+    if (this.reloc && this.reloc.mode && frame && frame.pose) this.reloc.hintPhoto(frame.pose, this._rawNow());
+  }
+
+  /** Check the alignment now (the user thinks the dots are off). */
+  realignNow() {
+    if (!this.reloc || this.reloc.mode) return;
+    const ev = this.reloc.begin('manual', this.lastT, { priors: [{ xf: { ...this.reloc.xf, t: this.reloc.xf.t.slice() }, radius: 1.5, yawRange: 30 }] });
+    this._onRelocEvent(ev);
+  }
+
+  _rawNow() {
+    const r = this.reloc;
+    return r && r.recent.length ? r.recent[r.recent.length - 1].pose : null;
+  }
+
+  /**
+   * One clear instruction for the middle of the screen: turn or tilt the phone, walk or sidestep, or
+   * hold still. Turning is measured from the phone's heading, so "right" is always screen-right.
+   * The kind of instruction only changes once a new one has held for a moment (no flicker between
+   * directions); the numbers update live.
+   * @returns {{kind: 'turn'|'tilt'|'around'|'walk'|'hold', arrow: number, label: string, dist?: number}|null}
+   *   arrow: screen direction in degrees (0 = up, 90 = right)
+   */
+  _cue(pos, pose, t) {
     const gs = this.live.guide;
-    if (!gs || !gs.next || this.paused || this.boundsDraft) return null;
-    let goal = gs.next.pos;
-    const S = gs.mode === 'path' && this.guide.stations;
-    if (S && gs.distTo < 1.2) goal = S[Math.min(S.length - 1, S.indexOf(gs.next) + 1)].pos;
-    const vx = goal[0] - pos[0], vz = goal[2] - pos[2];
-    const dist = Math.hypot(vx, vz);
-    if (dist < 0.25) return null;
+    if (!gs || !gs.next || !gs.phase || this.paused || this.boundsDraft || this.settings.guide === false) return this._settle(null, t);
+    const fwd = poseForward(pose);
     // Heading = where the phone points, or the top of the screen when it points straight down.
-    let f = poseForward(pose);
-    if (Math.abs(f[1]) > 0.95) f = [pose[4], 0, pose[6]];
-    const l = Math.hypot(f[0], f[2]) || 1;
-    const fx = f[0] / l, fz = f[2] / l;
-    const angle = Math.atan2(vx * -fz + vz * fx, vx * fx + vz * fz) / DEG;
-    return { angle, dist };
+    const f = Math.abs(fwd[1]) > 0.95 ? [pose[4], 0, pose[6]] : fwd;
+    const hd = Math.atan2(f[0], f[2]);
+    const wrapDeg = (a) => ((a / DEG + 540) % 360) - 180;
+    let cue;
+    if (gs.phase === 'walk' || gs.phase === 'go') {
+      const c = gs.carrot;
+      const vx = c[0] - pos[0], vz = c[2] - pos[2];
+      const dist = Math.hypot(vx, vz);
+      // Positive = to the right of the heading.
+      const ang = wrapDeg(hd - Math.atan2(vx, vz));
+      const a = Math.abs(ang);
+      const side = ang > 0 ? 'right' : 'left';
+      if (gs.phase === 'walk') {
+        const label = a < 35 ? 'Walk ahead' : a > 145 ? 'Turn around' : `Walk to your ${side}`;
+        cue = { kind: 'walk', key: 'walk' + (a < 35 ? 'f' : a > 145 ? 'b' : side), arrow: ang, label, dist };
+      } else {
+        const label = a < 35 ? 'Walk forward slowly' : a > 145 ? 'Step back slowly' : `Sidestep ${side}`;
+        cue = { kind: 'walk', key: 'go' + (a < 35 ? 'f' : a > 145 ? 'b' : side), arrow: ang, label };
+      }
+    } else {
+      const aim = gs.aimDir || gs.next.aim;
+      const yaw = Math.abs(fwd[1]) > 0.95 ? 0 : wrapDeg(hd - Math.atan2(aim[0], aim[2]));
+      const pitch = (Math.asin(clamp(aim[1], -1, 1)) - Math.asin(clamp(fwd[1], -1, 1))) / DEG;
+      const round5 = (x) => Math.max(5, Math.round(Math.abs(x) / 5) * 5);
+      if (gs.phase === 'hold' || (Math.abs(yaw) < 12 && Math.abs(pitch) < 12)) {
+        cue = { kind: 'hold', key: 'hold', arrow: 0, label: gs.mode === 'gaps' || gs.phase === 'hold' ? 'Hold steady' : 'On target' };
+      } else if (Math.abs(yaw) > 135) {
+        cue = { kind: 'around', key: 'around', arrow: yaw > 0 ? 90 : -90, label: 'Turn around' };
+      } else if (Math.abs(yaw) >= Math.abs(pitch) * 0.8) {
+        cue = { kind: 'turn', key: 'turn' + (yaw > 0 ? 'r' : 'l'), arrow: yaw > 0 ? 90 : -90, label: `Turn ${yaw > 0 ? 'right' : 'left'} ${round5(yaw)}°` };
+      } else {
+        cue = { kind: 'tilt', key: 'tilt' + (pitch > 0 ? 'u' : 'd'), arrow: pitch > 0 ? 0 : 180, label: `Tilt ${pitch > 0 ? 'up' : 'down'} ${round5(pitch)}°` };
+      }
+    }
+    return this._settle(cue, t);
+  }
+
+  _settle(cue, t) {
+    const key = cue ? cue.key : '';
+    if (key === this.cueKey) {
+      this.cueCand = null;
+      this.cueShown = cue;
+      return cue;
+    }
+    if (!this.cueCand || this.cueCand.key !== key) this.cueCand = { key, t };
+    // A first instruction shows at once; a change waits a moment, a disappearance a little longer.
+    if (this.cueKey == null || t - this.cueCand.t >= (cue ? 0.45 : 0.6)) {
+      this.cueKey = key;
+      this.cueShown = cue;
+      this.cueCand = null;
+      return cue;
+    }
+    return this.cueShown || null;
   }
 
   // ------------------------------------------------------------------ analysis tick
@@ -584,9 +779,9 @@ export class CaptureSession {
   _boundsGuidance() {
     const n = this.boundsDraft.corners.length;
     if (!this.floorKnown()) return { title: 'Finding the floor…', detail: 'Point the phone at the floor and move it slowly from side to side.' };
-    if (!this.boundsCursor) return { title: 'Aim lower, at the floor', detail: 'Point the centre dot at the floor where a corner of the area is.' };
-    if (n === 0) return { title: 'Mark the scan area', detail: this.template.boundsHint || 'Aim the centre dot at the floor in each corner and tap ＋ Corner.' };
-    if (n < 3) return { title: `Corner ${n + 1}`, detail: 'Aim at the next corner on the floor and tap ＋ Corner (or tap the spot on screen).' };
+    if (!this.boundsCursor) return { title: 'Aim lower, at the floor', detail: 'Point the centre cross at the floor where a corner of the area is.' };
+    if (n === 0) return { title: 'Mark the scan area', detail: this.template.boundsHint || 'Aim the centre cross at the floor in each corner and tap Corner.' };
+    if (n < 3) return { title: `Corner ${n + 1}`, detail: 'Aim at the next corner on the floor and tap Corner (or tap the spot on screen).' };
     return { title: `${n} corners · ${this.draftArea().toFixed(0)} m²`, detail: 'Add more corners, or tap Done when the outline matches the area.' };
   }
 
@@ -651,6 +846,7 @@ export class CaptureSession {
       },
       flags,
       trigger,
+      space: this.sixdof ? this.space : null,
       baseline: baseline == null ? null : round3(baseline),
       rotFromPrev: round3(rotFromPrev),
     };
@@ -713,7 +909,7 @@ export class CaptureSession {
     let c = null;
     if (n > 50) c = [sx / n, 0, sz / n];
     else {
-      const ps = this.frames.filter((f) => f.segment === this.segment && f.tracked).map((f) => posePosition(f.pose));
+      const ps = this.frames.filter((f) => f.tracked && spaceOf(f, this.capture) === this.space).map((f) => posePosition(f.pose));
       if (ps.length > 5) c = [ps.reduce((s, p) => s + p[0], 0) / ps.length, 0, ps.reduce((s, p) => s + p[2], 0) / ps.length];
     }
     this._center = c;
@@ -745,6 +941,11 @@ export class CaptureSession {
   }
 
   _updateGuidance(pos, fwd, tracked6, t) {
+    if (this.reloc && this.reloc.holding) {
+      this.target = null;
+      this.live.guide = null;
+      return;
+    }
     if (this.sixdof && tracked6) {
       const fy = this.voxels.floorY();
       if (fy !== null) this.floorY = fy;
@@ -761,6 +962,8 @@ export class CaptureSession {
     if (g && tracked6) {
       if (this.guidePending) {
         g.setPass(this.pass, pos);
+        // Spots already photographed (earlier passes, earlier sessions in this space) count.
+        for (const fr of this.frames) if (fr.tracked && fr.pose && spaceOf(fr, this.capture) === this.space) g.onPhoto(fr.pose);
         this.guidePending = false;
       }
       let gs = null;
@@ -775,6 +978,7 @@ export class CaptureSession {
         if (hintGaps && vs.solid > 30) gs = g.update({ pos, fwd, t });
       }
       this.live.guide = gs;
+      if (gs && gs.skipped) this._emit('spotSkipped');
       if (gs && gs.next && gs.instruction && !this.paused) {
         this.target = { point: gs.aimPoint, title: gs.instruction.title, detail: gs.instruction.detail, kind: gs.mode };
       }
@@ -825,14 +1029,18 @@ export class CaptureSession {
       const r = this.voxels.renderArrays();
       ov.setVoxels(r.pos, r.qual, this.voxels.size);
     }
-    ov.visible.voxels = this.settings.overlayVoxels !== false;
-    ov.visible.guide = true;
+    // While searching for the scan, only show it once there's a plausible guess (it then settles in place).
+    const searching = !!(this.reloc && this.reloc.mode === 'search');
+    const showMap = !searching || !!(this.reloc.state && this.reloc.state.preview);
+    ov.visible.voxels = this.settings.overlayVoxels !== false && showMap;
+    ov.visible.guide = showMap;
+    ov.visible.markers = !searching;
     if (this._overlayKeyframesDirty) {
       this._overlayKeyframesDirty = false;
       if (this.sixdof) {
         ov.setKeyframes(
           this.frames
-            .filter((f) => f.segment === this.segment && f.tracked)
+            .filter((f) => f.tracked && spaceOf(f, this.capture) === this.space)
             .map((f) => ({ pos: posePosition(f.pose), fwd: poseForward(f.pose), flagged: f.flags.includes('blurry') || f.flags.includes('rushed') })),
         );
       }

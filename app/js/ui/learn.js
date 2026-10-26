@@ -1,6 +1,7 @@
 // Capture guide: the field manual, available offline inside the app.
 
 import { h, mount } from './dom.js';
+import { icon } from './icons.js';
 
 const SECTIONS = [
   {
@@ -22,13 +23,25 @@ const SECTIONS = [
     body: `
 <ol>
 <li><b>Hold the phone sideways (landscape).</b> The AR camera sees 70° across in landscape but only 35° upright, so a sideways scan finishes much sooner.</li>
-<li><b>Mark the scan area.</b> When AR starts, aim the centre dot at the floor in each corner of the space and tap <b>＋ Corner</b> (or tap the spot on screen). Tap <b>Done</b>. Only surfaces inside the outline count, so you can capture half a hallway, or leave out what you can see through a window.</li>
-<li><b>Follow the path.</b> Each pass draws a glowing trail on the floor and a blue <b>aim ring</b>. Keep the ring near the centre of the screen and move the way the arrow at the bottom says ("Sidestep right"). The trail fills in on the map as you go, and the next pass starts by itself.</li>
+<li><b>Mark the scan area.</b> When AR starts, aim the centre cross at the floor in each corner of the space and tap <b>Corner</b> (or tap the spot on screen). Tap <b>Done</b>. Only surfaces inside the outline count, so you can capture half a hallway, or leave out what you can see through a window.</li>
+<li><b>Follow the arrow.</b> Each pass draws a trail on the floor. The arrow under the centre cross gives one instruction at a time: <b>walk</b> to the path, <b>turn</b> or <b>tilt</b> the phone ("Turn right 40°", "Tilt up 20°", "Turn around"), then <b>sidestep</b> along it. The ring shows exactly where to aim. The trail fills in on the map as you go, and the next pass starts by itself.</li>
 <li><b>Keep walking.</b> Photos are taken automatically while you move at a slow, steady pace. You don't need to stop. If you see "A little slower", ease off a bit.</li>
 <li><b>Fill the gaps.</b> The last pass sends you to the spots that still need angles: walk to the ring on the floor, aim at the red area inside the blue ring, and hold for a second. Repeat until the app says the area is complete (about <b>85%</b>).</li>
-<li><b>Skip what you can't capture.</b> Tap <b>⊘ Skip spot</b>, then tap a window, mirror or a corner you can't reach. It stops counting. Can't reach a marker? Pass sheet → <b>Skip this spot</b>.</li>
+<li><b>Skip what you can't capture.</b> Tap <b>Skip</b> (left), then tap a window, mirror or a corner you can't reach. It stops counting. Can't reach a spot the path wants? A <b>Skip this spot</b> button appears after a few seconds, and spots that can't be reached are skipped by themselves after about 15 seconds. You never have to shuffle back and forth: the guide only points ahead of you.</li>
 </ol>
 <p class="small muted">Every dot doesn't have to be green. Corners behind furniture and the tops of tall cabinets rarely matter. The area percentage weighs green fully and amber half, and 85% trains well.</p>`,
+  },
+  {
+    title: 'If tracking is lost or the AR session stops',
+    body: `
+<p>Phone AR sometimes loses its place: in the dark, in front of a blank wall, or when the phone goes to sleep and AR has to start again. SplatScout notices and puts you back in your scan instead of starting over:</p>
+<ul>
+<li><b>Tracking lost or the position jumps:</b> photos pause for a moment while the view is checked against what you already scanned. If it still lines up, you carry on. If not, the <b>Re-aligning</b> panel appears.</li>
+<li><b>Re-aligning:</b> sweep the phone slowly over walls and furniture you scanned before. Corners, doors and furniture work best; a plain wall could be anywhere. When it matches, the dots settle back onto the surfaces and you carry on where you left off.</li>
+<li><b>Coming back later</b> (screen off, app closed, another day): open the capture and tap <b>Capture more → Continue in AR</b>. Stand roughly where one of the photos shown was taken and aim the same way, which makes the match faster. Tap <b>I'm here</b> to tell the app.</li>
+<li>If it can't find its place (furniture moved, the room changed), <b>Line up by hand</b>: drag to slide the dots onto the walls, twist with two fingers to turn them, then <b>Use this position</b>. Or <b>Start a new map</b>: that session gets its own coordinates and its photos are still exported.</li>
+<li>Think the dots don't sit on the surfaces any more? Tap <b>Align</b> (left) to check.</li>
+</ul>`,
   },
   {
     title: 'The 8 golden rules',
@@ -48,13 +61,13 @@ const SECTIONS = [
     title: 'Reading the screen',
     body: `
 <ul>
-<li><b>Coach banner</b> (top): the single most important thing to fix right now. Red = stop and fix, amber = adjust, blue = tip, green = all good.</li>
-<li><b>Chips</b> (right): Speed, Sharp, Light, Detail, Depth (parallax) and Track. Keep them green.</li>
+<li><b>Status banner</b> (top): the most important problem to fix right now. Red = stop and fix, amber = adjust, cyan = tip. While everything is fine it gets out of the way and the arrow does the talking.</li>
+<li><b>Readouts</b> (top right): Speed, Sharp, Light, Detail, Depth (parallax) and Track. Keep the dots green.</li>
 <li><b>AR colours on surfaces</b>: <span class="red">red</span> = photographed from 1 angle, <span class="amber">amber</span> = 2 angles, <span class="green">green</span> = 3+ angles, faint blue = seen but not photographed yet, grey = outside the scan area or skipped. Dots behind walls and furniture are hidden.</li>
-<li><b>Yellow outline</b>: the scan area you marked.</li>
-<li><b>Glowing trail and chevrons on the floor</b>: the path for this pass. The arrow at the bottom says which way to step.</li>
-<li><b>Blue aim ring</b> (green when you're on target) and <b>edge arrow</b>: where to point the phone. In gap mode a ring on the floor and a ghost phone show where to stand.</li>
-<li><b>Tools</b> (left): <b>Area</b> redraws the outline, <b>⊘ Skip spot</b> stops counting a surface you tap, <b>Guide</b> shows or hides the path.</li>
+<li><b>Light outline on the floor</b>: the scan area you marked.</li>
+<li><b>Trail and chevrons on the floor</b>: the path for this pass.</li>
+<li><b>Arrow under the centre cross</b>: the one thing to do next (walk, turn, tilt, sidestep or hold steady). <b>Ring</b> (green when you're on target): where to point the phone. In gap mode a ring on the floor and a ghost phone show where to stand.</li>
+<li><b>Tools</b> (left): <b>Area</b> redraws the outline, <b>Skip</b> stops counting a surface you tap, <b>Guide</b> shows or hides the path, <b>Align</b> re-checks the position against the scan.</li>
 <li><b>Map</b> (bottom left): the floor plan of what's scanned, the scan area, the planned path (green where done), and where you are. Tap it to enlarge. In camera mode it's a panorama of every direction around you.</li>
 <li><b>Pass pill</b> (top): the current step of the plan and its progress. Tap it for instructions, to switch passes, or to change the scan area. <b>Area %</b> next to it is how complete the whole scan area is.</li>
 <li><b>Shutter</b> (bottom right): forces a photo. Normally unnecessary, since photos are automatic.</li>
@@ -110,8 +123,8 @@ const SECTIONS = [
     title: 'Getting photos into your splat pipeline',
     body: `
 <ol>
-<li>Review → <b>Export ZIP</b> → Save. On Android the ZIP goes to <i>Downloads</i>.</li>
-<li>With <b>SplatStation</b> running on the PC, plug the phone in over USB and it imports and trains the ZIP by itself. Otherwise move it to your PC (Quick Share, Google Drive…) and unzip it.</li>
+<li>Review → <b>Export</b>. Choose what to include (leave out blurry photos, a pass, or an AR map that wasn't lined up), then <b>Build ZIP → Save ZIP</b>. On Android the ZIP goes to <i>Downloads</i>. The home screen shows which captures are exported and which have new photos since.</li>
+<li>With <b>SplatStation</b> running on the PC, plug the phone in over USB: its exports are listed under <b>Phone over USB</b>, and you tick the ones to import. Imported captures wait under <b>Ready to process</b> until you pick the quality and press <b>Process</b>. (Both can be made automatic in Defaults.) Otherwise move the ZIP to your PC (Quick Share, Google Drive…) and drop it on the dashboard.</li>
 <li>Point your pipeline at <code>images/</code>. These are already sharp, well-spaced keyframes, so skip any "extract frames from video" step.</li>
 <li>All photos come from one camera with fixed settings, so treat them as a single camera (e.g. COLMAP <code>--ImageReader.single_camera 1</code>).</li>
 <li>If your pipeline only takes video: <code>ffmpeg -framerate 4 -i images/%04d.jpg -c:v libx264 -crf 14 -pix_fmt yuv420p capture.mp4</code></li>
@@ -135,7 +148,7 @@ export function learnScreen(root, { navigate }) {
   mount(
     root,
     h('div.page',
-      h('header.page-head', h('button.icon-btn', { onclick: () => navigate('#/') }, '←'), h('h1', 'Capture guide')),
+      h('header.page-head', h('button.icon-btn', { onclick: () => navigate('#/'), 'aria-label': 'Back' }, icon('back')), h('h1', 'Capture guide')),
       SECTIONS.map((s) => h('details.card.guide', { open: !!s.open }, h('summary', s.title), h('div.guide-body', { html: s.body }))),
       h('button.btn.primary.block', { onclick: () => navigate('#/new?practice=1') }, 'Try it in the Practice room'),
     ),

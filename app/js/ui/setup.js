@@ -1,6 +1,7 @@
 // New capture setup: where, what kind of space, which capture mode, and a pre-flight checklist.
 
 import { h, mount, toast } from './dom.js';
+import { icon, templateIcon } from './icons.js';
 import { TEMPLATES, PREFLIGHT, getTemplate } from '../core/plans.js';
 import { xrSupport } from '../sources/xrSource.js';
 import { listCameras, RESOLUTIONS, LENS_FOV } from '../sources/cameraSource.js';
@@ -56,7 +57,7 @@ export async function setupScreen(root, { navigate, query }) {
       h('section.card',
         h('h2', 'Type of space'),
         h('div.tpl-grid', TEMPLATES.map((t) => h('button.tpl' + (t.id === st.template ? '.active' : ''), { onclick: () => { st.template = t.id; render(); } },
-          h('span.tpl-icon', t.icon), h('span', t.name)))),
+          templateIcon(t.id, 'tpl-icon'), h('span', t.name)))),
         h('p.small.muted', tpl.desc),
         h('ol.small.pass-list', tpl.passes.map((p) => h('li', h('b', p.name), ` · ${p.short}`))),
       ),
@@ -88,7 +89,7 @@ export async function setupScreen(root, { navigate, query }) {
         h('label.field', h('span', 'Notes (optional)'), h('textarea', { rows: 2, placeholder: 'Lighting, access, anything unusual…', oninput: (e) => (st.notes = e.target.value) }, st.notes)),
       ),
 
-      h('button.btn.primary.big.block', { onclick: start }, practice ? 'Open practice room' : 'Continue to capture →'),
+      h('button.btn.primary.big.block', { onclick: start }, practice ? 'Open practice room' : 'Continue to capture'),
     );
     updateCount();
   };
@@ -165,6 +166,6 @@ export async function setupScreen(root, { navigate, query }) {
     navigate(`#/capture/${capture.id}`);
   }
 
-  mount(root, h('div.page', h('header.page-head', h('button.icon-btn', { onclick: () => navigate('#/') }, '←'), h('h1', practice ? 'Practice' : 'New capture')), body));
+  mount(root, h('div.page', h('header.page-head', h('button.icon-btn', { onclick: () => navigate('#/'), 'aria-label': 'Back' }, icon('back')), h('h1', practice ? 'Practice' : 'New capture')), body));
   render();
 }

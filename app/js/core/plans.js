@@ -16,7 +16,7 @@ export const TEMPLATES = [
     viewDist: 1.6,
     framesPerM2: 6,
     minFrames: 150,
-    boundsHint: 'Aim the centre dot at the floor in each corner of the room and tap ＋ Corner.',
+    boundsHint: 'Aim the centre cross at the floor in each corner of the room and tap Corner.',
     passes: [
       {
         id: 'mid', name: 'Eye-level lap', height: 'chest', loop: true, bands: ['mid'], guide: { kind: 'loop', inset: 1.0, pitch: -8, yaw: 15 },
@@ -57,7 +57,7 @@ export const TEMPLATES = [
         short: 'The app picks the spots that still need angles: stand on each marker and aim at the ring.',
         steps: [
           'Walk to the ring on the floor, then aim at the red area inside the blue ring. Each one takes a few seconds.',
-          'Can\'t get there? Tap "Skip this spot" in this sheet, or mark it with ⊘ so it no longer counts.',
+          'Can\'t get there? Tap "Skip this spot" in this sheet, or mark it with the Skip tool so it no longer counts.',
           'Look straight up at the ceiling and straight down at the floor while moving slowly.',
           'For each doorway, walk through slowly in both directions so rooms can be joined later.',
         ],

@@ -5,10 +5,12 @@
 
 import { VoxelMap, BANDS } from '../core/coverage.js';
 import { posePosition, poseForward, dirToAzEl } from '../core/math.js';
+import { spaceOf } from '../core/spaces.js';
 
-const QCOL = ['rgba(120,160,255,0.45)', '#ff4d4d', '#ffbd2e', '#3ddc84'];
+const QCOL = ['rgba(120,150,190,0.45)', '#f26d6d', '#f5b942', '#34d399'];
+const ACCENT = '#3ddcff';
 
-export function drawTopDown(canvas, { voxels, frames, pose, target, segment, bounds = null, draft = null, guidePath = null }) {
+export function drawTopDown(canvas, { voxels, frames, pose, target, space = null, capture = null, bounds = null, draft = null, guidePath = null }) {
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
   ctx.clearRect(0, 0, W, H);
@@ -34,7 +36,7 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, segment, bou
   if (poly) for (const p of poly) pts.push(p);
   else for (const c of cols.values()) pts.push([(c.ix + 0.5) * s, (c.iz + 0.5) * s]);
   if (draft) for (const p of draft) pts.push(p);
-  const path = frames.filter((f) => f.tracked && (segment == null || f.segment === segment)).map((f) => posePosition(f.pose));
+  const path = frames.filter((f) => f.tracked && f.pose && (space == null || spaceOf(f, capture) === space)).map((f) => posePosition(f.pose));
   for (const p of path) pts.push([p[0], p[2]]);
   const here = pose ? posePosition(pose) : null;
   if (here) pts.push([here[0], here[2]]);
@@ -52,6 +54,20 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, segment, bou
   const scale = Math.min(W, H) / span;
   const X = (x) => W / 2 + (x - cx) * scale;
   const Y = (z) => H / 2 + (z - cz) * scale;
+
+  // 1 m grid.
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let gx = Math.floor(cx - span); gx <= cx + span; gx++) {
+    ctx.moveTo(Math.round(X(gx)) + 0.5, 0);
+    ctx.lineTo(Math.round(X(gx)) + 0.5, H);
+  }
+  for (let gz = Math.floor(cz - span); gz <= cz + span; gz++) {
+    ctx.moveTo(0, Math.round(Y(gz)) + 0.5);
+    ctx.lineTo(W, Math.round(Y(gz)) + 0.5);
+  }
+  ctx.stroke();
 
   const cell = Math.max(1.5, s * scale);
   for (const c of cols.values()) {
@@ -71,9 +87,11 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, segment, bou
     ctx.stroke();
   };
   if (poly) {
-    ctx.strokeStyle = 'rgba(255,199,51,0.9)';
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(230,246,255,0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
     outline(poly, true);
+    ctx.setLineDash([]);
   }
   if (bounds && bounds.skips) {
     ctx.strokeStyle = 'rgba(200,200,200,0.7)';
@@ -85,8 +103,8 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, segment, bou
     }
   }
   if (draft && draft.length) {
-    ctx.strokeStyle = 'rgba(255,199,51,0.9)';
-    ctx.fillStyle = '#ffc733';
+    ctx.strokeStyle = 'rgba(230,246,255,0.9)';
+    ctx.fillStyle = '#e6f6ff';
     ctx.lineWidth = 2;
     outline(draft, draft.length >= 3);
     for (const [x, z] of draft) {
@@ -99,18 +117,18 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, segment, bou
   if (guidePath && guidePath.length) {
     for (const st of guidePath) {
       if (st.transit) continue;
-      ctx.fillStyle = st.done ? 'rgba(61,220,132,0.85)' : 'rgba(64,224,255,0.75)';
+      ctx.fillStyle = st.done ? 'rgba(52,211,153,0.85)' : 'rgba(61,220,255,0.75)';
       ctx.fillRect(X(st.pos[0]) - 1.5, Y(st.pos[2]) - 1.5, 3, 3);
     }
   }
 
   if (path.length > 1) {
-    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 1;
     ctx.beginPath();
     path.forEach((p, i) => (i ? ctx.lineTo(X(p[0]), Y(p[2])) : ctx.moveTo(X(p[0]), Y(p[2]))));
     ctx.stroke();
-    ctx.fillStyle = '#5ad8ff';
+    ctx.fillStyle = ACCENT;
     for (const p of path) {
       ctx.beginPath();
       ctx.arc(X(p[0]), Y(p[2]), 1.6, 0, Math.PI * 2);
@@ -119,8 +137,8 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, segment, bou
   }
 
   if (target) {
-    ctx.strokeStyle = '#33e6ff';
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.arc(X(target[0]), Y(target[2]), 7, 0, Math.PI * 2);
     ctx.stroke();
@@ -132,7 +150,7 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, segment, bou
     ctx.save();
     ctx.translate(X(here[0]), Y(here[2]));
     ctx.rotate(a);
-    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fillStyle = 'rgba(61,220,255,0.16)';
     ctx.beginPath();
     ctx.moveTo(0, 0);
     ctx.arc(0, 0, 28, -0.55, 0.55);
@@ -160,7 +178,7 @@ export function drawPanorama(canvas, { sphere, pose, need = 2 }) {
   const ey = (el) => ((90 - el) / 180) * H;
   for (const b of sphere.bins) {
     const n = b.distinct;
-    ctx.fillStyle = n >= need ? 'rgba(61,220,132,0.75)' : n > 0 ? 'rgba(255,189,46,0.75)' : 'rgba(255,255,255,0.08)';
+    ctx.fillStyle = n >= need ? 'rgba(52,211,153,0.75)' : n > 0 ? 'rgba(245,185,66,0.75)' : 'rgba(255,255,255,0.07)';
     const xa = ax(b.az0), xb = ax(b.az1);
     const y0 = ey(b.el1), y1 = ey(b.el0);
     if (xb > xa) ctx.fillRect(xa + 0.5, y0 + 0.5, xb - xa - 1, y1 - y0 - 1);
@@ -170,7 +188,7 @@ export function drawPanorama(canvas, { sphere, pose, need = 2 }) {
     }
   }
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
-  ctx.font = `${Math.round(H / 9)}px system-ui, sans-serif`;
+  ctx.font = `${Math.round(H / 9)}px ui-monospace, Menlo, monospace`;
   ctx.fillText('ceiling', 4, H / 9 + 2);
   ctx.fillText('floor', 4, H - 4);
   for (const band of BANDS) {
@@ -190,7 +208,7 @@ export function drawPanorama(canvas, { sphere, pose, need = 2 }) {
 
 function drawEmpty(ctx, W, H, text) {
   ctx.fillStyle = 'rgba(255,255,255,0.45)';
-  ctx.font = `${Math.round(H / 11)}px system-ui, sans-serif`;
+  ctx.font = `${Math.round(H / 11)}px ui-monospace, Menlo, monospace`;
   ctx.textAlign = 'center';
   ctx.fillText(text, W / 2, H / 2);
   ctx.textAlign = 'start';

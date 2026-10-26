@@ -3,7 +3,8 @@
 //   node station/station.mjs            (or double-click start-station.cmd)
 //
 // Then open http://localhost:8787. Drop captures in the inbox folder, upload them from the
-// dashboard (also from a phone on the same Wi-Fi), or plug the phone in over USB.
+// dashboard (also from a phone on the same Wi-Fi), or plug the phone in over USB and pick them.
+// New captures wait until you press Process (unless automatic processing is switched on).
 
 import { createServer } from 'node:http';
 import { createReadStream, createWriteStream, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync } from 'node:fs';
@@ -14,6 +15,7 @@ import { loadConfig, saveConfig, PRESETS } from './lib/config.mjs';
 import { processJob, STAGES, sourceKind, guessNames } from './lib/pipeline.mjs';
 import { killTree, capture } from './lib/run.mjs';
 import { PhoneImporter } from './lib/adb.mjs';
+import { readZipText } from './lib/zipread.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, 'web');
@@ -28,6 +30,7 @@ for (const j of jobs) if (j.status === 'running') j.status = 'interrupted';
 const clients = new Set();
 const log = [];
 let current = null; // {job, token}
+let queuePaused = false; // finish the running job, then start nothing new
 
 function saveJobs() {
   writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 1));
@@ -64,6 +67,10 @@ function say(text, job) {
   console.log(`[${new Date().toLocaleTimeString()}] ${job ? `(${job.room || job.id}) ` : ''}${text}`);
 }
 
+/**
+ * Register a capture. It waits for "Process" unless asked to start (opts.process) or automatic
+ * processing is on.
+ */
 function newJob(file, opts = {}) {
   const kind = sourceKind(file);
   if (!kind) return null;
@@ -73,22 +80,54 @@ function newJob(file, opts = {}) {
   const dest = join(dir, 'source', basename(file));
   renameSync(file, dest);
   const names = guessNames(file);
+  const start = opts.process != null ? opts.process : !!cfg.autoProcess;
   const job = {
-    id, dir, created: Date.now(), status: 'queued', preset: opts.preset || cfg.preset,
+    id, dir, created: Date.now(), status: start ? 'queued' : 'waiting', order: Date.now(), preset: opts.preset || cfg.preset,
     source: { kind, file: dest, name: basename(file), size: statSync(dest).size },
     building: names.building, room: names.room,
     stages: Object.fromEntries(STAGES.map((s) => [s.id, { p: 0, note: '' }])), messages: [],
   };
   jobs.unshift(job);
   changed(job);
-  say(`Queued ${basename(file)} (${PRESETS[job.preset].label}).`, job);
+  say(start ? `Queued ${basename(file)} (${PRESETS[job.preset].label}).` : `Received ${basename(file)}. It waits until you press Process.`, job);
+  inspectSource(job);
   pump();
   return job;
 }
 
+/** What's in a SplatScout ZIP (photos, grade, scan area), shown before processing. */
+async function inspectSource(job) {
+  if (job.source.kind !== 'zip') return;
+  try {
+    const txt = await readZipText(job.source.file, 'splatscout.json');
+    if (!txt) return;
+    const m = JSON.parse(txt);
+    const c = m.capture || {};
+    const frames = m.frames || [];
+    job.building = c.building || job.building;
+    job.room = c.room || job.room;
+    const left = m.selection && m.selection.left ? Object.values(m.selection.left).reduce((a, b) => a + b, 0) : 0;
+    job.summary = {
+      photos: frames.length,
+      posed: frames.filter((f) => f.tracked && f.pose).length,
+      sessions: new Set(frames.map((f) => f.segment)).size,
+      maps: new Set(frames.filter((f) => f.tracked).map((f) => (f.space != null ? f.space : f.segment))).size,
+      grade: m.score ? m.score.grade : null,
+      score: m.score ? m.score.score : null,
+      area: !!(m.bounds && m.bounds.poly),
+      engine: c.engine || null,
+      author: c.author || null,
+      capturedAt: c.createdAt || null,
+      app: m.version || null,
+      left,
+    };
+    changed(job);
+  } catch {}
+}
+
 async function pump() {
-  if (current) return;
-  const job = jobs.slice().reverse().find((j) => j.status === 'queued');
+  if (current || queuePaused) return;
+  const job = jobs.filter((j) => j.status === 'queued').sort((a, b) => (a.order ?? a.created) - (b.order ?? b.created))[0];
   if (!job) return;
   const token = { cancelled: false, child: null };
   current = { job, token };
@@ -179,7 +218,7 @@ function scanInbox() {
 }
 setInterval(scanInbox, 2500);
 
-const phone = new PhoneImporter(cfg, () => scanInbox(), (t) => say(t));
+const phone = new PhoneImporter(cfg, () => scanInbox(), (t) => say(t), () => broadcast('phone', phone.status));
 phone.start();
 
 // ------------------------------------------------------------------------------------ GPU monitor
@@ -298,6 +337,7 @@ const server = createServer(async (req, res) => {
         tools: Object.fromEntries(Object.entries(cfg.tools).map(([k, v]) => [k, v ? basename(v) : null])),
         workDir: cfg.workDir, inbox: cfg.dirs.inbox, library: cfg.dirs.library,
         preset: cfg.preset, presets: PRESETS, usePoses: cfg.usePoses, cropToBounds: cfg.cropToBounds !== false, adbAutoImport: cfg.adbAutoImport,
+        phoneAutoImport: !!cfg.phoneAutoImport, autoProcess: !!cfg.autoProcess, queuePaused,
         lan: lanUrls(), gpu, phone: phone.status, running: current ? current.job.id : null,
       });
     }
@@ -317,8 +357,44 @@ const server = createServer(async (req, res) => {
       if (typeof b.usePoses === 'boolean') cfg.usePoses = b.usePoses;
       if (typeof b.cropToBounds === 'boolean') cfg.cropToBounds = b.cropToBounds;
       if (typeof b.adbAutoImport === 'boolean') cfg.adbAutoImport = b.adbAutoImport;
+      if (typeof b.phoneAutoImport === 'boolean') cfg.phoneAutoImport = b.phoneAutoImport;
+      if (typeof b.autoProcess === 'boolean') cfg.autoProcess = b.autoProcess;
       saveConfig(cfg);
+      if (b.adbAutoImport || b.phoneAutoImport) phone.check().catch(() => {});
       return sendJson(res, { ok: true });
+    }
+    if (path === '/api/phone') return sendJson(res, phone.status);
+    if (path === '/api/phone/refresh' && req.method === 'POST') {
+      await phone.check().catch(() => {});
+      return sendJson(res, phone.status);
+    }
+    if (path === '/api/phone/import' && req.method === 'POST') {
+      const b = await readBody(req);
+      const names = Array.isArray(b.names) ? b.names.filter((n) => typeof n === 'string') : [];
+      try {
+        const n = await phone.importFiles(names);
+        return sendJson(res, { ok: true, imported: n });
+      } catch (e) {
+        return sendJson(res, { error: String(e.message || e) }, 409);
+      }
+    }
+    if (path === '/api/queue' && req.method === 'POST') {
+      const b = await readBody(req);
+      if (typeof b.paused === 'boolean') queuePaused = b.paused;
+      broadcast('queue', { paused: queuePaused });
+      pump();
+      return sendJson(res, { ok: true, paused: queuePaused });
+    }
+    if (path === '/api/process-all' && req.method === 'POST') {
+      let n = 0;
+      for (const j of jobs.slice().reverse()) {
+        if (j.status !== 'waiting') continue;
+        j.status = 'queued';
+        j.order = Date.now() + n++;
+        changed(j);
+      }
+      pump();
+      return sendJson(res, { ok: true, queued: n });
     }
     if (path === '/api/upload' && req.method === 'POST') {
       const name = basename(url.searchParams.get('name') || 'upload.zip').replace(/[^\w.\- ()]/g, '_');
@@ -330,14 +406,15 @@ const server = createServer(async (req, res) => {
         const final = join(cfg.dirs.inbox, '.ready-' + name);
         renameSync(tmp, final);
         const dest = join(cfg.dirs.inbox, name);
-        const job = newJob(renameAndReturn(final, dest), { preset: url.searchParams.get('preset') || undefined });
+        const p = url.searchParams.get('process');
+        const job = newJob(renameAndReturn(final, dest), { preset: url.searchParams.get('preset') || undefined, process: p == null ? undefined : p === '1' });
         sendJson(res, { ok: true, job: job && job.id });
       });
       out.on('error', (e) => sendJson(res, { error: String(e) }, 500));
       return;
     }
     let m;
-    if ((m = /^\/api\/jobs\/(\w+)\/(cancel|retry|delete|preset)$/.exec(path)) && req.method === 'POST') {
+    if ((m = /^\/api\/jobs\/(\w+)\/(cancel|retry|delete|preset|process|hold|next)$/.exec(path)) && req.method === 'POST') {
       const job = jobs.find((j) => j.id === m[1]);
       if (!job) return sendJson(res, { error: 'no such job' }, 404);
       if (m[2] === 'cancel') {
@@ -345,7 +422,31 @@ const server = createServer(async (req, res) => {
           current.token.cancelled = true;
           killTree(current.token.child);
         } else if (job.status === 'queued') {
-          job.status = 'cancelled';
+          job.status = 'waiting';
+          changed(job);
+        }
+      } else if (m[2] === 'process') {
+        // Start (or redo) with the options chosen on the card.
+        if (job.status !== 'running' && job.status !== 'queued') {
+          const b = await readBody(req);
+          if (b.preset && PRESETS[b.preset]) job.preset = b.preset;
+          if (typeof b.usePoses === 'boolean') job.usePoses = b.usePoses;
+          if (typeof b.crop === 'boolean') job.crop = b.crop;
+          job.status = 'queued';
+          job.order = Date.now();
+          job.error = null;
+          changed(job);
+          say(`Queued (${PRESETS[job.preset].label}).`, job);
+          pump();
+        }
+      } else if (m[2] === 'hold') {
+        if (job.status === 'queued') {
+          job.status = 'waiting';
+          changed(job);
+        }
+      } else if (m[2] === 'next') {
+        if (job.status === 'queued') {
+          job.order = Math.min(...jobs.filter((j) => j.status === 'queued').map((j) => j.order ?? j.created)) - 1;
           changed(job);
         }
       } else if (m[2] === 'retry') {

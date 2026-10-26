@@ -110,11 +110,11 @@ void main() {
 }`;
 
 export const QUALITY_COLORS = [
-  [0.45, 0.6, 1.0, 0.18], // seen, never photographed
-  [1.0, 0.27, 0.27, 0.7], // 1 angle
-  [1.0, 0.74, 0.16, 0.5], // 2 angles
-  [0.24, 0.86, 0.47, 0.28], // 3+ angles
-  [0.6, 0.6, 0.6, 0.1], // outside the scan area / skipped
+  [0.47, 0.59, 0.75, 0.2], // seen, never photographed
+  [0.95, 0.38, 0.38, 0.72], // 1 angle
+  [0.96, 0.72, 0.26, 0.52], // 2 angles
+  [0.2, 0.83, 0.6, 0.3], // 3+ angles
+  [0.6, 0.62, 0.66, 0.1], // outside the scan area / skipped
 ];
 // Dot size as a fraction of the voxel size: problems are big, finished areas recede.
 const QUALITY_SIZE = [0.22, 0.42, 0.34, 0.24, 0.16];
@@ -184,7 +184,7 @@ export class Overlay3D {
     const pts = new Float32Array(list.length * 8);
     const ln = new Float32Array(list.length * 14);
     list.forEach((k, i) => {
-      const c = k.flagged ? [1, 0.55, 0.2, 0.9] : [0.35, 0.85, 1.0, 0.9];
+      const c = k.flagged ? [0.96, 0.6, 0.3, 0.9] : [0.24, 0.86, 1.0, 0.9];
       pts.set([k.pos[0], k.pos[1], k.pos[2], ...c, 0.045], i * 8);
       ln.set([k.pos[0], k.pos[1], k.pos[2], ...c, k.pos[0] + k.fwd[0] * 0.18, k.pos[1] + k.fwd[1] * 0.18, k.pos[2] + k.fwd[2] * 0.18, c[0], c[1], c[2], 0.5], i * 14);
     });
@@ -212,7 +212,7 @@ export class Overlay3D {
   /** Pulsing beacon at a world point (or null). */
   setTarget(p, size = 0.45) {
     if (!p) return this.target.set(new Float32Array(0));
-    this.target.set(new Float32Array([p[0], p[1], p[2], 0.2, 0.9, 1.0, 0.95, -size, p[0], p[1], p[2], 0.2, 0.9, 1.0, 0.9, size * 0.18]));
+    this.target.set(new Float32Array([p[0], p[1], p[2], 0.24, 0.86, 1.0, 0.95, -size, p[0], p[1], p[2], 0.24, 0.86, 1.0, 0.9, size * 0.18]));
   }
 
   /** Named triangle layer (8 floats per vertex: xyz, rgba, wave). Empty array or null clears it. */

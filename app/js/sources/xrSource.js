@@ -62,6 +62,9 @@ export class XRSource {
     this.gl = gl;
     session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl, { alpha: true, antialias: false }) });
     this.refSpace = await session.requestReferenceSpace('local');
+    // ARCore may move the origin after losing tracking; the app then re-checks its alignment.
+    this.resetPending = false;
+    if (this.refSpace.addEventListener) this.refSpace.addEventListener('reset', () => (this.resetPending = true));
     // Hit testing against ARCore's planes: used to find the floor when marking the scan area.
     this.hitSource = null;
     if (!feats || feats.includes('hit-test')) {
@@ -115,6 +118,7 @@ export class XRSource {
       intr: null,
       depth: null,
       hit: null,
+      reset: false,
       requestAnalysis: null,
       requestCandidate: null,
       toScreen: null,
@@ -127,6 +131,10 @@ export class XRSource {
       const pose = new Float32Array(view.transform.matrix);
       fi.pose = pose;
       fi.trackState = viewerPose.emulatedPosition ? 'limited' : 'ok';
+      if (this.resetPending) {
+        fi.reset = true;
+        this.resetPending = false;
+      }
       const P = view.projectionMatrix;
       const cam = view.camera;
       let camTex = null;

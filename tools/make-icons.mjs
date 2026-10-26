@@ -43,12 +43,13 @@ const hex = (s) => [parseInt(s.slice(1, 3), 16) / 255, parseInt(s.slice(3, 5), 1
 
 // Design in 512-unit space.
 const BLOBS = [
-  { cx: 226, cy: 268, rx: 132, ry: 72, inner: hex('#ffd75a'), outer: hex('#ffc627'), a: 1 },
-  { cx: 318, cy: 214, rx: 86, ry: 46, inner: hex('#ff7aa2'), outer: hex('#e0457a'), a: 0.95 },
-  { cx: 248, cy: 240, rx: 58, ry: 32, inner: [1, 1, 1], outer: hex('#ffe9b0'), a: 1 },
+  { cx: 226, cy: 268, rx: 132, ry: 72, inner: hex('#7fe9ff'), outer: hex('#3ddcff'), a: 0.9 },
+  { cx: 318, cy: 214, rx: 86, ry: 46, inner: hex('#4f8bff'), outer: hex('#3b6fe0'), a: 0.9 },
+  { cx: 248, cy: 240, rx: 58, ry: 32, inner: [1, 1, 1], outer: hex('#dff8ff'), a: 1 },
 ];
 const ROT = (-24 * Math.PI) / 180;
-const BG = hex('#8c1d40').map((v) => v * 0.85);
+const BG_TOP = hex('#121821'), BG_BOTTOM = hex('#090b0e');
+const BRACKET = hex('#3ddcff');
 
 function insideRounded(x, y, r) {
   const cx = Math.min(Math.max(x, r), 512 - r), cy = Math.min(Math.max(y, r), 512 - r);
@@ -80,7 +81,7 @@ function bracketDist(x, y) {
 
 function shade(x, y) {
   if (!insideRounded(x, y, 112)) return [0, 0, 0, 0];
-  let c = BG.slice();
+  let c = BG_TOP.map((v, i) => v + (BG_BOTTOM[i] - v) * (y / 512));
   // Rotate into blob space around the centre.
   const dx = x - 256, dy = y - 256;
   const bx = 256 + dx * Math.cos(-ROT) - dy * Math.sin(-ROT);
@@ -93,9 +94,9 @@ function shade(x, y) {
     c = c.map((v, i) => v * (1 - g) + col[i] * g);
   }
   const bd = bracketDist(x, y);
-  if (bd < 11) {
-    const a = 0.92 * Math.min(1, 11 - bd);
-    c = c.map((v) => v * (1 - a) + a);
+  if (bd < 9) {
+    const a = Math.min(1, 9 - bd);
+    c = c.map((v, i) => v * (1 - a) + BRACKET[i] * a);
   }
   return [...c, 1];
 }

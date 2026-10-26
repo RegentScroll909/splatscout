@@ -6,7 +6,8 @@ import { analysisSize, coverMapping } from './common.js';
 import { BitmapImage } from './frameImage.js';
 import { rgbaToGray } from '../core/analyzer.js';
 import { Overlay3D } from '../capture/overlay3d.js';
-import { DEG, clamp, poseLookDir, mat4InvertRigid, rotationDelta, v3 } from '../core/math.js';
+import { DEG, clamp, poseLookDir, mat4InvertRigid, mat4Mul, rotationDelta, transformPoint, v3 } from '../core/math.js';
+import { xfPose, xfCompose, xfApply, xfApplyDir } from '../core/align.js';
 
 // Same geometry as the Pixel's ARCore camera image: 860 x 1920, 70° along the long side (35° across).
 const HFOV = 70;
@@ -17,8 +18,10 @@ export class DemoSource {
    * @param {HTMLElement} o.container
    * @param {'6dof'|'3dof'} [o.tracking]
    * @param {number} [o.tourSpeed] 0 = manual control; >0 starts the automatic tour at that speed
+   * @param {{yaw, t}|null} [o.sessionXf] like a real AR session: report poses in coordinates that are
+   *   turned and shifted from the room's (a resumed capture starts somewhere else in "AR space")
    */
-  constructor({ container, tracking = '6dof', tourSpeed = 0 }) {
+  constructor({ container, tracking = '6dof', tourSpeed = 0, sessionXf = null }) {
     this.kind = 'demo';
     this.tracking = tracking;
     this.container = container;
@@ -31,7 +34,22 @@ export class DemoSource {
     this.running = false;
     this.autopilot = null; // () => {pos, aim} | null: the auto-tour follows the guide when set
     this.frameNo = 0;
+    this.sessionXf = sessionXf;
+    this.lostUntil = 0;
     this._loop = this._loop.bind(this);
+  }
+
+  /** Simulate ARCore shifting its coordinates (what a tracking glitch looks like to the app). */
+  simulateJump(dist = 0.6, yawDeg = 12) {
+    const a = Math.random() * Math.PI * 2;
+    const j = { yaw: (Math.random() < 0.5 ? -1 : 1) * yawDeg * DEG, t: [Math.cos(a) * dist, 0, Math.sin(a) * dist] };
+    this.sessionXf = this.sessionXf ? xfCompose(j, this.sessionXf) : j;
+  }
+
+  /** Simulate losing tracking for a while (then coming back shifted, as ARCore often does). */
+  simulateLoss(sec = 2, dist = 0.5, yawDeg = 10) {
+    this.lostUntil = (this.simT || performance.now() / 1000) + sec;
+    this.simulateJump(dist, yawDeg);
   }
 
   async start({ onFrame, onEnd }) {
@@ -96,6 +114,8 @@ export class DemoSource {
       if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
       this.keys.add(e.key.toLowerCase());
       if (e.key.toLowerCase() === 't') this.tourSpeed = this.tourSpeed ? 0 : 1;
+      if (e.key.toLowerCase() === 'j' && this.tracking === '6dof') this.simulateJump();
+      if (e.key.toLowerCase() === 'l' && this.tracking === '6dof') this.simulateLoss();
     };
     this._ku = (e) => this.keys.delete(e.key.toLowerCase());
     window.addEventListener('keydown', this._kd);
@@ -266,7 +286,17 @@ export class DemoSource {
     this.octx.drawImage(this.glCanvas, 0, 0);
     this.octx.filter = 'none';
 
-    const pose = this.tracking === '6dof' ? truePose : poseLookDir([0, 0, 0], fwd);
+    const S = this.tracking === '6dof' ? this.sessionXf : null;
+    const lost = now < this.lostUntil;
+    const pose = this.tracking === '6dof' ? (S ? xfPose(S, truePose) : truePose.slice()) : poseLookDir([0, 0, 0], fwd);
+    // Depth is ray cast in the room's coordinates, then moved into the reported pose's coordinates at
+    // the moment it's asked for (the app may have moved the pose to line it up with the scan).
+    const toReported = () => mat4Mul(pose, mat4InvertRigid(truePose));
+    const reportGrid = (g) => {
+      const M = toReported(), xyz = new Float32Array(g.xyz.length);
+      for (let i = 0; i < xyz.length; i += 3) xyz.set(transformPoint(M, [g.xyz[i], g.xyz[i + 1], g.xyz[i + 2]]), i);
+      return { ...g, xyz };
+    };
     const rect = this.container.getBoundingClientRect();
     const map = coverMapping(this.intr, rect.width || 1, rect.height || 1);
     const intr = this.intr;
@@ -285,19 +315,19 @@ export class DemoSource {
       const t = raycast(this.pos, fwd);
       if (isFinite(t)) {
         const p = [this.pos[0] + fwd[0] * t, this.pos[1] + fwd[1] * t, this.pos[2] + fwd[2] * t];
-        hit = { p, n: surfaceNormal(p) };
+        hit = S ? { p: xfApply(S, p), n: xfApplyDir(S, surfaceNormal(p)) } : { p, n: surfaceNormal(p) };
       }
     }
     const fi = {
       t: now,
-      pose,
-      hit,
-      trackState: this.tracking === '6dof' ? 'ok' : 'n/a',
+      pose: lost ? null : pose,
+      hit: lost ? null : hit,
+      trackState: this.tracking === '6dof' ? (lost ? 'lost' : 'ok') : 'n/a',
       intr,
       displayIntr: map.displayIntr,
       toScreen: (p, isDir) => map.toScreen(pose, p, isDir),
       depth:
-        this.tracking === '6dof'
+        this.tracking === '6dof' && !lost
           ? {
               median: () => {
                 const g = depthGrid(truePose, intr, 9, 7, 0.1, 15);
@@ -309,7 +339,7 @@ export class DemoSource {
                 ds.sort((a, b) => a - b);
                 return ds.length ? ds[ds.length >> 1] : 0;
               },
-              grid: (nx, ny, minD = 0.25, maxD = 8) => depthGrid(truePose, intr, nx, ny, minD, maxD),
+              grid: (nx, ny, minD = 0.25, maxD = 8) => reportGrid(depthGrid(truePose, intr, nx, ny, minD, maxD)),
             }
           : null,
       requestAnalysis: () => {

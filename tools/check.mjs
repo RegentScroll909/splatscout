@@ -18,6 +18,10 @@ import { Bounds } from '../app/js/core/bounds.js';
 import { planPass, Guide } from '../app/js/core/guide.js';
 import { getTemplate } from '../app/js/core/plans.js';
 import { depthToPoints, unprojectIntr } from '../app/js/core/depth.js';
+import { depthGrid } from '../app/js/sources/demoScene.js';
+import { xf, xfInverse, xfPoints, xfPose, xfDelta, solveAlignment, checkAlignment, XF_ID } from '../app/js/core/align.js';
+import { spaceOf, mainSpace } from '../app/js/core/spaces.js';
+import { rebuildCoverage } from '../app/js/core/score.js';
 
 let passed = 0;
 const near = (a, b, eps = 1e-4, msg = '') => {
@@ -247,6 +251,123 @@ test('guide: photos along the path complete the pass', () => {
   state = g.update({ pos: g.stations[g.stations.length - 1].pos, fwd: [0, 0, -1], t: 1 });
   assert.equal(g.progress(), 1);
   assert.ok(state.complete, 'pass complete');
+});
+
+test('guide: never sends you back to a spot you just walked past', () => {
+  const room = getTemplate('room');
+  const b = new Bounds({ poly: [[0, 0], [6, 0], [6, 5], [0, 5]], floorY: 0 });
+  const g = new Guide({ template: room, bounds: b, voxels: new VoxelMap(0.2, 7) });
+  g.setPass(room.passes[0], [3, 1.4, 4]);
+  g.update({ pos: g.stations[0].pos, fwd: g.stations[0].aim, t: 0 });
+  // Walk along the path without any photo landing, then stand a little past station 4.
+  for (let i = 1; i <= 4; i++) g.update({ pos: g.stations[i].pos, fwd: g.stations[i].aim, t: i * 0.5 });
+  const a = g.stations[4].pos, c = g.stations[5].pos;
+  const L = Math.hypot(c[0] - a[0], c[2] - a[2]);
+  const past = [a[0] + ((c[0] - a[0]) / L) * 0.2, 1.4, a[2] + ((c[2] - a[2]) / L) * 0.2];
+  const st = g.update({ pos: past, fwd: g.stations[4].aim, t: 3 });
+  assert.ok(g.stations.indexOf(st.next) >= 5, `next is ahead (got ${g.stations.indexOf(st.next)})`);
+  assert.notEqual(st.phase, 'walk', 'close enough to just carry on');
+});
+
+test('guide: standing on a spot completes it; a spot that can\'t be reached is skipped', () => {
+  const room = getTemplate('room');
+  const b = new Bounds({ poly: [[0, 0], [6, 0], [6, 5], [0, 5]], floorY: 0 });
+  const g = new Guide({ template: room, bounds: b, voxels: new VoxelMap(0.2, 7) });
+  g.setPass(room.passes[0], [3, 1.4, 4]);
+  const s0 = g.stations[0];
+  let st = g.update({ pos: s0.pos, fwd: s0.aim, t: 0 });
+  assert.equal(st.next, s0);
+  assert.ok(st.wantPhoto, 'asks for a photo here');
+  g.update({ pos: s0.pos, fwd: s0.aim, t: 1 });
+  g.update({ pos: s0.pos, fwd: s0.aim, t: 3.6 });
+  assert.ok(s0.done, 'done after standing there, aimed, for a moment');
+  // Next spot: the user hovers 1.5 m away and never gets there.
+  st = g.update({ pos: [s0.pos[0], 1.4, s0.pos[2] - 1.5], fwd: [0, 0, 1], t: 4 });
+  const target = st.next;
+  let skipped = false;
+  for (let t = 4.5; t < 22 && !skipped; t += 0.5) skipped = g.update({ pos: [s0.pos[0], 1.4, s0.pos[2] - 1.5], fwd: [0, 0, 1], t }).skipped;
+  assert.ok(skipped && target.transit, 'skipped after ~15 s');
+});
+
+// The practice room's geometry, scanned with a lap: the map new sessions are lined up with.
+const W_AR = 1280, H_AR = 576, F_AR = W_AR / 2 / Math.tan(35 * DEG);
+const INTR_AR = { fx: F_AR, fy: F_AR, cx: W_AR / 2, cy: H_AR / 2, w: W_AR, h: H_AR };
+function practiceMap() {
+  const vm = new VoxelMap(0.2, 7);
+  for (let k = 0; k < 120; k++) {
+    const a = (k / 120) * Math.PI * 2;
+    const pos = [Math.cos(a) * 2.6, 1.4, Math.sin(a) * 2.2];
+    const pose = poseLookDir(pos, [-Math.cos(a) + 0.3 * Math.sin(a * 3), -0.15, -Math.sin(a)]);
+    vm.integrate(depthGrid(pose, INTR_AR, 24, 18, 0.25, 8).xyz, pos);
+  }
+  return vm;
+}
+/** A few seconds of looking around from p, reported in an AR session whose coordinates are S⁻¹. */
+function lookAround(S, p, look, n = 10, step = 9, mirror = false) {
+  const Si = xfInverse(S);
+  return Array.from({ length: n }, (_, k) => {
+    const h = (look + k * step) * DEG;
+    const pose = poseLookDir([p[0] + 0.03 * k, 1.35, p[1]], [Math.sin(h), -0.25 + 0.05 * (k % 3), -Math.cos(h)]);
+    const g = depthGrid(pose, INTR_AR, 32, 24, 0.25, 8);
+    let xyz = g.xyz, pp = pose;
+    if (mirror) {
+      xyz = g.xyz.slice();
+      for (let i = 0; i < xyz.length; i += 3) xyz[i] = -xyz[i] + 0.3;
+      pp = pose.slice();
+      pp[12] = -pp[12] + 0.3;
+      pp[0] = -pp[0];
+      pp[4] = -pp[4];
+      pp[8] = -pp[8];
+    }
+    return { pts: xfPoints(Si, xyz), pose: xfPose(Si, pp), intr: INTR_AR, d: g.d, nx: g.nx, ny: g.ny };
+  });
+}
+
+test('re-alignment: a new AR session is found in the scan at any heading', () => {
+  const vm = practiceMap();
+  for (const [yaw, t, p, look] of [[40, [1.2, 0.1, -0.7], [0.5, 0.8], 30], [170, [-2, 0, 1], [-1.5, -1], 200], [-95, [0.3, -0.2, 2.5], [2, -0.5], 100]]) {
+    const S = xf(yaw * DEG, t);
+    const r = solveAlignment(vm, lookAround(S, p, look), { floorY: 0 });
+    const d = xfDelta(r.xf, S, [p[0], 1.3, p[1]]);
+    assert.ok(r.ok, `locked (${r.status}, ${JSON.stringify(r.metrics)})`);
+    assert.ok(d.dist < 0.1 && d.yaw < 2, `within 10 cm / 2° (got ${d.dist.toFixed(3)} m, ${d.yaw.toFixed(2)}°)`);
+  }
+});
+
+test('re-alignment: refuses a look-alike room and a plain wall', () => {
+  const vm = practiceMap();
+  const S = xf(0.7, [0.4, 0, -0.3]);
+  const mirrored = solveAlignment(vm, lookAround(S, [0.5, 0.8], 30, 10, 18, true), { floorY: 0 });
+  assert.ok(!mirrored.ok, 'mirrored furniture layout is not accepted');
+  const Si = xfInverse(S);
+  const wall = Array.from({ length: 8 }, (_, k) => {
+    const pose = poseLookDir([3.0, 1.4, -0.5 + k * 0.05], [1, -0.05 + 0.02 * (k % 3), 0.05 * (k - 4)]);
+    const g = depthGrid(pose, INTR_AR, 32, 24, 0.25, 8);
+    return { pts: xfPoints(Si, g.xyz), pose: xfPose(Si, pose), intr: INTR_AR, d: g.d, nx: g.nx, ny: g.ny };
+  });
+  const r = solveAlignment(vm, wall, { floorY: 0 });
+  assert.ok(!r.ok && ['flat', 'ambiguous'].includes(r.status), `a plain wall could be anywhere (${r.status})`);
+});
+
+test('re-alignment: drift check finds a 12 cm offset and leaves a good alignment alone', () => {
+  const vm = practiceMap();
+  const S = xf(1.5 * DEG, [0.09, 0, -0.08]);
+  const r = checkAlignment(vm, lookAround(S, [-2, -1.5], 200, 6, 15), XF_ID, null);
+  assert.ok(r.enough, 'enough overlap');
+  const d = xfDelta(r.xf, S, [-2, 1.3, -1.5]);
+  assert.ok(r.delta.dist > 0.08 && d.dist < 0.05 && d.yaw < 0.8, `found the offset (${r.delta.dist.toFixed(3)} m, error ${d.dist.toFixed(3)} m)`);
+  const ok = checkAlignment(vm, lookAround(XF_ID, [-2, -1.5], 200, 6, 15), XF_ID, null);
+  assert.ok(ok.delta.dist < 0.08 && ok.through0 < 0.05, `no correction needed (${ok.delta.dist.toFixed(3)} m)`);
+});
+
+test('spaces: sessions lined up into one map share coverage; others stay apart', () => {
+  const cap = { engine: 'xr', tracking: '6dof', template: 'room' };
+  const pts = new Float32Array([1, 1, -2, 1.05, 1, -2, 1, 1.05, -2]);
+  const mk = (segment, space) => ({ segment, space, tracked: true, tracking: '6dof', pose: poseLookDir([0, 1.4, 0], [0, 0, -1]), intr: INTR_AR, pts });
+  const frames = [mk(1, 100), mk(1, 100), mk(2, 100), mk(3, 300), { ...mk(1), space: undefined }];
+  assert.equal(spaceOf(frames[4], cap), 100, 'old photos: their own session\'s space');
+  assert.deepEqual(mainSpace(frames, cap), { space: 100, count: 4 });
+  assert.equal(rebuildCoverage(frames, getTemplate('room'), cap).segments, 2, 'two separate maps');
 });
 
 test('keyframer takes sharp photos while walking (no need to stop)', () => {

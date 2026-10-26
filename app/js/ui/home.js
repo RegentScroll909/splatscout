@@ -1,46 +1,49 @@
 // Home: device readiness, start a capture, and all captures grouped by building.
 
 import { h, mount, fmtDate, fmtBytes, gradeClass } from './dom.js';
+import { icon, templateIcon } from './icons.js';
 import { xrSupport } from '../sources/xrSource.js';
-import { getTemplate } from '../core/plans.js';
 import { modeLabel } from './review.js';
 import * as store from '../data/store.js';
 
 export async function homeScreen(root, { navigate }) {
-  const status = h('div.status-card', h('div.status-dot.pending'), h('div', h('b', 'Checking this device…')));
-  const list = h('div');
+  const status = h('div.status-line', h('span.status-dot.pending'), h('span.mono', 'Checking device…'));
+  const storage = h('span.mono.muted.small');
+  const list = h('div.cap-list');
   mount(
     root,
     h(
-      'div.page',
-      h('header.brand', h('img.brand-logo', { src: 'icons/icon.svg', alt: '' }), h('div', h('h1', 'SplatScout'), h('div.muted', 'AR capture coach for Gaussian splats'))),
+      'div.page.home',
+      h('header.brand',
+        h('img.brand-logo', { src: 'icons/icon.svg', alt: '' }),
+        h('div.brand-text', h('h1', 'SplatScout'), h('div.brand-sub', 'Capture interiors for Gaussian splats')),
+        h('button.icon-btn', { onclick: () => navigate('#/settings'), 'aria-label': 'Settings' }, icon('settings')),
+      ),
       status,
-      h('button.btn.primary.big.block', { onclick: () => navigate('#/new') }, '＋ New capture'),
+      h('button.btn.primary.big.block', { onclick: () => navigate('#/new') }, icon('plus'), 'New capture'),
       h('div.row.two',
-        h('button.btn.block', { onclick: () => navigate('#/new?practice=1') }, '🎮 Practice room'),
-        h('button.btn.block', { onclick: () => navigate('#/learn') }, '📘 Capture guide'),
+        h('button.btn.block', { onclick: () => navigate('#/new?practice=1') }, icon('cube'), 'Practice room'),
+        h('button.btn.block', { onclick: () => navigate('#/learn') }, icon('book'), 'Capture guide'),
       ),
       list,
-      h('footer.foot', h('button.link', { onclick: () => navigate('#/settings') }, '⚙ Settings'), h('span.muted.small#storage')),
+      h('footer.foot', storage),
     ),
   );
 
   xrSupport().then((s) => {
-    if (s.ok) {
-      mount(status, h('div.status-dot.ok'), h('div', h('b', 'AR tracking ready'), h('div.small.muted', 'Captures record 3D camera positions and paint scanned surfaces live.')));
-    } else {
-      mount(status, h('div.status-dot.warn'), h('div', h('b', 'Camera mode'), h('div.small.muted', `${s.reason} Coverage is tracked from the motion sensors instead.`)));
-    }
+    mount(status,
+      h('span.status-dot.' + (s.ok ? 'ok' : 'warn')),
+      h('span.mono', s.ok ? 'AR READY' : 'CAMERA MODE'),
+      h('span.muted.small', s.ok ? 'Tracks 3D position and paints scanned surfaces live' : `${s.reason} Coverage comes from the motion sensors.`));
   });
 
   store.storageEstimate().then((e) => {
-    const el = document.getElementById('storage');
-    if (e && el) el.textContent = `${fmtBytes(e.usage)} used of ${fmtBytes(e.quota)}`;
+    if (e) storage.textContent = `${fmtBytes(e.usage)} used · ${fmtBytes(e.quota)} available`;
   });
 
   const [buildings, captures] = await Promise.all([store.listBuildings(), store.listCaptures()]);
   if (!captures.length) {
-    mount(list, h('div.empty', h('p', 'No captures yet.'), h('p.small.muted', 'New here? Try the Practice room first. It\'s a virtual classroom that shows how the coaching works.')));
+    mount(list, h('div.empty', icon('layers', 'big'), h('p', 'No captures yet.'), h('p.small.muted', 'New here? The Practice room is a virtual classroom that shows how the guide and coaching work.')));
     return;
   }
   const byB = new Map();
@@ -53,18 +56,26 @@ export async function homeScreen(root, { navigate }) {
     list,
     [...byB.entries()].map(([bid, caps]) =>
       h('section.group',
-        h('h2.group-title', bname(bid), h('span.muted.small', ` · ${caps.length} capture${caps.length === 1 ? '' : 's'}`)),
+        h('div.group-title', h('span', bname(bid)), h('span.mono.muted', String(caps.length).padStart(2, '0'))),
         caps.map((c) =>
-          h('button.cap-card', { onclick: () => navigate(`#/review/${c.id}`) },
+          h('button.cap-row', { onclick: () => navigate(`#/review/${c.id}`) },
             h('div.grade.small.' + gradeClass(c.score && c.score.grade), (c.score && c.score.grade) || '–'),
-            h('div.cap-card-body',
-              h('div.cap-card-title', `${getTemplate(c.template).icon} ${c.room || 'Untitled'}${c.floor ? ` · floor ${c.floor}` : ''}`),
-              h('div.small.muted', `${fmtDate(c.createdAt)} · ${c.frameCount || 0} photos · ${modeLabel(c)}${c.exportedAt ? ' · exported' : ''}`),
+            h('div.cap-row-body',
+              h('div.cap-row-title', templateIcon(c.template, 'dim'), h('span', `${c.room || 'Untitled'}${c.floor ? ` · floor ${c.floor}` : ''}`)),
+              h('div.cap-row-meta', `${fmtDate(c.createdAt)} · ${c.frameCount || 0} photos · ${modeLabel(c)}`),
             ),
-            h('span.chev', '›'),
+            exportTag(c),
+            icon('chevron', 'dim'),
           ),
         ),
       ),
     ),
   );
+}
+
+/** Whether the latest photos have been exported for SplatStation. */
+function exportTag(c) {
+  if (!c.exportedAt) return h('span.tag', 'Not exported');
+  const stale = c.exportedFrames != null && c.frameCount > c.exportedFrames;
+  return h('span.tag.' + (stale ? 'warn' : 'good'), stale ? 'New photos' : 'Exported');
 }

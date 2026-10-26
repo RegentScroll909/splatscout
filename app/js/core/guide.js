@@ -9,6 +9,10 @@ import { VoxelMap } from './coverage.js';
 const SPACING = 0.4; // m between path stations
 const DONE_RADIUS = 0.6; // a photo this close to a station (and aimed about right) completes it
 const DONE_ANGLE = 35 * DEG;
+const AT_STATION = 0.6; // m: standing "on" a station
+const DWELL = 2.5; // s standing on a station, aimed, before it counts even without a new photo
+const STUCK = 15; // s on the same station without progress before it's skipped
+const NEAR = 1.2; // m from the next station: closer = follow the path, farther = walk to it
 const HEIGHT = { chest: 1.4, high: 1.9, low: 0.85 };
 
 export const passHeight = (pass) => HEIGHT[pass && pass.height] || HEIGHT.chest;
@@ -182,6 +186,11 @@ export class Guide {
     this.gap = null;
     this.skipped = new Map(); // cluster key -> skip until t
     this.state = null;
+    this.nextIdx = -1;
+    this.nextSince = 0;
+    this.dwellT = 0;
+    this.aiming = false;
+    this.skippedSpots = 0;
   }
 
   get floorY() {
@@ -207,6 +216,9 @@ export class Guide {
     this.k = 0;
     this.gap = null;
     this.complete = false;
+    this.nextIdx = -1;
+    this.dwellT = 0;
+    this.aiming = false;
   }
 
   /** Fraction of the current path that has been photographed. */
@@ -240,13 +252,13 @@ export class Guide {
   update({ pos, fwd, t }) {
     const floorY = this.floorY != null ? this.floorY : pos[1] - 1.4;
     let st;
-    if (this.stations) st = this._updatePath(pos, fwd, floorY);
+    if (this.stations) st = this._updatePath(pos, fwd, floorY, t);
     else st = this._updateGaps(pos, fwd, t, floorY);
     this.state = st;
     return st;
   }
 
-  _updatePath(pos, fwd, floorY) {
+  _updatePath(pos, fwd, floorY, t) {
     const S = this.stations;
     // Where along the path is the user? Look near the last position first, so a path that passes
     // close to itself (laps, lanes) doesn't make the progress jump.
@@ -262,11 +274,17 @@ export class Guide {
       }
     }
     this.k = k;
+    // Already past the nearest station? Then the next one is ahead: never send the user backwards
+    // for a spot they just walked through (missed spots are collected at the end instead).
+    let from = k;
+    const ahead = S[Math.min(S.length - 1, k + 1)].pos, behind = S[Math.max(0, k - 1)].pos;
+    const tx = ahead[0] - behind[0], tz = ahead[2] - behind[2], tl = Math.hypot(tx, tz);
+    if (tl > 1e-3 && ((pos[0] - S[k].pos[0]) * tx + (pos[2] - S[k].pos[2]) * tz) / tl > 0.15) from = k + 1;
     let next = -1;
-    for (let i = k; i < S.length; i++) {
+    for (let i = from; i < S.length; i++) {
       if (S[i].done || S[i].transit) continue;
       // Furniture where the path wants you to stand: walk around it, that spot doesn't count.
-      if (this._blocked(S[i].pos)) {
+      if (this._blocked(S[i].pos, floorY)) {
         S[i].transit = true;
         continue;
       }
@@ -290,7 +308,37 @@ export class Guide {
       this.complete = true;
       return { mode: 'path', progress, complete: true, next: null, trail: [], instruction: null };
     }
+    if (next !== this.nextIdx) {
+      this.nextIdx = next;
+      this.nextSince = t;
+      this.dwellT = 0;
+    }
     const target = S[next];
+    const distTo = dist2D(target.pos, pos);
+    const offAim = angleBetween(fwd, target.aim) / DEG;
+
+    // Standing on the station and aimed: it's done after a moment even if no photo was accepted
+    // (the session also asks for one), so nobody gets stuck shuffling on the spot.
+    const at = distTo < AT_STATION && Math.abs(target.pos[1] - pos[1]) < 0.6;
+    if (at && offAim < 30) {
+      if (!this.dwellT) this.dwellT = t;
+      else if (t - this.dwellT > DWELL) {
+        target.done = true;
+        this.nextSince = t;
+      }
+    } else {
+      this.dwellT = 0;
+    }
+    // Not getting anywhere with this spot (can't reach it, can't aim there): skip it.
+    let skipped = false;
+    if (!target.done && t - this.nextSince > STUCK && distTo < 2.5) {
+      target.transit = true;
+      target.skippedSpot = true;
+      this.skippedSpots++;
+      this.nextSince = t;
+      skipped = true;
+    }
+
     // Trail: from the user's feet to the next station, then along the path for a few metres.
     const trail = [[pos[0], floorY, pos[2]]];
     let len = 0;
@@ -301,25 +349,48 @@ export class Guide {
       trail.push([p[0], floorY, p[2]]);
       if (missed) break;
     }
-    const distTo = dist2D(target.pos, pos);
     const aimPoint = this._aimPoint(target.pos, target.aim);
-    const offAim = angleBetween(fwd, target.aim) / DEG;
-    let instruction;
-    if (distTo > 1.2) {
-      instruction = {
-        title: missed ? 'Go back to a spot you missed' : 'Walk to the path',
-        detail: `Follow the dotted trail on the floor (${distTo.toFixed(1)} m).`,
-      };
-    } else if (offAim > 40) {
-      instruction = { title: 'Aim at the ring', detail: 'Turn the phone towards the blue ring, then keep walking along the path.' };
-    } else {
-      instruction = { title: 'Follow the path', detail: 'Keep the blue ring near the centre and move the way the arrow points, at a slow, steady pace.' };
-    }
+    // One thing at a time: walk to the path, then aim, then move along it.
+    const near = distTo <= NEAR;
+    if (!near) this.aiming = false;
+    else if (this.aiming ? offAim < 15 : offAim > 25) this.aiming = !this.aiming;
+    // "Hold steady" only once someone has lingered on a spot without its photo; walking past at a
+    // steady pace is the normal way to follow a path.
+    const phase = !near ? 'walk' : this.aiming ? 'aim' : at && !target.done && this.dwellT && t - this.dwellT > 1 ? 'hold' : 'go';
+    const carrot = near ? this._carrot(next, pos, 0.8) : [target.pos[0], floorY, target.pos[2]];
+    const instruction =
+      phase === 'walk'
+        ? { title: missed ? 'Go back to a spot you missed' : 'Walk to the path', detail: `Follow the arrows on the floor (${distTo.toFixed(1)} m).` }
+        : phase === 'aim'
+          ? { title: 'Turn to the ring', detail: 'Point the phone where the arrow shows, then carry on along the path.' }
+          : phase === 'hold'
+            ? { title: 'Hold steady', detail: 'Taking a photo of this spot.' }
+            : { title: 'Follow the path', detail: 'Move the way the arrow points at a slow, steady pace.' };
     return {
-      mode: 'path', progress, complete: false, missed, next: target, aimPoint, offAim, distTo, trail, instruction,
-      ghost: distTo > 1.2 ? { pos: target.pos, aim: target.aim } : null,
-      stand: distTo > 1.2 ? [target.pos[0], floorY, target.pos[2]] : null,
+      mode: 'path', progress, complete: false, missed, next: target, aimPoint, aimDir: target.aim, offAim, distTo, trail, instruction,
+      phase, carrot, wantPhoto: at && offAim < 30 && !target.done, skipped, stuck: t - this.nextSince > 8,
+      ghost: !near ? { pos: target.pos, aim: target.aim } : null,
+      stand: !near ? [target.pos[0], floorY, target.pos[2]] : null,
     };
+  }
+
+  /** A point `ahead` metres further along the path from the user's spot near station `next`. */
+  _carrot(next, pos, ahead) {
+    const S = this.stations;
+    const a = S[Math.max(0, next - 1)].pos, b = S[next].pos;
+    const ex = b[0] - a[0], ez = b[2] - a[2], L2 = ex * ex + ez * ez;
+    const u = L2 > 1e-6 ? clamp(((pos[0] - a[0]) * ex + (pos[2] - a[2]) * ez) / L2, 0, 1) : 1;
+    let cur = [a[0] + ex * u, a[2] + ez * u];
+    let remain = ahead;
+    for (let i = next; i < S.length; i++) {
+      if (S[i].transit && i > next) continue;
+      const p = [S[i].pos[0], S[i].pos[2]];
+      const d = Math.hypot(p[0] - cur[0], p[1] - cur[1]);
+      if (d >= remain) return [cur[0] + ((p[0] - cur[0]) * remain) / d, b[1], cur[1] + ((p[1] - cur[1]) * remain) / d];
+      remain -= d;
+      cur = p;
+    }
+    return [cur[0], b[1], cur[1]];
   }
 
   _updateGaps(pos, fwd, t, floorY) {
@@ -328,7 +399,7 @@ export class Guide {
       const c = this.voxels.weakClusters(0.8, 3).find((x) => x.key === this.gap.key);
       const fixed = !c || c.deficit <= this.gap.deficit0 * 0.45 || (this.gap.hits || 0) >= 1;
       if (fixed) this.gap = null;
-      else if (t - this.gap.t0 > 30) {
+      else if (t - this.gap.t0 > 25) {
         this.skipped.set(this.gap.key, t + 120);
         this.gap = null;
       }
@@ -342,23 +413,32 @@ export class Guide {
     }
     const distTo = dist2D(g.pos, pos);
     const offAim = angleBetween(fwd, g.aim) / DEG;
-    const instruction = distTo > 0.7
-      ? { title: 'Next spot: walk to the marker', detail: `Stand on the ring on the floor (${distTo.toFixed(1)} m), then aim at the red area.` }
-      : offAim > 25
-        ? { title: 'Aim at the ring', detail: 'Point the phone at the red area inside the blue ring and hold steady.' }
-        : { title: 'Hold steady', detail: 'Hold still for a moment so the photo is sharp.' };
+    const near = distTo <= 0.7;
+    if (!near) this.aiming = false;
+    else if (this.aiming ? offAim < 15 : offAim > 25) this.aiming = !this.aiming;
+    const phase = !near ? 'walk' : this.aiming ? 'aim' : 'hold';
+    const instruction = phase === 'walk'
+      ? { title: 'Next spot: walk to the marker', detail: `Stand on the ring on the floor (${distTo.toFixed(1)} m), then aim where the arrow shows.` }
+      : phase === 'aim'
+        ? { title: 'Aim at the ring', detail: 'Point the phone at the red area inside the ring.' }
+        : { title: 'Hold steady', detail: 'Taking a photo of this spot.' };
     return {
-      mode: 'gaps', progress: null, complete: false, next: g, aimPoint: g.target, offAim, distTo, instruction,
+      mode: 'gaps', progress: null, complete: false, next: g, aimPoint: g.target, aimDir: g.aim, offAim, distTo, instruction,
+      phase, carrot: [g.pos[0], floorY, g.pos[2]], stuck: t - g.t0 > 12,
       trail: distTo > 0.7 ? [[pos[0], floorY, pos[2]], [g.pos[0], floorY, g.pos[2]]] : [],
       stand: [g.pos[0], floorY, g.pos[2]],
       ghost: distTo > 0.7 ? { pos: g.pos, aim: g.aim } : null,
     };
   }
 
-  _blocked(p) {
+  /** Something solid where you'd stand: checked at knee, waist and phone height (tables, chairs). */
+  _blocked(p, floorY) {
     const vm = this.voxels, r = vm.size;
-    for (const [dx, dz] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r]]) {
-      if (vm.isSolidAt(p[0] + dx, p[1], p[2] + dz)) return true;
+    const ys = floorY != null ? [floorY + 0.45, floorY + 0.85, p[1]] : [p[1]];
+    for (const y of ys) {
+      for (const [dx, dz] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r]]) {
+        if (vm.isSolidAt(p[0] + dx, y, p[2] + dz)) return true;
+      }
     }
     return false;
   }
@@ -414,8 +494,16 @@ export class Guide {
     return best;
   }
 
-  /** Skip the current gap target for a while (the user can't or won't get there). */
-  skipGap(t) {
+  /** Skip the spot the guide points at (the user can't or won't get there). */
+  skip(t) {
+    const st = this.stations && this.nextIdx >= 0 ? this.stations[this.nextIdx] : null;
+    if (st && !st.done) {
+      st.transit = true;
+      st.skippedSpot = true;
+      this.skippedSpots++;
+      this.nextSince = t;
+      return;
+    }
     if (this.gap) this.skipped.set(this.gap.key, t + 180);
     this.gap = null;
   }

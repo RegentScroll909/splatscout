@@ -1,6 +1,8 @@
-// Capture screen: camera/AR view with the live coaching HUD, the scan-area tool and the guide.
+// Capture screen: camera/AR view with the live coaching HUD, the scan-area tool, the guide, and the
+// alignment panel (when the AR view has to find its place in the scan again).
 
 import { h, mount, toast, fmtDuration, confirmDialog, gradeClass } from './dom.js';
+import { icon } from './icons.js';
 import { CaptureSession } from '../capture/session.js';
 import { XRSource } from '../sources/xrSource.js';
 import { CameraSource } from '../sources/cameraSource.js';
@@ -11,11 +13,33 @@ import { drawTopDown, drawPanorama } from '../capture/minimap.js';
 import { analyzeCapture } from '../core/score.js';
 import { getTemplate } from '../core/plans.js';
 import { Bounds } from '../core/bounds.js';
+import { mainSpace, spaceOf } from '../core/spaces.js';
+import { DEG } from '../core/math.js';
 import * as store from '../data/store.js';
 import { getSettings, setSettings } from '../data/settings.js';
 import { unlockAudio, tick, chime, buzz, speak, keepAwake } from '../capture/audio.js';
 
-const ICON = { bad: '⛔', warn: '⚠️', info: '💡', good: '✅' };
+const LEVEL_ICON = { bad: 'alert', warn: 'alert', info: 'info', good: 'check' };
+
+const REASON = {
+  resume: 'Continuing your scan',
+  lost: 'Tracking was lost',
+  jump: 'The position jumped',
+  reset: 'AR reset its position',
+  drift: 'The position drifted',
+  manual: 'Re-aligning',
+};
+
+const ALIGN_TEXT = {
+  more: ['Look around slowly', 'Sweep the phone across walls and furniture you scanned before.'],
+  new: ['This part isn\'t in the scan', 'Go back to an area you scanned and point the phone at it.'],
+  flat: ['Need more shape', 'Aim at a corner, a doorway or furniture. A plain wall could be anywhere.'],
+  floor: ['Show the floor for a moment', 'Tilt down until the floor is in view, then back up.'],
+  ambiguous: ['Two places look alike', 'Turn to something distinctive: a door, a cabinet, a corner.'],
+  mismatch: ['Not matching yet', 'The room\'s outline fits but its contents don\'t. Keep looking around, or check it\'s the same room.'],
+  matching: ['Matching…', 'Keep moving the phone slowly over what you scanned.'],
+  locked: ['Found it', 'Lining up…'],
+};
 
 export async function captureScreen(root, { captureId, navigate }) {
   const settings = getSettings();
@@ -31,40 +55,50 @@ export async function captureScreen(root, { captureId, navigate }) {
   const tracked6 = engine === 'xr' || engine === 'demo6';
   const say = (text) => settings.voice && speak(text);
 
+  // An earlier AR session to continue: photos with depth in one set of coordinates.
+  const withDepth = (f) => f.tracked && f.pose && f.pts && f.pts.length;
+  const resumeMain = tracked6 ? mainSpace(existing, capture, withDepth) : null;
+  const canResume = !!(resumeMain && resumeMain.count >= 8);
+  const refFrames = canResume ? pickReferences(existing.filter((f) => withDepth(f) && spaceOf(f, capture) === resumeMain.space)) : [];
+  let refIdx = 0;
+  const refUrls = refFrames.map((f) => URL.createObjectURL(f.thumb || f.jpeg));
+
   // ---------------------------------------------------------------- DOM
   const stage = h('div.cap-stage');
   const coachTitle = h('div.coach-title');
   const coachDetail = h('div.coach-detail');
   const coachIcon = h('div.coach-icon');
-  const coach = h('div.coach', coachIcon, h('div', coachTitle, coachDetail));
-  const chips = h('div.chips');
+  const coach = h('div.coach', coachIcon, h('div.coach-text', coachTitle, coachDetail));
+  const readouts = h('div.readouts');
   const ring = h('div.target-ring');
-  const walkArrow = h('span.walk-arrow', '➜');
-  const walkLabel = h('span.walk-label');
-  const walkHint = h('div.walk-hint.hidden', walkArrow, walkLabel);
-  const arrow = h('div.edge-arrow', '➤');
+  const cueIcon = h('div.cue-icon');
+  const cueLabel = h('div.cue-label');
+  const cueSub = h('div.cue-sub');
+  const cue = h('div.cue.hidden', cueIcon, h('div.cue-text', cueLabel, cueSub));
+  const stuckBtn = h('button.pill-btn.stuck-btn.hidden.hud-interactive', { onclick: () => skipGuideSpot() }, icon('skip'), 'Skip this spot');
   const passName = h('span.pass-name');
+  const passIdx = h('span.pass-idx');
   const passBar = h('div.pass-bar-fill');
-  const covPill = h('div.cov-pill', '—');
-  const count = h('div.count', '0');
-  const timer = h('div.timer', '0:00');
+  const covVal = h('span.stat-val', '—');
+  const covLbl = h('span.stat-lbl', 'Area');
+  const covStat = h('div.stat', covVal, covLbl);
+  const count = h('span.stat-val', '0');
+  const timer = h('span.stat-val', '0:00');
   const thumb = h('img.last-thumb', { alt: '' });
-  const recBtn = h('button.rec.hud-interactive', { 'aria-label': 'Pause or resume' });
+  const recBtn = h('button.rec.hud-interactive', { 'aria-label': 'Pause or resume' }, icon('pause', 'rec-pause'), icon('play', 'rec-play'));
   const mapCanvas = h('canvas.minimap.hud-interactive', { width: 280, height: 280 });
   const debug = h('pre.debug');
   const sheet = h('div.sheet.hidden.hud-interactive');
   const overlay = h('div.cap-overlay.hud-interactive');
+  const ghost = h('img.ghost-photo.hidden', { alt: '' });
 
-  const passPill = h('button.pass-pill.hud-interactive', { onclick: () => openPassSheet() }, passName, h('div.pass-bar', passBar));
+  const passPill = h('button.pass-pill.hud-interactive', { onclick: () => openPassSheet() },
+    h('div.pass-line', passIdx, passName), h('div.pass-bar', passBar));
   const hudBottom = h(
     'div.hud-bottom',
-    h('div.map-wrap', mapCanvas, h('div.map-legend', legendDot('#ff4d4d', '1'), legendDot('#ffbd2e', '2'), legendDot('#3ddc84', '3+'))),
-    h('div.center-controls', recBtn, h('div.counts', count, h('span.count-label', 'photos'), timer)),
-    h(
-      'div.right-controls',
-      thumb,
-      h('button.shutter.hud-interactive', { onclick: () => session && session.shoot(), 'aria-label': 'Take a photo now' }),
-    ),
+    h('div.map-wrap', mapCanvas, h('div.map-legend', legendDot('q1', '1'), legendDot('q2', '2'), legendDot('q3', '3+'))),
+    h('div.center-controls', recBtn),
+    h('div.right-controls', thumb, h('button.shutter.hud-interactive', { onclick: () => session && session.shoot(), 'aria-label': 'Take a photo now' })),
   );
 
   // Marking the scan area: replaces the bottom controls.
@@ -73,35 +107,70 @@ export async function captureScreen(root, { captureId, navigate }) {
     'div.bounds-bar.hidden',
     h('button.btn.ghost.hud-interactive', { onclick: () => skipBounds() }, 'Skip'),
     h('button.btn.hud-interactive', { onclick: () => session && session.undoCorner() }, 'Undo'),
-    h('button.btn.primary.big.hud-interactive', { onclick: () => addCorner() }, '＋ Corner'),
+    h('button.btn.primary.hud-interactive', { onclick: () => addCorner() }, icon('plus'), 'Corner'),
     h('button.btn.hud-interactive.done-btn', { onclick: () => finishBounds() }, 'Done ', cornerCount),
   );
 
-  // Tools (AR): scan area, skip a spot, guide on/off.
-  const skipBtn = h('button.tool.hud-interactive', { onclick: () => toggleSkipMode(), title: 'Stop counting a surface' }, h('span.tool-icon', '⊘'), h('span.tool-label', 'Skip spot'));
-  const guideBtn = h('button.tool.hud-interactive', { onclick: () => toggleGuide(), title: 'Show or hide the path' }, h('span.tool-icon', '🧭'), h('span.tool-label', 'Guide'));
+  // Tools (AR): scan area, skip a spot, guide on/off, re-align.
+  const tool = (name, label, title, onclick) => h('button.tool.hud-interactive', { onclick, title, 'aria-label': title }, icon(name), h('span.tool-label', label));
+  const skipBtn = tool('skip', 'Skip', 'Stop counting a surface (windows, mirrors)', () => toggleSkipMode());
+  const guideBtn = tool('route', 'Guide', 'Show or hide the path', () => toggleGuide());
   const tools = h(
     'div.tools' + (tracked6 ? '' : '.hidden'),
-    h('button.tool.hud-interactive', { onclick: () => redrawBounds(), title: 'Mark the scan area' }, h('span.tool-icon', '⬚'), h('span.tool-label', 'Area')),
+    tool('area', 'Area', 'Mark the scan area', () => redrawBounds()),
     skipBtn,
     guideBtn,
+    tool('align', 'Align', 'Re-align with the scan (when the dots don\'t sit on the surfaces)', () => realign()),
   );
+
+  // Re-alignment panel.
+  const alignKicker = h('div.panel-kicker');
+  const alignTitle = h('div.panel-title');
+  const alignDetail = h('div.panel-detail');
+  const alignMeter = h('div.meter-fill');
+  const refImg = h('img.ref-img', { alt: 'Where to stand' });
+  const refBox = h('div.ref' + (refFrames.length ? '' : '.hidden'),
+    h('button.ref-photo.hud-interactive', { onclick: () => toggleGhost(), title: 'Overlay this photo on the camera view' }, refImg),
+    h('div.ref-side',
+      h('div.ref-cap', 'Stand here, aim the same way'),
+      h('div.row.tight',
+        h('button.icon-btn.small.hud-interactive', { onclick: () => stepRef(-1), 'aria-label': 'Previous photo' }, icon('chevronLeft')),
+        h('button.icon-btn.small.hud-interactive', { onclick: () => stepRef(1), 'aria-label': 'Next photo' }, icon('chevron')),
+        h('button.btn.small.hud-interactive', { onclick: () => imHere() }, icon('pin'), 'I\'m here'),
+      ),
+    ),
+  );
+  const rotL = h('button.icon-btn.small.hud-interactive.hidden', { onclick: () => session && session.nudgeAlignment(0, 0, -2), 'aria-label': 'Turn the scan left' }, icon('refresh', 'flip'));
+  const rotR = h('button.icon-btn.small.hud-interactive.hidden', { onclick: () => session && session.nudgeAlignment(0, 0, 2), 'aria-label': 'Turn the scan right' }, icon('refresh'));
+  const manualBtn = h('button.btn.small.hud-interactive', { onclick: () => setManual(!manual) }, icon('hand'), h('span', 'Line up by hand'));
+  const acceptBtn = h('button.btn.small.primary.hud-interactive.hidden', { onclick: () => acceptAlignment() }, icon('check'), 'Use this position');
+  const alignPanel = h('div.align-panel.hidden.hud-interactive',
+    h('div.panel-head', icon('align'), alignKicker),
+    alignTitle,
+    alignDetail,
+    h('div.meter', alignMeter),
+    refBox,
+    h('div.row.tight.wrap', manualBtn, rotL, rotR, acceptBtn, h('button.btn.small.ghost.hud-interactive', { onclick: () => newMap() }, 'Start a new map')),
+  );
+  // Full-screen gesture layer for lining up by hand.
+  const alignPad = h('div.align-pad.hidden.hud-interactive', h('div.align-pad-hint', 'Drag to slide the scan · twist with two fingers to turn it'));
 
   const hud = h(
     'div.hud',
     h(
       'div.hud-top',
-      h('button.icon-btn.hud-interactive', { onclick: () => quit(), 'aria-label': 'Close' }, '✕'),
+      h('button.icon-btn.hud-interactive', { onclick: () => quit(), 'aria-label': 'Close' }, icon('close')),
       passPill,
-      covPill,
+      h('div.stats', covStat, h('div.stat', count, h('span.stat-lbl', 'Photos')), h('div.stat.wide-only', timer, h('span.stat-lbl', 'Active'))),
       h('button.btn.small.primary.hud-interactive', { onclick: () => openFinishSheet() }, 'Done'),
     ),
     coach,
-    chips,
+    alignPanel,
+    readouts,
     h('div.reticle'),
     ring,
-    arrow,
-    walkHint,
+    cue,
+    stuckBtn,
     tools,
     settings.showDebug ? debug : null,
     hudBottom,
@@ -109,7 +178,7 @@ export async function captureScreen(root, { captureId, navigate }) {
     sheet,
     overlay,
   );
-  const capRoot = h('div.cap#capture-root', stage, hud);
+  const capRoot = h('div.cap#capture-root', stage, ghost, alignPad, hud);
   mount(root, capRoot);
   document.body.classList.add('capturing');
 
@@ -121,6 +190,9 @@ export async function captureScreen(root, { captureId, navigate }) {
   let raf = 0;
   let lastUi = 0;
   let skipMode = false;
+  let manual = false;
+  let resumeMode = false;
+  let cueKind = '';
 
   mapCanvas.addEventListener('click', () => {
     mapBig = !mapBig;
@@ -131,7 +203,7 @@ export async function captureScreen(root, { captureId, navigate }) {
   });
   recBtn.addEventListener('click', () => {
     if (!session) return;
-    if (session.paused) session.resume();
+    if (session.paused) session.unpause();
     else session.pause();
     updateRec();
   });
@@ -165,6 +237,36 @@ export async function captureScreen(root, { captureId, navigate }) {
     }
   });
 
+  // Lining up by hand: one finger slides the scan, two fingers turn it.
+  const touches = new Map();
+  let twist = null;
+  alignPad.addEventListener('pointerdown', (e) => {
+    alignPad.setPointerCapture(e.pointerId);
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    twist = null;
+  });
+  alignPad.addEventListener('pointermove', (e) => {
+    const p = touches.get(e.pointerId);
+    if (!p || !session) return;
+    if (touches.size === 1) {
+      const k = 0.004; // metres per pixel
+      session.nudgeAlignment((e.clientX - p.x) * k, -(e.clientY - p.y) * k, 0);
+    } else if (touches.size === 2) {
+      const [a, b] = [...touches.entries()].map(([id, q]) => (id === e.pointerId ? { x: e.clientX, y: e.clientY } : q));
+      const ang = Math.atan2(b.y - a.y, b.x - a.x) / DEG;
+      if (twist != null) session.nudgeAlignment(0, 0, ((ang - twist + 540) % 360) - 180);
+      twist = ang;
+    }
+    p.x = e.clientX;
+    p.y = e.clientY;
+  });
+  const lift = (e) => {
+    touches.delete(e.pointerId);
+    twist = null;
+  };
+  alignPad.addEventListener('pointerup', lift);
+  alignPad.addEventListener('pointercancel', lift);
+
   function feedback() {
     if (settings.sounds) tick('shot');
     buzz(15);
@@ -180,44 +282,59 @@ export async function captureScreen(root, { captureId, navigate }) {
   function showStartOverlay(error) {
     const p = template.passes[0];
     const resumed = existing.length > 0;
+    const refPick = canResume ? h('img.start-ref', { src: refUrls[refIdx], alt: '' }) : null;
     mount(
       overlay,
       h(
         'div.overlay-card',
         h('div.overlay-kicker', `${capture.building} · ${capture.room}`),
-        h('h2', resumed ? 'Add more photos' : `${template.icon} ${template.name} capture`),
-        resumed
-          ? h('p', `${existing.length} photos so far. ${isXR ? 'A new AR session starts its own map, so mark the scan area again and cover whole areas rather than single spots.' : ''}`)
-          : h('p', h('b', `Pass 1: ${p.name}. `), p.short),
-        tracked6
+        h('h2', canResume ? 'Continue this scan' : resumed ? 'Add more photos' : `${template.name} capture`),
+        canResume
+          ? h('div',
+              h('p', `${existing.length} photos so far. Stand near one of these spots and aim the same way. Once AR starts, sweep the phone slowly over what you scanned: the app finds its place and brings back the scan area, coverage and path.`),
+              h('div.start-ref-row',
+                h('button.icon-btn.small', { onclick: () => { refIdx = (refIdx + refFrames.length - 1) % refFrames.length; refPick.src = refUrls[refIdx]; }, 'aria-label': 'Previous photo' }, icon('chevronLeft')),
+                refPick,
+                h('button.icon-btn.small', { onclick: () => { refIdx = (refIdx + 1) % refFrames.length; refPick.src = refUrls[refIdx]; }, 'aria-label': 'Next photo' }, icon('chevron')),
+              ),
+            )
+          : resumed
+            ? h('p', `${existing.length} photos so far.${isXR ? ' This AR session starts a new map: mark the scan area again and cover whole areas rather than single spots.' : ''}`)
+            : h('p', h('b', `Pass 1 · ${p.name}. `), p.short),
+        tracked6 && !canResume
           ? h(
               'ol.tips',
-              h('li', h('b', 'Mark the scan area: '), 'aim the centre dot at the floor in each corner and tap ＋ Corner. Only what\'s inside counts.'),
-              h('li', h('b', 'Follow the glowing path '), 'on the floor and keep the blue ring near the centre of the screen.'),
-              h('li', 'Photos are taken automatically while you walk at a steady, slow pace. No need to stop.'),
+              h('li', h('b', 'Mark the scan area. '), 'Aim the centre cross at the floor in each corner and tap Corner. Only what\'s inside counts.'),
+              h('li', h('b', 'Follow the path '), 'on the floor. The arrow in the middle says which way to turn, tilt or step.'),
+              h('li', 'Photos are taken automatically while you walk at a slow, steady pace. No need to stop.'),
               h('li', 'Surfaces turn ', h('b.red', 'red'), ' → ', h('b.amber', 'amber'), ' → ', h('b.green', 'green'), ' as they\'re photographed from more angles. The area is done at about 85%.'),
             )
-          : h(
-              'ul.tips',
-              h('li', 'Move slowly and steadily. Photos are taken automatically.'),
-              h('li', 'Step sideways between shots. Don\'t just turn on the spot.'),
-              h('li', 'Fill the dots around you: white = never, amber = once, green = from 2+ spots.'),
-              h('li', 'Keep the same phone orientation the whole time.'),
-            ),
+          : !tracked6
+            ? h(
+                'ul.tips',
+                h('li', 'Move slowly and steadily. Photos are taken automatically.'),
+                h('li', 'Step sideways between shots. Don\'t just turn on the spot.'),
+                h('li', 'Fill the dots around you: white = never, amber = once, green = from 2+ spots.'),
+                h('li', 'Keep the same phone orientation the whole time.'),
+              )
+            : null,
         tracked6 && window.innerHeight > window.innerWidth
-          ? h('div.callout', h('b', '↻ Turn the phone sideways first. '), 'In landscape the AR camera sees twice as wide (70° instead of 35°), so surfaces get their angles much sooner and the scan finishes faster. Keep it sideways for the whole capture.')
+          ? h('div.callout', h('b', 'Turn the phone sideways first. '), 'In landscape the AR camera sees twice as wide (70° instead of 35°), so surfaces get their angles sooner and the scan finishes faster.')
           : null,
         error ? h('div.error', error) : null,
-        h('button.btn.primary.big', { onclick: begin }, isXR ? 'Start AR capture' : engine.startsWith('demo') ? 'Start practice' : 'Start camera'),
-        engine.startsWith('demo') ? h('p.small.muted', 'Desktop: drag to look, WASD to walk, Q/E down/up, T toggles the auto-tour. Touch: left half moves, right half looks.') : null,
+        h('button.btn.primary.big', { onclick: () => begin(canResume) },
+          canResume ? 'Continue in AR' : isXR ? 'Start AR capture' : engine.startsWith('demo') ? 'Start practice' : 'Start camera'),
+        canResume ? h('button.btn', { onclick: () => begin(false) }, 'Start a new map instead') : null,
+        engine.startsWith('demo') ? h('p.small.muted', 'Desktop: drag to look, WASD to walk, Q/E down/up, T toggles the auto-tour. J fakes a tracking jump, L fakes lost tracking. Touch: left half moves, right half looks.') : null,
         h('button.btn.ghost', { onclick: () => navigate(existing.length ? `#/review/${captureId}` : '#/') }, 'Cancel'),
       ),
     );
     overlay.classList.remove('hidden');
   }
 
-  async function begin() {
+  async function begin(resume) {
     unlockAudio();
+    resumeMode = !!resume;
     try {
       if (engine === 'camera') await requestOrientationPermission();
       source = makeSource();
@@ -255,11 +372,13 @@ export async function captureScreen(root, { captureId, navigate }) {
       updateRec();
       updateGuideBtn();
       if (source.kind === 'demo') source.autopilot = () => session.autopilotTarget();
-      if (session.sixdof && !(session.bounds && session.bounds.poly)) {
-        if (source.kind === 'demo' && capture.tour) {
-          // The auto-tour marks the practice room's corners itself.
-          const m = 0.05;
-          session.setBounds(new Bounds({ poly: [[ROOM.min[0] + m, ROOM.min[2] + m], [ROOM.max[0] - m, ROOM.min[2] + m], [ROOM.max[0] - m, ROOM.max[2] - m], [ROOM.min[0] + m, ROOM.max[2] - m]], floorY: 0, segment: session.segment }));
+      const resumed = resumeMode && session.resume();
+      if (resumed) {
+        showRef();
+        say('Continuing your scan. Look around slowly.');
+      } else if (session.sixdof && !(session.bounds && session.bounds.poly)) {
+        if (source.kind === 'demo' && capture.tour && !source.sessionXf) {
+          setRoomBounds();
         } else if (settings.guide !== false) {
           startBounds();
         }
@@ -282,7 +401,78 @@ export async function captureScreen(root, { captureId, navigate }) {
     if (engine === 'camera') {
       return new CameraSource({ container: stage, deviceId: capture.cameraId || settings.cameraId, resolution: capture.resolution || settings.resolution, lens: capture.lens || 'auto' });
     }
-    return new DemoSource({ container: stage, tracking: engine === 'demo3' ? '3dof' : '6dof', tourSpeed: capture.tour ? 1 : 0 });
+    // Like a real AR session, a later session in the practice room starts in its own coordinates.
+    const later = engine === 'demo6' && (capture.segments || 0) > 0;
+    const sessionXf = later ? { yaw: (Math.random() * 2 - 1) * Math.PI, t: [(Math.random() * 2 - 1) * 1.5, (Math.random() * 2 - 1) * 0.1, (Math.random() * 2 - 1) * 1.5] } : null;
+    return new DemoSource({ container: stage, tracking: engine === 'demo3' ? '3dof' : '6dof', tourSpeed: capture.tour ? 1 : 0, sessionXf });
+  }
+
+  function setRoomBounds() {
+    // The auto-tour marks the practice room's corners itself.
+    const m = 0.05;
+    session.setBounds(new Bounds({
+      poly: [[ROOM.min[0] + m, ROOM.min[2] + m], [ROOM.max[0] - m, ROOM.min[2] + m], [ROOM.max[0] - m, ROOM.max[2] - m], [ROOM.min[0] + m, ROOM.max[2] - m]],
+      floorY: 0, segment: session.segment, space: session.space,
+    }));
+  }
+
+  // ---------------------------------------------------------------- re-alignment
+  function showRef() {
+    if (!refFrames.length) return;
+    refImg.src = refUrls[refIdx];
+    if (!ghost.classList.contains('hidden')) ghost.src = refUrls[refIdx];
+  }
+
+  function stepRef(d) {
+    if (!refFrames.length) return;
+    refIdx = (refIdx + d + refFrames.length) % refFrames.length;
+    showRef();
+  }
+
+  function toggleGhost(force) {
+    const on = force != null ? force : ghost.classList.contains('hidden');
+    ghost.classList.toggle('hidden', !on || !refFrames.length);
+    if (on && refFrames.length) ghost.src = URL.createObjectURL(refFrames[refIdx].jpeg || refFrames[refIdx].thumb);
+  }
+
+  function imHere() {
+    if (!session || !refFrames.length) return;
+    session.hintAlignment(refFrames[refIdx]);
+    feedback();
+    toast('Got it: matching from this spot');
+  }
+
+  function setManual(on) {
+    manual = on;
+    alignPad.classList.toggle('hidden', !on);
+    acceptBtn.classList.toggle('hidden', !on);
+    rotL.classList.toggle('hidden', !on);
+    rotR.classList.toggle('hidden', !on);
+    manualBtn.lastChild.textContent = on ? 'Back to automatic' : 'Line up by hand';
+    if (on) toast('Drag to slide the dots onto the walls, twist with two fingers (or ⟲ ⟳) to turn them. Then tap "Use this position".', 6000);
+  }
+
+  function acceptAlignment() {
+    if (!session) return;
+    session.acceptAlignment();
+  }
+
+  async function newMap() {
+    if (!session) return;
+    const ok = await confirmDialog('Start a new map? This AR session gets its own coordinates: mark the scan area again. Photos already taken are kept, but coverage starts empty.', 'Start new map');
+    if (!ok) return;
+    session.startNewMap();
+    setManual(false);
+    toggleGhost(false);
+    if (source.kind === 'demo' && capture.tour && !source.sessionXf) setRoomBounds();
+    else if (settings.guide !== false) startBounds();
+    toast('New map started');
+  }
+
+  function realign() {
+    if (!session || !session.reloc) return;
+    if (session.voxels.stats().solid < 150) return toast('Scan a little more first: there\'s nothing to line up with yet.');
+    session.realignNow();
   }
 
   // ---------------------------------------------------------------- scan area
@@ -295,7 +485,7 @@ export async function captureScreen(root, { captureId, navigate }) {
   function addCorner() {
     if (!session || !session.boundsDraft) return;
     const p = session.centerFloorPoint();
-    if (!p) return toast(session.floorKnown() ? 'Aim the centre dot at the floor' : 'Still finding the floor: point the phone at it and move slowly');
+    if (!p) return toast(session.floorKnown() ? 'Aim the centre cross at the floor' : 'Still finding the floor: point the phone at it and move slowly');
     session.addCorner(p);
     feedback();
   }
@@ -321,7 +511,7 @@ export async function captureScreen(root, { captureId, navigate }) {
 
   function redrawBounds() {
     if (!session || !session.sixdof) return;
-    if (session.boundsDraft) return;
+    if (session.boundsDraft || (session.reloc && session.reloc.mode)) return;
     startBounds();
     toast('Mark the corners again. The old outline is replaced when you tap Done.');
   }
@@ -334,7 +524,7 @@ export async function captureScreen(root, { captureId, navigate }) {
   function toggleSkipMode() {
     if (!session || session.boundsDraft) return;
     setSkipMode(!skipMode);
-    if (skipMode) toast('Tap surfaces that can\'t be captured well (windows, mirrors, places you can\'t reach). Tap ⊘ again when done.', 5000);
+    if (skipMode) toast('Tap surfaces that can\'t be captured well (windows, mirrors, places you can\'t reach). Tap Skip again when done.', 5000);
   }
 
   function toggleGuide() {
@@ -342,11 +532,18 @@ export async function captureScreen(root, { captureId, navigate }) {
     setSettings({ guide: on });
     settings.guide = on;
     updateGuideBtn();
-    toast(on ? 'Guide on: follow the path and the ring' : 'Guide hidden: coverage colours and tips only');
+    toast(on ? 'Guide on: follow the path and the arrow' : 'Guide hidden: coverage colours and tips only');
   }
 
   function updateGuideBtn() {
     guideBtn.classList.toggle('active', settings.guide !== false);
+  }
+
+  function skipGuideSpot() {
+    if (!session) return;
+    session.skipGuideSpot();
+    feedback();
+    toast('Skipped. On to the next spot.');
   }
 
   function onEvent(e) {
@@ -354,15 +551,37 @@ export async function captureScreen(root, { captureId, navigate }) {
       if (settings.sounds) chime();
       buzz(40);
       const next = template.passes[session.passIndex + 1];
-      toast(e.last ? `✓ ${e.pass.name} done. Keep filling gaps or tap Done.` : `✓ ${e.pass.name} done. Next: ${next.name}`, 3500);
+      toast(e.last ? `${e.pass.name} done. Keep filling gaps or tap Done.` : `${e.pass.name} done. Next: ${next.name}`, 3500);
       say(e.last ? `${e.pass.name} done.` : `${e.pass.name} done. Next, ${next.name}.`);
     } else if (e.type === 'passStart') {
       toast(`Pass ${e.index + 1}: ${e.pass.name}. ${e.pass.short}`, 5000);
     } else if (e.type === 'areaComplete') {
       if (settings.sounds) chime();
       buzz([30, 60, 30]);
-      toast('🎉 Scan area complete! Tap Done to check the grade, or keep going for extra detail.', 6000);
+      toast('Scan area complete. Tap Done to check the grade, or keep going for extra detail.', 6000);
       say('Scan area complete.');
+    } else if (e.type === 'searching') {
+      if (e.reason !== 'resume') {
+        buzz([60, 40, 60]);
+        say('Position lost. Point the phone at something you scanned.');
+      }
+      showRef();
+    } else if (e.type === 'realigned') {
+      if (settings.sounds) chime();
+      buzz([20, 40, 20]);
+      setManual(false);
+      toggleGhost(false);
+      toast(e.reason === 'resume' ? 'Found your scan. Carry on where you left off.' : 'Back on track: lined up with your scan.', 4000);
+      say(e.reason === 'resume' ? 'Found your scan.' : 'Back on track.');
+      if (e.reason === 'resume' && session.sixdof && !(session.bounds && session.bounds.poly) && settings.guide !== false && !(source.kind === 'demo' && capture.tour)) {
+        startBounds();
+      }
+    } else if (e.type === 'trackingBack') {
+      toast('Tracking back: position checked against the scan.');
+    } else if (e.type === 'corrected') {
+      toast(`Position corrected by ${e.cm} cm`);
+    } else if (e.type === 'spotSkipped') {
+      toast('Skipped a spot that couldn\'t be reached');
     }
   }
 
@@ -374,29 +593,45 @@ export async function captureScreen(root, { captureId, navigate }) {
     lastUi = now;
     while (session.events.length) onEvent(session.events.shift());
     const L = session.live;
-    const pr = skipMode && !session.boundsDraft
-      ? { level: 'info', title: 'Skip spots', detail: 'Tap a surface to stop counting it. Tap ⊘ again when you\'re done.' }
-      : L.primary;
+    const R = L.reloc;
+    const searching = !!(R && R.mode === 'search');
+    const marking = !!session.boundsDraft;
+
+    let pr = L.primary;
+    if (skipMode && !marking) pr = { level: 'info', title: 'Skip spots', detail: 'Tap a surface to stop counting it. Tap Skip again when you\'re done.' };
+    if (R && R.mode === 'check') pr = { level: 'info', title: 'Checking position…', detail: 'Tracking was interrupted. Photos wait a moment while the view is matched against the scan.' };
+    // The arrow in the middle already says what the guide wants: the banner is for problems.
+    if (pr && pr.id === 'guide' && L.cue && !marking && !skipMode) pr = null;
+    coach.classList.toggle('hidden', searching || !pr);
     if (pr) {
-      coach.className = 'coach ' + pr.level;
-      coachIcon.textContent = ICON[pr.level] || '';
+      coach.className = 'coach ' + pr.level + (searching ? ' hidden' : '');
+      if (coach.dataset.icon !== pr.level) {
+        mount(coachIcon, icon(LEVEL_ICON[pr.level] || 'info'));
+        coach.dataset.icon = pr.level;
+      }
       coachTitle.textContent = pr.title;
       coachDetail.textContent = pr.detail || '';
     }
-    const marking = !!session.boundsDraft;
+    alignPanel.classList.toggle('hidden', !searching);
+    if (searching) renderAlign(R);
+    else if (manual) setManual(false);
+
     boundsBar.classList.toggle('hidden', !marking);
     hudBottom.classList.toggle('hidden', marking);
-    tools.classList.toggle('hidden', !session.sixdof || marking);
+    tools.classList.toggle('hidden', !session.sixdof || marking || searching);
+    capRoot.classList.toggle('aligning', searching);
     if (marking) cornerCount.textContent = `(${session.boundsDraft.corners.length})`;
-    mount(chips, ...Object.values(L.chips || {}).map((c) => h('div.chip.' + c.level, h('span.chip-label', c.label), h('span.chip-value', c.value))));
+    mount(readouts, ...Object.values(L.chips || {}).map((c) => h('div.readout.' + c.level, h('span.readout-dot'), h('span.readout-lbl', c.label), h('span.readout-val', c.value))));
     const pass = session.pass;
-    passName.textContent = marking ? 'Marking the scan area' : `${session.passIndex + 1}/${template.passes.length} · ${pass.name}`;
+    passIdx.textContent = marking ? 'AREA' : `${String(session.passIndex + 1).padStart(2, '0')}/${String(template.passes.length).padStart(2, '0')}`;
+    passName.textContent = marking ? 'Marking the scan area' : searching ? 'Re-aligning' : pass.name;
     passBar.style.width = Math.round(Math.min(1, L.passProgress || 0) * 100) + '%';
     if (L.coverage) {
       const v = L.coverage.value;
       const area = session.bounds && session.bounds.poly && L.coverage.kind === 'surfaces';
-      covPill.textContent = `${area ? 'Area' : L.coverage.kind === 'surfaces' ? 'Surfaces' : 'Views'} ${Math.round(v * 100)}%`;
-      covPill.className = 'cov-pill ' + (L.coverage.kind !== 'surfaces' ? '' : v >= 0.85 ? 'good' : v >= 0.55 ? 'warn' : '');
+      covVal.textContent = `${Math.round(v * 100)}%`;
+      covLbl.textContent = area ? 'Area' : L.coverage.kind === 'surfaces' ? 'Surfaces' : 'Views';
+      covStat.className = 'stat ' + (L.coverage.kind !== 'surfaces' ? '' : v >= 0.85 ? 'good' : v >= 0.55 ? 'warn' : '');
     }
     count.textContent = String(L.frames);
     timer.textContent = fmtDuration(session.stats.activeSec);
@@ -404,14 +639,16 @@ export async function captureScreen(root, { captureId, navigate }) {
       toast('Saving failed: ' + L.saveError, 5000);
       L.saveError = null;
     }
-    placeTarget(L.targetScreen, L.aimOk);
-    placeWalkHint(L.walk);
+    placeTarget(searching ? null : L.targetScreen, L.aimOk);
+    placeCue(searching || marking ? null : L.cue);
+    stuckBtn.classList.toggle('hidden', !L.stuck || searching || marking);
     if (now - lastMap > 500) {
       lastMap = now;
       if (session.sixdof && (session.voxels.vox.size > 0 || session.bounds)) {
         drawTopDown(mapCanvas, {
-          voxels: session.voxels, frames: session.frames, pose: L.pose, target: session.target && session.target.point,
-          segment: session.segment, bounds: session.bounds, draft: session.boundsDraft && session.boundsDraft.corners,
+          voxels: session.voxels, frames: session.frames, pose: searching && !(session.reloc.state && session.reloc.state.preview) ? null : L.pose,
+          target: session.target && session.target.point, space: session.space, capture, bounds: session.bounds,
+          draft: session.boundsDraft && session.boundsDraft.corners,
           guidePath: session.guide && session.guide.hasPath ? session.guide.stations : null,
         });
       } else {
@@ -421,54 +658,64 @@ export async function captureScreen(root, { captureId, navigate }) {
     if (settings.showDebug && L.metrics) {
       const m = L.metrics;
       const vs = session.voxels.stats();
+      const x = session.reloc ? session.reloc.xf : null;
       debug.textContent =
         `cam ${L.camRes}  track ${L.trackState}  depth ${session.source.info.depth ? 'on' : 'off'}\n` +
         `sharp ${m.sharp.toFixed(0)} rel ${m.relSharp.toFixed(2)}  mean ${m.mean.toFixed(0)} clip ${(m.clipHi * 100).toFixed(1)}%\n` +
         `tex ${m.texture.toFixed(3)} spread ${m.textureSpread.toFixed(2)}  rot ${m.rotSpeed.toFixed(1)}°/s  lin ${m.linSpeed == null ? '-' : m.linSpeed.toFixed(2)}\n` +
         `flow ${m.flowSpeed.toFixed(3)}  depth ${m.depthMed ? m.depthMed.toFixed(2) : '-'}m  h ${L.height == null ? '-' : L.height.toFixed(2)}m  floor ${session.floorHeight().toFixed(2)}\n` +
-        `vox ${session.voxels.vox.size} solid ${vs.solid} out ${vs.outside}  q ${vs.q0}/${vs.q1}/${vs.q2}/${vs.q3}`;
+        `vox ${session.voxels.vox.size} solid ${vs.solid} out ${vs.outside}  q ${vs.q0}/${vs.q1}/${vs.q2}/${vs.q3}\n` +
+        (x ? `align ${(x.yaw / DEG).toFixed(1)}° ${x.t.map((v) => v.toFixed(2)).join(' ')}  space ${session.space}` : '') +
+        (R && R.metrics ? `\n${JSON.stringify(R.metrics)}` : '');
     }
+  }
+
+  function renderAlign(R) {
+    const [title, detail] = R.manual
+      ? ['Line it up by hand', 'Drag until the dots sit on the real walls and furniture, then tap "Use this position".']
+      : ALIGN_TEXT[R.status] || ALIGN_TEXT.more;
+    alignKicker.textContent = REASON[R.reason] || 'Re-aligning';
+    alignTitle.textContent = title;
+    // After a while without a match, point at the ways out.
+    alignDetail.textContent = !R.manual && R.since > 25 && R.status !== 'matching'
+      ? `${detail} Or line it up by hand, or start a new map.`
+      : detail;
+    alignMeter.style.width = Math.round(Math.min(1, R.confidence) * 100) + '%';
+    alignMeter.className = 'meter-fill' + (R.confidence >= 0.55 ? ' good' : R.confidence >= 0.3 ? ' warn' : '');
   }
 
   function placeTarget(ts, ok) {
     const W = capRoot.clientWidth, H = capRoot.clientHeight;
-    if (!ts || session.paused) {
+    if (!ts || session.paused || !ts.front) {
       ring.style.display = 'none';
-      arrow.style.display = 'none';
       return;
     }
     ring.classList.toggle('ok', !!ok);
-    // Keep markers inside the free middle area: below the coach banner, left of the chips,
-    // above the bottom controls.
-    const box = { x0: 40, x1: W - 100, y0: 200, y1: H - 180 };
-    if (box.x1 - box.x0 < 80 || box.y1 - box.y0 < 80) Object.assign(box, { x0: 30, x1: W - 30, y0: 80, y1: H - 80 });
-    if (ts.front && ts.x > box.x0 && ts.x < box.x1 && ts.y > box.y0 && ts.y < box.y1) {
+    const m = 40;
+    if (ts.x > m && ts.x < W - m && ts.y > m && ts.y < H - m) {
       ring.style.display = 'block';
       ring.style.transform = `translate(${ts.x}px, ${ts.y}px)`;
-      arrow.style.display = 'none';
     } else {
       ring.style.display = 'none';
-      const cx = (box.x0 + box.x1) / 2, cy = (box.y0 + box.y1) / 2;
-      const a = Math.atan2(ts.y - cy, ts.x - cx);
-      const rx = (box.x1 - box.x0) / 2, ry = (box.y1 - box.y0) / 2;
-      const k = Math.min(Math.abs(rx / Math.cos(a) || 1e9), Math.abs(ry / Math.sin(a) || 1e9));
-      arrow.style.display = 'block';
-      arrow.style.transform = `translate(${cx + Math.cos(a) * k}px, ${cy + Math.sin(a) * k}px) rotate(${a}rad)`;
     }
   }
 
-  function placeWalkHint(w) {
-    if (!w || settings.guide === false) {
-      walkHint.classList.add('hidden');
+  function placeCue(c) {
+    if (!c || session.paused) {
+      cue.classList.add('hidden');
       return;
     }
-    walkHint.classList.remove('hidden');
-    // The arrow glyph points right; 0° = ahead (up on screen).
-    walkArrow.style.transform = `rotate(${w.angle - 90}deg)`;
-    const a = Math.abs(w.angle);
-    const label = a < 40 ? 'Walk ahead' : a > 140 ? 'Step back' : w.angle > 0 ? 'Sidestep right' : 'Sidestep left';
-    const where = a < 40 ? 'ahead' : a > 140 ? 'behind you' : w.angle > 0 ? 'to your right' : 'to your left';
-    walkLabel.textContent = w.dist > 1.2 ? `${w.dist.toFixed(1)} m ${where}` : label;
+    cue.classList.remove('hidden');
+    cue.className = 'cue ' + c.kind;
+    const kind = c.kind === 'turn' ? (c.arrow > 0 ? 'turnR' : 'turnL') : c.kind;
+    if (kind !== cueKind) {
+      cueKind = kind;
+      mount(cueIcon, icon(c.kind === 'turn' ? 'turn' : c.kind === 'around' ? 'around' : c.kind === 'hold' ? 'hold' : 'arrow'));
+    }
+    const rot = c.kind === 'walk' || c.kind === 'tilt' ? `rotate(${c.arrow}deg)` : c.kind === 'turn' && c.arrow < 0 ? 'scaleX(-1)' : '';
+    cueIcon.firstChild.style.transform = rot;
+    cueLabel.textContent = c.label;
+    cueSub.textContent = c.dist != null ? `${c.dist.toFixed(1)} m` : '';
   }
 
   // ---------------------------------------------------------------- sheets
@@ -484,26 +731,27 @@ export async function captureScreen(root, { captureId, navigate }) {
             toast(`Pass ${i + 1}: ${p.name}`);
           },
         },
-        h('div.pass-item-title', `${i + 1}. ${p.name}`),
-        h('div.pass-item-short', p.short),
+        h('span.pass-item-n', String(i + 1).padStart(2, '0')),
+        h('div', h('div.pass-item-title', p.name), h('div.pass-item-short', p.short)),
       ),
     );
     const cur = session.pass;
     const gs = session.live.guide;
     openSheet(
-      h('h3', `Now: ${cur.name}`),
+      h('div.sheet-kicker', 'Current pass'),
+      h('h3', cur.name),
       h('ol.steps', cur.steps.map((s) => h('li', s))),
-      session.passIndex < template.passes.length - 1
-        ? h('button.btn.primary', { onclick: () => { session.nextPass(); closeSheet(); toast(`Next: ${session.pass.name}`); } }, `Next pass: ${template.passes[session.passIndex + 1].name} →`)
-        : null,
-      gs && gs.mode === 'gaps' && gs.next
-        ? h('button.btn', { onclick: () => { session.skipGuideSpot(); closeSheet(); toast('Skipped. Picking another spot.'); } }, 'Skip this spot')
-        : null,
+      h('div.row',
+        session.passIndex < template.passes.length - 1
+          ? h('button.btn.primary', { onclick: () => { session.nextPass(); closeSheet(); toast(`Next: ${session.pass.name}`); } }, `Next: ${template.passes[session.passIndex + 1].name}`, icon('chevron'))
+          : null,
+        gs && gs.next ? h('button.btn', { onclick: () => { skipGuideSpot(); closeSheet(); } }, icon('skip'), 'Skip this spot') : null,
+      ),
       session.sixdof ? scanAreaControls() : null,
       h('h4', 'All passes'),
       items,
       cameraControls(),
-      h('button.btn.ghost', { onclick: closeSheet }, 'Close'),
+      h('button.btn.ghost.block', { onclick: closeSheet }, 'Close'),
     );
   }
 
@@ -516,7 +764,8 @@ export async function captureScreen(root, { captureId, navigate }) {
       h('div.row',
         h('button.btn.small', { onclick: () => { closeSheet(); redrawBounds(); } }, b && b.poly ? 'Redraw outline' : 'Mark outline'),
         skips ? h('button.btn.small', { onclick: () => { session.undoSkip(); closeSheet(); toast('Last skipped spot restored'); } }, 'Undo last skip') : null,
-        b && b.poly ? h('button.btn.small.ghost', { onclick: () => { session.setBounds(b.skips.length ? new Bounds({ poly: null, floorY: null, skips: b.skips, segment: session.segment }) : null); closeSheet(); toast('Outline removed'); } }, 'Remove outline') : null,
+        b && b.poly ? h('button.btn.small.ghost', { onclick: () => { session.setBounds(b.skips.length ? new Bounds({ poly: null, floorY: null, skips: b.skips, segment: session.segment, space: session.space }) : null); closeSheet(); toast('Outline removed'); } }, 'Remove outline') : null,
+        h('button.btn.small', { onclick: () => { closeSheet(); realign(); } }, icon('align'), 'Re-align'),
       ),
     );
   }
@@ -542,7 +791,7 @@ export async function captureScreen(root, { captureId, navigate }) {
     }
     if (c.exposureCompensation) {
       const ec = c.exposureCompensation;
-      parts.push(h('label.small', 'Exposure compensation', h('input', { type: 'range', min: ec.min, max: ec.max, step: ec.step || 0.1, value: 0,
+      parts.push(h('label.field', h('span', 'Exposure compensation'), h('input', { type: 'range', min: ec.min, max: ec.max, step: ec.step || 0.1, value: 0,
         oninput: (e) => source.setExposureCompensation(parseFloat(e.target.value)).catch(() => {}) })));
     }
     return h('div', parts);
@@ -555,10 +804,10 @@ export async function captureScreen(root, { captureId, navigate }) {
     updateRec();
     const res = analyzeCapture(session.frames, { ...capture, stats: session.stats, tracking: session.tracking });
     openSheet(
-      h('div.grade-row', h('div.grade.' + gradeClass(res.grade), res.grade), h('div', h('div.score', `${res.score}/100`), h('div.verdict', res.verdict))),
+      h('div.grade-row', h('div.grade.' + gradeClass(res.grade), res.grade), h('div', h('div.score', `${res.score}`, h('span.score-of', '/100')), h('div.verdict', res.verdict))),
       h('ul.fixes', res.fixes.slice(0, 4).map((f) => h('li.' + f.level, f.text))),
-      h('div.row',
-        h('button.btn.ghost', { onclick: () => { closeSheet(); session.resume(); updateRec(); } }, 'Keep capturing'),
+      h('div.row.end',
+        h('button.btn.ghost', { onclick: () => { closeSheet(); session.unpause(); updateRec(); } }, 'Keep capturing'),
         h('button.btn.primary', { onclick: () => finish(res) }, 'Finish & review'),
       ),
     );
@@ -577,15 +826,16 @@ export async function captureScreen(root, { captureId, navigate }) {
       overlay,
       h(
         'div.overlay-card',
-        h('h2', 'AR session ended'),
-        h('p', `${session.frames.length} photos saved. You can start a new AR session to add more. Note that it starts a new map.`),
+        h('div.overlay-kicker', 'Session ended'),
+        h('h2', 'The AR session stopped'),
+        h('p', `${session.frames.length} photos are saved. Start AR again to carry on: the app lines the new session up with your scan, so the scan area, coverage and path come back.`),
         h('button.btn.primary.big', {
           onclick: async () => {
             cleanup();
             await session.stop();
             captureScreen(root, { captureId, navigate });
           },
-        }, 'Start a new AR session'),
+        }, 'Continue'),
         h('button.btn', { onclick: () => finish() }, 'Finish & review'),
       ),
     );
@@ -620,6 +870,7 @@ export async function captureScreen(root, { captureId, navigate }) {
     cancelAnimationFrame(raf);
     keepAwake(false);
     document.body.classList.remove('capturing');
+    for (const u of refUrls) URL.revokeObjectURL(u);
   }
 
   // Leaving via browser back.
@@ -631,8 +882,19 @@ export async function captureScreen(root, { captureId, navigate }) {
   };
 }
 
-function legendDot(color, label) {
-  return h('span.legend-item', h('span.legend-dot', { style: { background: color } }), label);
+/** Up to four photos to show "where to stand": the last one, then others spread over the capture. */
+function pickReferences(frames) {
+  if (!frames.length) return [];
+  const out = [frames[frames.length - 1]];
+  for (const k of [0.2, 0.5, 0.8]) {
+    const f = frames[Math.floor(k * (frames.length - 1))];
+    if (!out.includes(f)) out.push(f);
+  }
+  return out.filter((f) => f.thumb || f.jpeg);
+}
+
+function legendDot(cls, label) {
+  return h('span.legend-item', h('span.legend-dot.' + cls), label);
 }
 
 function explainError(e, engine) {

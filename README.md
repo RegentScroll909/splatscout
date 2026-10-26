@@ -3,12 +3,17 @@
 SplatScout is a phone app (a web app you install from Chrome, with no app store) that helps you capture
 building interiors well enough to make **clean Gaussian splats**. While you scan, it:
 
-- **Guides you around the space in AR (2.0)**: you mark the scan area by tapping its corners on the floor,
-  then each pass draws a glowing path on the floor, an aim ring, and a "sidestep right" arrow. Passes advance
-  by themselves, and the last pass sends you straight to the spots that still need angles (stand on the ring,
-  aim at the red area). The practice room reaches a complete scan in about 7–8 minutes.
+- **Guides you around the space in AR**: you mark the scan area by tapping its corners on the floor, then
+  each pass draws a path on the floor and an arrow under the centre cross gives one instruction at a time:
+  walk to the path, turn or tilt the phone ("Turn right 40°", "Tilt up 20°"), then sidestep along it. It only
+  ever points ahead (no shuffling back and forth in corners), takes the photo when you stand on a spot, and
+  skips spots that can't be reached. The last pass sends you to the spots that still need angles.
+- **Keeps its place in your scan (2.1)**: when tracking is lost, the position jumps, or the AR session stops
+  (screen off, app closed, another day), the next view is matched against the surfaces already scanned, so the
+  scan area, coverage and path come back instead of starting over. Line up by hand or start a new map if a
+  room has changed.
 - **Scan bounds (2.0)**: only what's inside the outline counts (half a hallway, one end of a lobby), and you
-  can tap ⊘ to skip spots you can't capture well, like windows and mirrors. SplatStation crops the
+  can tap Skip to leave out spots you can't capture well, like windows and mirrors. SplatStation crops the
   finished splat to the same outline.
 - **Paints coverage onto the real surfaces in AR**: red = captured from 1 angle, amber = 2, green = 3+.
   Dots sit on the actual surfaces and hide behind furniture and walls; depth noise floating in mid-air is
@@ -19,12 +24,13 @@ building interiors well enough to make **clean Gaussian splats**. While you scan
   wall, window blowing out, tracking lost, gap in overlap, wrong height for this pass… Optional voice coaching.
 - **Walks you through a capture plan** for the type of space (room, hallway, large hall, stairwell,
   object, freestyle), pass by pass (eye level, overhead, low, cross, details), with progress for each pass.
-- **Points you at what's missing** with an AR beacon and an edge arrow, and shows a live floor-plan map with
-  the scan area and the path.
+- **Points you at what's missing** with an AR beacon and the centre arrow, and shows a live floor-plan map
+  with the scan area and the path.
 - **Grades the capture (A–F) before you leave the room**, with concrete fixes ("23% of surfaces were seen
   from one angle — walk the red areas"; "4 photos are soft — remove them").
-- **Exports a ZIP** of sharp, well-spaced photos for your splat pipeline. AR mode also includes the camera
-  poses (Nerfstudio `transforms.json` and a COLMAP text model) and a coloured depth point cloud.
+- **Exports a ZIP** of sharp, well-spaced photos for your splat pipeline, and you choose what goes in it
+  (leave out blurry photos, a pass, or a separate AR map). AR mode also includes the camera poses
+  (Nerfstudio `transforms.json` and a COLMAP text model) and a coloured depth point cloud.
 
 Two capture engines:
 
@@ -83,14 +89,16 @@ mode automatically.
 ## 2. Capture
 
 1. **New capture** → building, room, type of space → AR tracked → tick the pre-flight checklist.
-2. **Start AR capture**, then **mark the scan area**: aim the centre dot at the floor in each corner and tap
-   **＋ Corner** (or tap the spot on screen), then **Done**. *Skip* scans without an outline.
-3. **Follow the path** on the floor at a slow, steady walk, keeping the blue ring near the centre of the screen.
-   Photos are automatic and you don't need to stop. Each pass moves on to the next by itself.
+2. **Start AR capture**, then **mark the scan area**: aim the centre cross at the floor in each corner and tap
+   **Corner** (or tap the spot on screen), then **Done**. *Skip* scans without an outline.
+3. **Follow the arrow** under the centre cross at a slow, steady walk. Photos are automatic and you don't need
+   to stop. Each pass moves on to the next by itself.
 4. **Fill the gaps**: the last pass puts a ring on the floor where to stand and a ring on the surface to aim at.
-   The capture is complete at about **Area 85%**. Use **⊘ Skip spot** for windows, mirrors or unreachable corners.
-5. **Done** grades the capture on the spot: *Keep capturing* or *Finish & review*.
-6. In Review: check the fixes, remove blurry photos, and **Export ZIP**.
+   The capture is complete at about **Area 85%**. Use **Skip** (left) for windows, mirrors or unreachable corners.
+5. If **Re-aligning** appears (tracking was lost), sweep the phone over something you scanned before until it
+   says *Found it*. To continue another time: **Capture more → Continue in AR**.
+6. **Done** grades the capture on the spot: *Keep capturing* or *Finish & review*.
+7. In Review: check the fixes, then **Export**, choose what to include, and **Save ZIP**.
 
 The in-app **Capture guide** is the full field manual: golden rules, technique for each type of space,
 lighting, tricky surfaces, and a "splat symptom → capture fix" table.
@@ -121,8 +129,8 @@ Building_Room_YYYYMMDD/
 
 ## SplatStation: turn captures into splats on your PC
 
-SplatStation runs on the PC with the GPU. It watches for new captures and turns each one into a finished
-Gaussian splat automatically:
+SplatStation runs on the PC with the GPU. It collects your captures, and turns the ones you choose into
+finished Gaussian splats:
 
 ```
 SplatScout ZIP  ─┐                        ┌─ COLMAP 4 (GPU SIFT + matching)
@@ -136,13 +144,20 @@ which removes floaters seen through windows or past the area. The uncropped spla
 Turn it off on the dashboard (*Crop splats to the scan area*).
 
 **Start it:** double-click **`start-station.cmd`** (or run `node station/station.mjs`), then open
-**http://localhost:8787**. The dashboard shows the queue, a progress bar for each stage, live GPU load and VRAM,
-a library of finished splats, and a 3D viewer.
+**http://localhost:8787**. The dashboard shows captures ready to process, the queue, a progress bar for each stage,
+live GPU load and VRAM, a library of finished splats, and a 3D viewer.
+
+**You decide what runs.** New captures land in *Ready to process* with their photo count, grade and scan area.
+Pick the quality, whether to use the phone's AR positions and whether to crop, then press **Process**. Queued jobs
+can be held or moved to the front, and *Pause after the current job* stops the queue. To have everything start by
+itself instead, tick *Process new captures by themselves* under Defaults.
 
 **Get captures in, any of these ways:**
-- **USB (easiest with your Pixel):** plug the phone in. New SplatScout exports in the phone's *Download* folder are
-  pulled in automatically (needs USB debugging on; uses `adb`).
-- **Drag and drop** a ZIP or video onto the dashboard.
+- **USB (easiest with your Pixel):** plug the phone in. The SplatScout exports in the phone's *Download* folder are
+  listed under *Phone over USB*; tick the ones you want and press **Import** (needs USB debugging on; uses `adb`).
+  *Copy new exports from the phone by themselves* under Defaults brings back automatic import.
+- **Drag and drop** a ZIP or video onto the dashboard (tick *Start processing as soon as they arrive* to skip the
+  Process step).
 - **From the phone over Wi-Fi:** open the "From a phone on the same Wi-Fi" address shown on the dashboard and
   upload. Put that address in SplatScout → Settings → *SplatStation address* to get an "Open SplatStation" button
   after each export. Campus Wi-Fi often blocks phone-to-PC traffic; use USB there.
@@ -174,10 +189,16 @@ SuperSplat** to crop and clean floaters.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (24 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (30 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
-  depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, photos while
-  walking, coaching priority/hysteresis, scoring, COLMAP/transforms export, ZIP validity and splat cropping.
+  depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
+  backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
+  walls, drift), lined-up sessions sharing one map, photos while walking, coaching priority/hysteresis,
+  scoring, COLMAP/transforms export, ZIP validity and splat cropping.
+- **Re-alignment in the Practice room**, which now starts every later session in shifted, turned coordinates
+  like a real AR session: resuming a capture found its place within 2 cm about 10 s after starting; a simulated
+  60 cm / 12° tracking jump and a 2 s tracking loss were both put back within 6 cm; lining up by hand from 9 cm
+  and 4° off snapped to within 1 cm.
 - **Full guided captures** in the Practice room, simulated with the Pixel's AR camera geometry (860×1920,
   35° wide in portrait), driven frame by frame through the real pipeline with an autopilot that follows the
   guide at walking pace: marking the scan area, all five passes advancing by themselves, gap filling,

@@ -144,12 +144,15 @@ const DIR_SEP_COS = Math.cos(15 * DEG); // observation directions closer than 15
  *  * Each photo adds its viewing direction to every surface voxel visible in it ("dirs": how many
  *    clearly different angles the surface was photographed from).
  *  * Optional bounds: only surfaces inside the scan area count.
+ *  * Empty space the depth rays passed through is remembered too ("free"), which lets re-alignment
+ *    tell a real match from a room that merely has the same shape.
  */
 export class VoxelMap {
   constructor(size = 0.2, maxObsDist = 5) {
     this.size = size;
     this.maxObsDist = maxObsDist;
     this.vox = new Map();
+    this.free = new Map(); // key -> times seen through * 4096 + last frame id
     this.version = 0;
     this.frameId = 0;
     this.bounds = null;
@@ -158,6 +161,7 @@ export class VoxelMap {
 
   reset() {
     this.vox.clear();
+    this.free.clear();
     this.version++;
   }
 
@@ -189,7 +193,7 @@ export class VoxelMap {
       const k = this.key(ix, iy, iz);
       let v = this.vox.get(k);
       if (!v) {
-        v = { ix, iy, iz, n: 0, sx: 0, sy: 0, sz: 0, hit: 0, miss: 0, f: 0, m: 0, kfs: 0, dirs: [], bv: -1, ib: true };
+        v = { ix, iy, iz, n: 0, sx: 0, sy: 0, sz: 0, hit: 0, miss: 0, f: 0, m: 0, kfs: 0, dirs: [], bv: -1, ib: true, c: id };
         this.vox.set(k, v);
       }
       v.n++;
@@ -208,11 +212,16 @@ export class VoxelMap {
         }
         return false;
       };
+      const free = this.free, tag = id % 4096;
+      const cell = (k) => {
+        const f = free.get(k) || 0;
+        if (f % 4096 !== tag) free.set(k, (Math.floor(f / 4096) + 1) * 4096 + tag);
+      };
       for (let i = 0; i < points.length; i += 3) {
         const dx = points[i] - camPos[0], dy = points[i + 1] - camPos[1], dz = points[i + 2] - camPos[2];
         const len = Math.hypot(dx, dy, dz);
         if (len - stopBefore <= s) continue;
-        this.march(camPos, [dx / len, dy / len, dz / len], len - stopBefore, visit);
+        this.march(camPos, [dx / len, dy / len, dz / len], len - stopBefore, visit, cell);
       }
     }
     this.version++;
@@ -220,9 +229,9 @@ export class VoxelMap {
 
   /**
    * Walk the voxels along a ray (3D DDA). `visit(voxel, t)` is called for existing voxels;
-   * return true to stop. Returns the stopping voxel or null.
+   * return true to stop. `cell(key)` (optional) sees every cell. Returns the stopping voxel or null.
    */
-  march(o, dir, maxLen, visit) {
+  march(o, dir, maxLen, visit, cell) {
     const s = this.size;
     let ix = Math.floor(o[0] / s), iy = Math.floor(o[1] / s), iz = Math.floor(o[2] / s);
     const sx = dir[0] > 0 ? 1 : -1, sy = dir[1] > 0 ? 1 : -1, sz = dir[2] > 0 ? 1 : -1;
@@ -233,7 +242,9 @@ export class VoxelMap {
     let tZ = az > 1e-9 ? (sz > 0 ? (iz + 1) * s - o[2] : o[2] - iz * s) / az : Infinity;
     let t = 0;
     for (let guard = 0; t < maxLen && guard < 4096; guard++) {
-      const v = this.vox.get(this.key(ix, iy, iz));
+      const k = this.key(ix, iy, iz);
+      if (cell) cell(k);
+      const v = this.vox.get(k);
       if (v && visit(v, t)) return v;
       if (tX < tY && tX < tZ) { t = tX; tX += dX; ix += sx; }
       else if (tY < tZ) { t = tY; tY += dY; iy += sy; }
@@ -335,6 +346,16 @@ export class VoxelMap {
       v.ib = this.bounds.contains(v.sx / v.n, v.sy / v.n, v.sz / v.n);
     }
     return v.ib;
+  }
+
+  /** Space that depth rays have passed through several times, with no surface in it. */
+  isFreeAt(x, y, z) {
+    const s = this.size;
+    const k = this.key(Math.floor(x / s), Math.floor(y / s), Math.floor(z / s));
+    const f = this.free.get(k);
+    if (!f || f < 3 * 4096) return false;
+    const v = this.vox.get(k);
+    return !v || !VoxelMap.isSolid(v);
   }
 
   isSolidAt(x, y, z) {
