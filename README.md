@@ -8,13 +8,17 @@ building interiors well enough to make **clean Gaussian splats**. While you scan
   walk to the path, turn or tilt the phone ("Turn right 40°", "Tilt up 20°"), then sidestep along it. It only
   ever points ahead (no shuffling back and forth in corners), takes the photo when you stand on a spot, and
   skips spots that can't be reached. The last pass sends you to the spots that still need angles.
-- **Keeps its place in your scan (2.1)**: when tracking is lost, the position jumps, or the AR session stops
-  (screen off, app closed, another day), the next view is matched against the surfaces already scanned, so the
-  scan area, coverage and path come back instead of starting over. Line up by hand or start a new map if a
-  room has changed.
-- **Scan bounds (2.0)**: only what's inside the outline counts (half a hallway, one end of a lobby), and you
-  can tap Skip to leave out spots you can't capture well, like windows and mirrors. SplatStation crops the
-  finished splat to the same outline.
+- **Keeps its place in your scan (2.1, 2.2)**: when tracking is lost, the position jumps, or the AR session
+  stops (screen off, app closed, another day), the next view is matched against the surfaces already scanned,
+  so the scan area, coverage and path come back instead of starting over. Along a hallway, where plain walls
+  fit anywhere, the camera image is compared with your earlier photos (signs, posters, door numbers) to tell
+  where along it you are. If it takes a while, tap your spot on the map; or fine-tune by hand, or start a new
+  map if a room has changed.
+- **Scan bounds (2.0, 2.2)**: only what's inside the outline counts (half a hallway, one end of a lobby), and
+  you can tap Skip to leave out spots you can't capture well, like windows and mirrors. SplatStation crops the
+  finished splat to the same outline. A rough rectangle is enough: the path keeps clear of the walls the
+  phone finds, so corners can sit inside a wall (around a hallway's door recesses, say) and spots behind a
+  wall drop out.
 - **Paints coverage onto the real surfaces in AR**: red = captured from 1 angle, amber = 2, green = 3+.
   Dots sit on the actual surfaces and hide behind furniture and walls; depth noise floating in mid-air is
   filtered out and carved away.
@@ -90,13 +94,16 @@ mode automatically.
 
 1. **New capture** → building, room, type of space → AR tracked → tick the pre-flight checklist.
 2. **Start AR capture**, then **mark the scan area**: aim the centre cross at the floor in each corner and tap
-   **Corner** (or tap the spot on screen), then **Done**. *Skip* scans without an outline.
+   **Corner** (or tap the spot on screen), then **Done**. *Skip* scans without an outline. A rough rectangle
+   is fine: in a hallway, mark it out to the back of the door recesses; the path keeps clear of the walls.
 3. **Follow the arrow** under the centre cross at a slow, steady walk. Photos are automatic and you don't need
    to stop. Each pass moves on to the next by itself.
 4. **Fill the gaps**: the last pass puts a ring on the floor where to stand and a ring on the surface to aim at.
    The capture is complete at about **Area 85%**. Use **Skip** (left) for windows, mirrors or unreachable corners.
 5. If **Re-aligning** appears (tracking was lost), sweep the phone over something you scanned before until it
-   says *Found it*. To continue another time: **Capture more → Continue in AR**.
+   says *Found it*. In a hallway, aim at something that only appears once (a sign, a poster, a door number).
+   If it takes a while, tap **Show me on the map** and tap where you're standing. To continue another time:
+   **Capture more → Continue in AR**.
 6. **Done** grades the capture on the spot: *Keep capturing* or *Finish & review*.
 7. In Review: check the fixes, then **Export**, choose what to include, and **Save ZIP**.
 
@@ -189,12 +196,24 @@ SuperSplat** to crop and clean floaters.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (30 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (33 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
-  walls, drift), lined-up sessions sharing one map, photos while walking, coaching priority/hysteresis,
-  scoring, COLMAP/transforms export, ZIP validity and splat cropping.
+  walls, drift), hallway re-alignment (depth alone can't place you along it, the photos can), hallway paths
+  kept off the walls when the outline is drawn around the door recesses, lined-up sessions sharing one map,
+  photos while walking, coaching priority/hysteresis, scoring, COLMAP/transforms export, ZIP validity and
+  splat cropping.
+- **Hallway re-alignment (2.2)** in the new Practice hallway (18 m, door recesses both sides, posters and
+  numbered doors, planked floor and tiled ceiling) and the Practice room, with photo-taking paused so a bad
+  result couldn't spoil the next. Continuing a scan in a new, turned and shifted session locked in 2–4 s
+  within 1–3 cm. Per scene, 24 events: tracking lost for 2 s with ARCore keeping its coordinates (resumed at
+  once), lost with its coordinates shifted 0.6 m and 8°, and 0.6 m / 25° jumps. All came back within 6 cm,
+  4.4 s (room) and 5.4 s (hallway) on average, none stuck. Tapping a spot 36 cm off on the map locked in 2 s
+  within 7 cm. Earlier rounds of this test exposed wrong locks: from repeated floor and ceiling patterns
+  (photo matching now uses walls, doors and signs only), from middling photo matches (now "not sure"), and
+  from the quick post-loss check correcting over a narrow view (it now only confirms an unchanged position;
+  anything else gets the full search).
 - **Re-alignment in the Practice room**, which now starts every later session in shifted, turned coordinates
   like a real AR session: resuming a capture found its place within 2 cm about 10 s after starting; a simulated
   60 cm / 12° tracking jump and a 2 s tracking loss were both put back within 6 cm; lining up by hand from 9 cm
@@ -220,13 +239,16 @@ Not yet tested, because it needs real hardware: a live ARCore session on your Pi
   *Photo pace* gives three presets.
 - Marking corners relies on ARCore finding the floor: point the phone at the floor and move it slowly until the
   cursor appears.
+- Photo matching (2.2) was tuned on rendered scenes. Real hallways have exposure changes, motion blur and
+  identical doors. If re-aligning in a real hallway still struggles, the capture's `alignLog` in the export
+  records each lock with its photo score, which says whether the threshold needs moving.
 
 ## 5. For developers
 
 ```
-app/js/core/      platform-independent logic (analysis, coverage, depth filter, scan bounds, guide, keyframes,
-                  coaching, plans, scoring, export formats)
-app/js/sources/   xrSource (WebXR/ARCore), cameraSource (getUserMedia + orientation), demoSource/demoScene (practice room)
+app/js/core/      platform-independent logic (analysis, coverage, depth filter, scan bounds, guide, walkable floor
+                  plan, re-alignment + photo matching, keyframes, coaching, plans, scoring, export formats)
+app/js/sources/   xrSource (WebXR/ARCore), cameraSource (getUserMedia + orientation), demoSource/demoScene (practice room, hallway)
 app/js/capture/   session engine, 3D overlay (+ guide geometry), minimap, audio
 app/js/data/      IndexedDB storage, settings, ZIP export
 app/js/ui/        screens

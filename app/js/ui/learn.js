@@ -23,7 +23,7 @@ const SECTIONS = [
     body: `
 <ol>
 <li><b>Hold the phone sideways (landscape).</b> The AR camera sees 70° across in landscape but only 35° upright, so a sideways scan finishes much sooner.</li>
-<li><b>Mark the scan area.</b> When AR starts, aim the centre cross at the floor in each corner of the space and tap <b>Corner</b> (or tap the spot on screen). Tap <b>Done</b>. Only surfaces inside the outline count, so you can capture half a hallway, or leave out what you can see through a window.</li>
+<li><b>Mark the scan area.</b> When AR starts, aim the centre cross at the floor in each corner of the space and tap <b>Corner</b> (or tap the spot on screen). Tap <b>Done</b>. Only surfaces inside the outline count, so you can capture half a hallway, or leave out what you can see through a window. A rough rectangle is fine: in a hallway with door recesses, mark it out to the back of the recesses. Corners can sit inside a wall: the path keeps clear of the walls the phone finds, and spots behind a wall drop out.</li>
 <li><b>Follow the arrow.</b> Each pass draws a trail on the floor. The arrow under the centre cross gives one instruction at a time: <b>walk</b> to the path, <b>turn</b> or <b>tilt</b> the phone ("Turn right 40°", "Tilt up 20°", "Turn around"), then <b>sidestep</b> along it. The ring shows exactly where to aim. The trail fills in on the map as you go, and the next pass starts by itself.</li>
 <li><b>Keep walking.</b> Photos are taken automatically while you move at a slow, steady pace. You don't need to stop. If you see "A little slower", ease off a bit.</li>
 <li><b>Fill the gaps.</b> The last pass sends you to the spots that still need angles: walk to the ring on the floor, aim at the red area inside the blue ring, and hold for a second. Repeat until the app says the area is complete (about <b>85%</b>).</li>
@@ -37,9 +37,11 @@ const SECTIONS = [
 <p>Phone AR sometimes loses its place: in the dark, in front of a blank wall, or when the phone goes to sleep and AR has to start again. SplatScout notices and puts you back in your scan instead of starting over:</p>
 <ul>
 <li><b>Tracking lost or the position jumps:</b> photos pause for a moment while the view is checked against what you already scanned. If it still lines up, you carry on. If not, the <b>Re-aligning</b> panel appears.</li>
-<li><b>Re-aligning:</b> sweep the phone slowly over walls and furniture you scanned before. Corners, doors and furniture work best; a plain wall could be anywhere. When it matches, the dots settle back onto the surfaces and you carry on where you left off.</li>
+<li><b>Re-aligning:</b> sweep the phone slowly over walls and furniture you scanned before. The app compares what the depth sensor sees with the scan, and the camera image with your earlier photos. When it matches, the dots settle back onto the surfaces and you carry on where you left off.</li>
+<li><b>In hallways</b>, plain walls look the same all along, so the photos do the work: aim at something that only appears once, like a sign, a poster, a noticeboard or a door number. Showing the floor for a moment helps too.</li>
+<li><b>Show me on the map:</b> if it takes a while, tap it, tap where you're standing on the floor plan (the dots are where earlier photos were taken), and drag from your dot the way the phone faces. The search then looks only there. When the dots sit on the real walls, tap <b>Use this position</b>.</li>
 <li><b>Coming back later</b> (screen off, app closed, another day): open the capture and tap <b>Capture more → Continue in AR</b>. Stand roughly where one of the photos shown was taken and aim the same way, which makes the match faster. Tap <b>I'm here</b> to tell the app.</li>
-<li>If it can't find its place (furniture moved, the room changed), <b>Line up by hand</b>: drag to slide the dots onto the walls, twist with two fingers to turn them, then <b>Use this position</b>. Or <b>Start a new map</b>: that session gets its own coordinates and its photos are still exported.</li>
+<li>If the room changed (furniture moved), use the map, then <b>Fine-tune</b> to drag the dots onto the walls by hand. Or <b>Start a new map</b>: that session gets its own coordinates and its photos are still exported.</li>
 <li>Think the dots don't sit on the surfaces any more? Tap <b>Align</b> (left) to check.</li>
 </ul>`,
   },

@@ -1,20 +1,76 @@
-// Practice room: a procedurally textured classroom rendered with WebGL2, plus CPU ray casting
-// for simulated depth. Used by Practice mode (desktop/phone) and for testing the capture pipeline.
+// Practice scenes: a procedurally textured classroom and a hallway with door recesses, rendered
+// with WebGL2, plus CPU ray casting for simulated depth. Used by Practice mode (desktop/phone) and
+// for testing the capture pipeline.
 
 import { compileProgram } from './gpu.js';
 import { projectionFromIntrinsics, mat4InvertRigid, transformDir } from '../core/math.js';
 import { depthToPoints, unprojectIntr } from '../core/depth.js';
 
-export const ROOM = { min: [-4, 0, -3.5], max: [4, 3, 3.5] };
+// Hallway: 2.5 m wide and 18 m long, with 1.2 m wide, 0.5 m deep door recesses on both sides. The
+// outer box is the back of the recesses; the walls between recesses are solid blocks.
+const HALL_W = 1.25, HALL_RECESS = 0.5, HALL_L = 9;
+const RECESSES = [[1, -5.9], [1, -0.6], [1, 4.1], [-1, -3.4], [-1, 2.4], [-1, 7.1]]; // [side, z centre]
 
-const FURNITURE = [
-  { min: [-1.2, 0, -0.6], max: [1.2, 0.75, 0.6], color: [0.55, 0.38, 0.24] }, // table
-  { min: [-3.98, 0, -2.6], max: [-3.5, 2.0, -0.6], color: [0.32, 0.36, 0.42] }, // shelf
-  { min: [2.3, 0, -3.48], max: [3.6, 1.0, -2.95], color: [0.62, 0.6, 0.55] }, // cabinet
-  { min: [1.8, 0, 1.4], max: [2.2, 3.0, 1.8], color: [0.74, 0.72, 0.7] }, // pillar
-  { min: [-2.6, 0, 2.5], max: [-0.6, 0.8, 3.45], color: [0.18, 0.3, 0.52] }, // sofa
-  { min: [-0.9, 0.75, -0.35], max: [-0.3, 1.05, 0.05], color: [0.8, 0.25, 0.2] }, // box on table
-];
+function hallWalls() {
+  const out = [];
+  for (const side of [1, -1]) {
+    const zs = RECESSES.filter((r) => r[0] === side).map((r) => r[1]).sort((a, b) => a - b);
+    let z = -HALL_L;
+    for (const c of [...zs, HALL_L + 0.6]) {
+      if (c - 0.6 > z) {
+        const x0 = side > 0 ? HALL_W : -HALL_W - HALL_RECESS, x1 = side > 0 ? HALL_W + HALL_RECESS : -HALL_W;
+        out.push({ min: [x0, 0, z], max: [x1, 2.8, c - 0.6], color: [1, 1, 1], mat: 0 });
+      }
+      z = c + 0.6;
+    }
+  }
+  return out;
+}
+
+export const SCENES = {
+  room: {
+    kind: 0,
+    box: { min: [-4, 0, -3.5], max: [4, 3, 3.5] },
+    furniture: [
+      { min: [-1.2, 0, -0.6], max: [1.2, 0.75, 0.6], color: [0.55, 0.38, 0.24] }, // table
+      { min: [-3.98, 0, -2.6], max: [-3.5, 2.0, -0.6], color: [0.32, 0.36, 0.42] }, // shelf
+      { min: [2.3, 0, -3.48], max: [3.6, 1.0, -2.95], color: [0.62, 0.6, 0.55] }, // cabinet
+      { min: [1.8, 0, 1.4], max: [2.2, 3.0, 1.8], color: [0.74, 0.72, 0.7] }, // pillar
+      { min: [-2.6, 0, 2.5], max: [-0.6, 0.8, 3.45], color: [0.18, 0.3, 0.52] }, // sofa
+      { min: [-0.9, 0.75, -0.35], max: [-0.3, 1.05, 0.05], color: [0.8, 0.25, 0.2] }, // box on table
+    ],
+    start: [0, 1.45, 2.4],
+  },
+  hallway: {
+    kind: 1,
+    box: { min: [-HALL_W - HALL_RECESS, 0, -HALL_L], max: [HALL_W + HALL_RECESS, 2.8, HALL_L] },
+    furniture: hallWalls(),
+    start: [0, 1.45, 6.5],
+  },
+};
+
+let scene = SCENES.room;
+/** The active scene's outer box (the room, or the hallway including its recesses). */
+export let ROOM = scene.box;
+let FURNITURE = scene.furniture;
+
+/** Pick the practice scene ('room' or 'hallway') before creating a DemoScene or casting rays. */
+export function setScene(id) {
+  scene = SCENES[id] || SCENES.room;
+  ROOM = scene.box;
+  FURNITURE = scene.furniture;
+  return scene;
+}
+
+/** Can someone stand at (x, z)? Inside the box and clear of the walls, 0.3 m from both. */
+export function walkable(x, z) {
+  const m = 0.3;
+  if (x < ROOM.min[0] + m || x > ROOM.max[0] - m || z < ROOM.min[2] + m || z > ROOM.max[2] - m) return false;
+  for (const f of FURNITURE) {
+    if (f.mat === 0 && x > f.min[0] - m && x < f.max[0] + m && z > f.min[2] - m && z < f.max[2] + m) return false;
+  }
+  return true;
+}
 
 const VS = `#version 300 es
 layout(location=0) in vec3 aPos;
@@ -32,6 +88,7 @@ const FS = `#version 300 es
 precision highp float;
 in vec3 vPos; in vec3 vNrm; in vec3 vCol; flat in int vMat;
 uniform float uExposure;
+uniform int uKind;
 out vec4 outColor;
 
 float hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
@@ -59,34 +116,45 @@ void main() {
   vec3 p = vPos, n = normalize(vNrm);
   vec3 col;
   bool emissive = false;
+  bool hall = uKind == 1;
   if (vMat == 0) {
     // Walls
     vec2 uv = abs(n.x) > 0.5 ? p.zy : p.xy;
     vec3 base = n.x < -0.5 ? vec3(0.78, 0.74, 0.66) : n.x > 0.5 ? vec3(0.70, 0.75, 0.79)
               : n.z < -0.5 ? vec3(0.83, 0.81, 0.77) : vec3(0.77, 0.71, 0.68);
-    bool blank = n.z < -0.5 && p.x > 0.4 && p.x < 3.9; // a plain painted wall section
+    bool blank = !hall && n.z < -0.5 && p.x > 0.4 && p.x < 3.9; // a plain painted wall section
+    bool recessBack = hall && abs(p.x) > 1.7;
     col = base * (blank ? 1.0 : 0.9 + fbm(uv * 18.0) * 0.12 + fbm(uv * 3.0) * 0.1);
-    if (!blank) {
+    if (!blank && !recessBack) {
+      // Hallways: fewer posters, with long plain stretches between them.
       vec2 cell = floor((uv + vec2(0.3, 0.0)) / vec2(1.7, 1.0));
       vec2 f = fract((uv + vec2(0.3, 0.0)) / vec2(1.7, 1.0));
       float h = hash(cell + n.xz * 7.0 + 3.0);
-      if (p.y > 1.15 && p.y < 2.35 && h > 0.3 && f.x > 0.12 && f.x < 0.88) {
+      if (p.y > 1.15 && p.y < 2.35 && h > (hall ? 0.62 : 0.3) && f.x > 0.12 && f.x < 0.88) {
         vec2 pf = vec2((f.x - 0.12) / 0.76, (p.y - 1.15) / 1.2);
         col = (pf.x < 0.03 || pf.x > 0.97 || pf.y < 0.03 || pf.y > 0.97) ? vec3(0.12) : poster(pf, h);
       }
     }
     if (p.y < 0.12) col = vec3(0.25, 0.2, 0.18) * (0.85 + 0.3 * noise(uv * 40.0));
-    if (abs(p.y - 0.95) < 0.025) col = vec3(0.45, 0.32, 0.22);
-    // Window on the +X wall (faces -X)
-    if (n.x < -0.5 && p.z > -1.5 && p.z < 1.0 && p.y > 0.9 && p.y < 2.3) {
-      bool mullion = abs(p.z + 0.25) < 0.03 || abs(p.y - 1.6) < 0.03 || p.z < -1.46 || p.z > 0.96 || p.y < 0.94 || p.y > 2.26;
-      col = mullion ? vec3(0.9) : vec3(1.6, 1.7, 1.85) * (0.95 + 0.1 * noise(p.zy * 3.0));
-      emissive = !mullion;
-    }
-    // Door on the -X wall
-    if (n.x > 0.5 && p.z > 1.0 && p.z < 2.0 && p.y < 2.1) {
-      col = vec3(0.45, 0.3, 0.18) * (0.8 + 0.4 * fbm(vec2(p.z * 3.0, p.y * 40.0)));
-      if (abs(p.z - 1.85) < 0.04 && abs(p.y - 1.0) < 0.04) col = vec3(0.85, 0.75, 0.3);
+    if (abs(p.y - 0.95) < 0.025 && !hall) col = vec3(0.45, 0.32, 0.22);
+    if (!hall) {
+      // Window on the +X wall (faces -X)
+      if (n.x < -0.5 && p.z > -1.5 && p.z < 1.0 && p.y > 0.9 && p.y < 2.3) {
+        bool mullion = abs(p.z + 0.25) < 0.03 || abs(p.y - 1.6) < 0.03 || p.z < -1.46 || p.z > 0.96 || p.y < 0.94 || p.y > 2.26;
+        col = mullion ? vec3(0.9) : vec3(1.6, 1.7, 1.85) * (0.95 + 0.1 * noise(p.zy * 3.0));
+        emissive = !mullion;
+      }
+      // Door on the -X wall
+      if (n.x > 0.5 && p.z > 1.0 && p.z < 2.0 && p.y < 2.1) {
+        col = vec3(0.45, 0.3, 0.18) * (0.8 + 0.4 * fbm(vec2(p.z * 3.0, p.y * 40.0)));
+        if (abs(p.z - 1.85) < 0.04 && abs(p.y - 1.0) < 0.04) col = vec3(0.85, 0.75, 0.3);
+      }
+    } else if (recessBack && p.y < 2.1) {
+      // Doors at the back of the recesses, each with its own number plate.
+      float id = floor((p.z + 30.0) / 1.2);
+      col = mix(vec3(0.45, 0.3, 0.18), vec3(0.3, 0.36, 0.45), step(0.5, hash(vec2(id, n.x)))) * (0.8 + 0.4 * fbm(vec2(p.z * 3.0, p.y * 40.0)));
+      vec2 plate = vec2(fract((p.z + 30.0) / 1.2) - 0.5, p.y - 1.6);
+      if (abs(plate.x) < 0.12 && abs(plate.y) < 0.07) col = poster(vec2(plate.x / 0.24 + 0.5, plate.y / 0.14 + 0.5), hash(vec2(id, 7.0)));
     }
   } else if (vMat == 1) {
     // Floor: wooden planks with a rug
@@ -98,7 +166,7 @@ void main() {
     col *= 0.8 + 0.35 * noise(vec2((p.x + off) * 3.0, p.z * 60.0));
     if (fract(p.z / 0.18) < 0.04 || fract((p.x + off) / 1.2) < 0.008) col *= 0.5;
     vec2 r = abs(p.xz - vec2(0.0, 0.0));
-    if (r.x < 2.0 && r.y < 1.4) {
+    if (!hall && r.x < 2.0 && r.y < 1.4) {
       vec2 g = floor(p.xz * 6.0);
       col = mix(vec3(0.5, 0.12, 0.15), vec3(0.85, 0.7, 0.35), step(0.5, hash(g))) * (0.8 + 0.3 * noise(p.xz * 30.0));
       if (r.x > 1.85 || r.y > 1.25) col = vec3(0.2, 0.15, 0.1);
@@ -116,7 +184,7 @@ void main() {
     col *= 0.85 + 0.25 * step(0.5, fract((p.x + p.z) * 4.0 + p.y * 3.0)) * step(0.7, hash(floor(p.xz * 8.0 + p.y)));
   }
   if (!emissive) {
-    vec3 L = vec3(0.0, 2.9, 0.0) - p;
+    vec3 L = (hall ? vec3(0.0, 2.7, p.z) : vec3(0.0, 2.9, 0.0)) - p;
     float d = length(L);
     float diff = max(dot(n, L / d), 0.0);
     float light = 0.5 + 0.65 * diff / (1.0 + 0.04 * d * d);
@@ -153,9 +221,11 @@ export class DemoScene {
     this.uView = gl.getUniformLocation(this.prog, 'uView');
     this.uProj = gl.getUniformLocation(this.prog, 'uProj');
     this.uExposure = gl.getUniformLocation(this.prog, 'uExposure');
+    this.uKind = gl.getUniformLocation(this.prog, 'uKind');
+    this.kind = scene.kind;
     const data = [];
     pushBox(data, ROOM.min, ROOM.max, 0, [1, 1, 1], true);
-    for (const f of FURNITURE) pushBox(data, f.min, f.max, 3, f.color, false);
+    for (const f of FURNITURE) pushBox(data, f.min, f.max, f.mat != null ? f.mat : 3, f.color, false);
     const arr = new Float32Array(data);
     this.count = arr.length / 10;
     this.vao = gl.createVertexArray();
@@ -185,6 +255,7 @@ export class DemoScene {
     gl.uniformMatrix4fv(this.uView, false, mat4InvertRigid(pose));
     gl.uniformMatrix4fv(this.uProj, false, projectionFromIntrinsics(intr, 0.05, 50));
     gl.uniform1f(this.uExposure, exposure);
+    gl.uniform1i(this.uKind, this.kind);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, this.count);
     gl.bindVertexArray(null);

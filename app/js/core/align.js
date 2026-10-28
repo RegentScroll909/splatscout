@@ -8,9 +8,12 @@
 //     blurred floor plan of the mapped surfaces (every heading and place, or near a guess).
 //  2. ICP: the best candidates are refined in 3D (point-to-plane, heading + shift only).
 //  3. Visibility check: from the aligned pose, the live depth must not see through mapped surfaces.
+//  4. Photos: where depth can't decide (along a plain hallway, or between look-alike places), the
+//     earlier photos are compared with the live camera image (photomatch.js).
 
 import { DEG, clamp, mat4Mul } from './math.js';
 import { VoxelMap } from './coverage.js';
+import { photoAgreement, FINE, COARSE } from './photomatch.js';
 
 // ------------------------------------------------------------------ heading + shift transforms
 // xf = {yaw (rad), t: [x, y, z]}: p' = Ry(yaw) p + t, where Ry turns +z towards +x.
@@ -232,22 +235,34 @@ function nearest(vm, x, y, z, maxDist, accept) {
  * @param {number} [o.minDist]
  * @param {(v) => boolean} [o.accept] which map voxels may be matched
  * @param {number|null} [o.yPrior] keep the vertical shift near this value (floor heights agree)
- * @returns {{xf, n, matched, inliers, overlap, rms, cond, weak}}
+ * @param {number|null} [o.ySoft] a guess for the vertical shift, used only to keep the fit steady
+ * @param {{yaw, t}|null} [o.prior] keep what the surfaces don't pin down (the position along a plain
+ *   hallway) near this guess; directions the surfaces do pin down are hardly affected
+ * @returns {{xf, n, matched, inliers, overlap, rms, cond, weak, weakDir}}
  */
 export function icp(vm, pts, x0, o = {}) {
   const iters = o.iters || 10, maxDist = o.maxDist || 0.35, minDist = o.minDist || 0.08;
   const n = pts.length / 3;
   let cur = xf(x0.yaw, x0.t);
   let H = null;
+  // Where the live points' centre lands under the prior.
+  let pc = null;
+  if (o.prior) {
+    const m = [0, 0, 0];
+    for (let i = 0; i < pts.length; i += 3) for (let k = 0; k < 3; k++) m[k] += pts[i + k] / (n || 1);
+    pc = xfApply(o.prior, m);
+  }
   for (let it = 0; it < iters; it++) {
     const md = iters > 1 ? maxDist + ((minDist - maxDist) * it) / (iters - 1) : minDist;
     const q = xfPoints(cur, pts);
-    let cx = 0, cz = 0;
+    let cx = 0, cy = 0, cz = 0;
     for (let i = 0; i < q.length; i += 3) {
       cx += q[i];
+      cy += q[i + 1];
       cz += q[i + 2];
     }
     cx /= n || 1;
+    cy /= n || 1;
     cz /= n || 1;
     const A = new Float64Array(16), g = new Float64Array(4);
     let wsum = 0;
@@ -279,6 +294,22 @@ export function icp(vm, pts, x0, o = {}) {
     if (wsum < 20) break;
     if (o.yPrior != null) add([0, 0, 1, 0], cur.t[1] - o.yPrior, wsum * 0.02);
     H = A.map((v) => v / wsum);
+    if (o.ySoft != null) {
+      // A guess for the height (no floor in view): keeps the fit from wandering up or down, but
+      // doesn't count as the surfaces pinning it down.
+      A[10] += wsum * 0.02;
+      g[2] += wsum * 0.02 * (cur.t[1] - o.ySoft);
+    }
+    if (pc) {
+      // A weak pull towards the prior (the step turns about the live centre, so the centre moves by
+      // exactly the shift). Added after H, so the conditioning still reports what the data pins down.
+      const pw = wsum * 0.004;
+      const res = [wrap(cur.yaw - o.prior.yaw), cx - pc[0], cy - pc[1], cz - pc[2]];
+      for (let i = 0; i < 4; i++) {
+        A[i * 4 + i] += pw;
+        g[i] += pw * res[i];
+      }
+    }
     for (let i = 0; i < 4; i++) A[i * 4 + i] += 1e-4 * wsum;
     const d = solve(A, g.map((v) => -v), 4);
     if (!d) break;
@@ -324,14 +355,29 @@ export function fitStats(vm, pts, x, accept) {
   };
 }
 
-/** Which directions the fit pins down: cond = smallest eigenvalue; weak = 'height' | 'slide' | null. */
+/**
+ * Which directions the fit pins down: cond = smallest eigenvalue; weak = 'height' | 'slide' | null
+ * (the first one to fix); weakHeight: the height is open (no floor in view); weakDir: a floor
+ * direction [x, z] (unit) the surfaces leave open, e.g. along a hallway.
+ */
 function conditioning(H) {
-  if (!H) return { cond: 0, weak: 'slide' };
+  if (!H) return { cond: 0, weak: 'slide', weakHeight: true, weakDir: null, slideDir: null };
   const e = eigSym(H, 4);
   const cond = e.values[0];
-  let weak = null;
-  if (cond < 0.03) weak = Math.abs(e.vectors[0][2]) > 0.7 ? 'height' : 'slide';
-  return { cond, weak };
+  // Sliding on the floor, with the heading free to adjust: the shift block with the heading
+  // eliminated. Its weak direction runs along a wall (or a hallway, even when its doors and recesses
+  // pin it down a little); weak means much weaker than across it, not just below a fixed number.
+  const hy = H[0] || 1e-9;
+  const sxx = H[5] - (H[1] * H[1]) / hy, sxz = H[7] - (H[1] * H[3]) / hy, szz = H[15] - (H[3] * H[3]) / hy;
+  const mean = (sxx + szz) / 2, dev = Math.sqrt(((sxx - szz) / 2) ** 2 + sxz * sxz);
+  const lo = mean - dev, hi = mean + dev;
+  const a = Math.atan2(2 * sxz, sxx - szz) / 2 + Math.PI / 2;
+  const slideDir = [Math.cos(a), Math.sin(a)];
+  const weakDir = lo < 0.03 || lo < 0.1 * hi ? slideDir : null;
+  // Height: only floors, ceilings and tabletops pin it down.
+  const weakHeight = H[10] < Math.max(0.03, 0.1 * hi);
+  const weak = cond < 0.03 || weakDir || weakHeight ? (weakHeight ? 'height' : 'slide') : null;
+  return { cond, weak, weakHeight, weakDir, slideDir };
 }
 
 // ------------------------------------------------------------------ visibility check
@@ -618,8 +664,9 @@ const angDiff = (a, b) => ((a - b + 540) % 360) - 180;
  * @param {(v) => boolean} [o.accept]
  * @returns {{ok, xf, confidence, status, metrics}}
  *   status: 'more' (need more data) | 'new' (not looking at mapped surfaces) | 'flat' (walls only)
- *   | 'floor' (height unknown) | 'ambiguous' | 'mismatch' (outline fits, contents don't) | 'matching'
- *   | 'locked'
+ *   | 'floor' (height unknown) | 'ambiguous' | 'mismatch' (outline fits, contents don't)
+ *   | 'unlike' (shape fits, photos of the spot don't) | 'matching' | 'locked'
+ * @param {{keys, imgs}} [o.photo] earlier photos' keys and live camera images (photomatch.js)
  */
 export function solveAlignment(vm, frames, o = {}) {
   const live = poolLive(frames);
@@ -645,32 +692,96 @@ export function solveAlignment(vm, frames, o = {}) {
   if (!cands.length) return { ok: false, xf: null, confidence: 0, status: 'new' };
   const yGuess = (fallback) => (o.floorY != null && live.floorY != null ? o.floorY - live.floorY : fallback);
   const yPrior = (ty) => (o.floorY != null && live.floorY != null ? ty : null);
-  // Each candidate: quick ICP on a subset, then how much of the map the live depth confirms.
+  const photo = o.photo && o.photo.keys && o.photo.keys.length >= 3 && o.photo.imgs && o.photo.imgs.length ? o.photo : null;
+  const mid = centreOf(live.pts);
+  // No floor in view: guess the height from how high the phone was held while scanning.
+  let camGuess = 0;
+  if (o.floorY != null) {
+    const ys = photo ? photo.keys.map((k) => k.pos[1]).sort((a, b) => a - b) : [];
+    camGuess = (ys.length ? ys[ys.length >> 1] : o.floorY + 1.4) - live.camY;
+  }
+  // The photos settled a search: a good match, and nothing as good elsewhere.
+  const clear = (r, margin = 0.15) => !!(r && r.score >= 0.6 && r.score - r.second >= margin);
+  // Candidates on the same hallway line share one photo search. With no floor in view the search
+  // also looks up and down a little (the height guess can be some centimetres off, and the fine
+  // photo match is sharp).
+  const lines = [];
+  const lineSearch = (x, dir, lift) => {
+    const c = xfApply(x, mid);
+    for (const L of lines) {
+      const d = [c[0] - L.c[0], c[2] - L.c[2]];
+      const along = d[0] * L.dir[0] + d[1] * L.dir[1];
+      if (Math.abs(angDiff(x.yaw / DEG, L.yaw / DEG)) < 4 && Math.abs(c[1] - L.c[1]) < 0.15 &&
+        Math.hypot(d[0] - along * L.dir[0], d[1] - along * L.dir[1]) < 0.3) return L.r;
+    }
+    const r = slideSearch(photo, x, dir, null, { lift: lift ? 0.3 : 0 });
+    lines.push({ c, dir, yaw: x.yaw, r });
+    return r;
+  };
+  // Each candidate: quick ICP on a subset, then how much of the map the live depth confirms. With
+  // photos, each candidate is also slid along its hallway line: repeated doors and recesses fit the
+  // walls in many places, and only the photos tell them apart.
   const sub = thinPoints(live.pts, 600);
-  const tried = cands.slice(0, 5).map((c) => {
+  const tried = [];
+  const consider = (fit, ty, yP, slid) => {
+    if (tried.some((t) => xfDelta(t.fit.xf, fit.xf, mid).dist < 0.1 && xfDelta(t.fit.xf, fit.xf, mid).yaw < 1.5)) return;
+    const ph = photo ? photoScore(photo, fit.xf, 2) : null;
+    tried.push({ fit, vis: visibility(vm, frames, fit.xf, o.accept, 6), open: camerasInOpen(vm, frames, fit.xf), ty, yP, photo: ph, slid });
+  };
+  for (const c of cands.slice(0, 5)) {
     const prior = (o.priors || []).find((p) => Math.abs(angDiff(p.xf.yaw / DEG, c.yaw / DEG)) < 30);
-    const ty = yGuess(prior ? prior.xf.t[1] : o.priors && o.priors[0] ? o.priors[0].xf.t[1] : 0);
-    const fit = icp(vm, sub, xf(c.yaw, [c.tx, ty, c.tz]), { iters: 8, accept: o.accept, yPrior: yPrior(ty) });
-    const vis = visibility(vm, frames, fit.xf, o.accept, 6);
-    return { fit, vis, ty };
-  });
+    const ty = yGuess(prior ? prior.xf.t[1] : o.priors && o.priors[0] ? o.priors[0].xf.t[1] : camGuess);
+    const fit = icp(vm, sub, xf(c.yaw, [c.tx, ty, c.tz]), { iters: 8, accept: o.accept, yPrior: yPrior(ty), ySoft: ty });
+    consider(fit, ty, yPrior(ty), null);
+    if (!photo) continue;
+    const dir = fit.weakDir || fit.slideDir;
+    const open = fit.weakHeight && yPrior(ty) == null;
+    const slid = dir ? lineSearch(fit.xf, dir, open) : null;
+    if (!slid || slid.score < 0.3) continue;
+    // A height from the photos when they match well there.
+    const yP = yPrior(ty) != null ? yPrior(ty) : open && slid.score >= 0.45 && Math.abs(slid.dy) < 0.28 ? slid.xf.t[1] : null;
+    // The full ICP again from there: the candidate may have fitted the walls a little off sideways.
+    const f2 = icp(vm, sub, slid.xf, { iters: 8, maxDist: 0.35, minDist: 0.06, accept: o.accept, yPrior: yP, ySoft: yP == null ? slid.xf.t[1] : null, prior: slid.xf });
+    consider(f2, ty, yP, slid);
+  }
   const maxMatch = Math.max(1, ...tried.map((t) => t.vis.match));
+  const anyPhoto = tried.some((t) => t.photo != null);
   for (const t of tried) {
     t.score = t.fit.inlierFrac * t.fit.overlap * clamp(1 - 4 * t.vis.ratio, 0, 1) * clamp(1 - 4 * t.fit.freeFrac, 0, 1) + 0.3 * (t.vis.match / maxMatch);
+    if (t.open != null) t.score *= 0.2 + 0.8 * t.open;
+    // Photos weigh heavily: along a hallway, wrong places fit the walls as well as the right one.
+    if (anyPhoto) t.score *= (0.15 + clamp(t.photo == null ? 0.25 : t.photo, 0, 1)) ** 2;
   }
   tried.sort((p, q) => q.score - p.score);
   const top = tried[0];
   // Polish the winner with every point.
-  const best = icp(vm, live.pts, top.fit.xf, { iters: 6, maxDist: 0.2, minDist: 0.06, accept: o.accept, yPrior: yPrior(top.ty) });
+  const best = icp(vm, live.pts, top.fit.xf, {
+    iters: 6, maxDist: 0.2, minDist: 0.06, accept: o.accept, yPrior: top.yP, ySoft: top.yP == null ? top.fit.xf.t[1] : null,
+    prior: top.slid ? top.fit.xf : null,
+  });
   const vis = visibility(vm, frames, best.xf, o.accept);
   // Another, clearly different alignment that fits almost as well: the room looks alike there.
-  const mid = centreOf(live.pts);
   const rival = tried.find((t) => t !== top && t.score > top.score * 0.88 &&
     (xfDelta(t.fit.xf, top.fit.xf, mid).dist > 0.6 || xfDelta(t.fit.xf, top.fit.xf, mid).yaw > 15));
+  // What the surfaces leave open must have been settled by the photos: one clear peak along the
+  // hallway line, right where the winner sits, which also gives the height.
+  const topDir = top.fit.weakDir || top.fit.slideDir;
+  const along = photo && topDir ? lineSearch(top.fit.xf, topDir, best.weakHeight && top.yP == null) : null;
+  const placed = clear(along) && xfDelta(top.fit.xf, along.xf, mid).dist < 0.3;
+  const openSlide = best.weakDir && !placed;
+  const openHeight = best.weakHeight && top.yP == null;
+  const weak = !best.weak ? null : openHeight ? 'height' : openSlide || (!best.weakDir && !best.weakHeight) ? 'slide' : null;
+  // Photos of this spot exist but don't look like the live view (the shape fits somewhere it
+  // shouldn't), or only half agree (a repeated door or recess): wait for a clearer view.
+  const ph = placed ? Math.max(top.photo != null ? top.photo : 0, along.score) : top.photo;
+  const unlike = ph != null && ph < 0.35;
+  const unsure = ph != null && !unlike && ph < 0.65;
   const metrics = {
     matched: best.matched, inlierFrac: +best.inlierFrac.toFixed(3), overlap: +best.overlap.toFixed(3), rms: +best.rms.toFixed(3),
-    through: +vis.ratio.toFixed(3), visMatch: vis.match, inFree: +best.freeFrac.toFixed(3), cond: +best.cond.toFixed(4), weak: best.weak, n: live.n,
+    through: +vis.ratio.toFixed(3), visMatch: vis.match, inFree: +best.freeFrac.toFixed(3), camOpen: top.open == null ? null : +top.open.toFixed(2), cond: +best.cond.toFixed(4), weak: best.weak, n: live.n,
     rival: rival ? +(rival.score / top.score).toFixed(2) : 0,
+    photo: ph == null ? null : +ph.toFixed(2),
+    photoPeak: along ? +(along.score - along.second).toFixed(2) : null,
   };
   const conf =
     clamp((best.inlierFrac - 0.3) / 0.45, 0, 1) *
@@ -678,29 +789,122 @@ export function solveAlignment(vm, frames, o = {}) {
     clamp(1 - (vis.ratio - 0.05) / 0.25, 0, 1) *
     clamp(1 - (best.freeFrac - 0.02) / 0.1, 0, 1) *
     clamp(best.matched / 300, 0, 1) *
-    (best.weak ? 0.5 : 1) *
+    (weak ? 0.5 : 1) *
     (rival ? 0.4 : 1);
   let status = 'matching';
   if (best.overlap < 0.2) status = 'new';
   else if (best.freeFrac > 0.06) status = 'mismatch';
-  else if (best.weak === 'height') status = 'floor';
-  else if (best.weak) status = 'flat';
+  else if (weak === 'height') status = 'floor';
+  else if (weak) status = 'flat';
   else if (rival) status = 'ambiguous';
-  const ok = conf >= 0.55 && best.inlierFrac >= 0.6 && vis.ratio <= 0.12 && best.freeFrac <= 0.06 && best.matched >= 250 && !best.weak && !rival && vis.match >= 60;
+  else if (unlike) status = 'unlike';
+  else if (unsure) status = 'flat';
+  // The phone must stand where the map saw open space (not inside or behind a wall).
+  const walled = top.open != null && top.open < 0.5;
+  const ok = conf >= 0.55 && best.inlierFrac >= 0.6 && vis.ratio <= 0.12 && best.freeFrac <= 0.06 && best.matched >= 250 && !weak && !rival && !unlike && !unsure && !walled && vis.match >= 60;
   return { ok, xf: best.xf, confidence: conf, status: ok ? 'locked' : status, metrics };
+}
+
+// ------------------------------------------------------------------ photos
+
+/** Photo agreement if the live images were taken under alignment x; null without overlapping photos. */
+export function photoScore(photo, x, stride = 2, level = FINE) {
+  return photoAgreement(photo.keys, photo.imgs, photo.imgs.map((im) => xfPose(x, im.raw)), stride, level);
+}
+
+/**
+ * Slide x along a direction to where the photos agree best with the live images. Settles the
+ * position along a hallway, which depth can't. The coarse image scale, every 8 cm, finds the
+ * places worth a look; the fine scale (its match peak is only a few centimetres wide, but wrong
+ * places score low) decides between them.
+ * @param {{keys, imgs}} photo
+ * @param {number[]} dir unit [x, z] on the floor, or [x, y, z]
+ * @param {number[]|null} [range] [lo, hi] metres to search; default: as far as there are photos along that line
+ * @param {object} [o]
+ * @param {number} [o.apart] how far from the peak another one counts as a different place
+ * @param {number} [o.lift] also search the height up to this far (no floor in view)
+ * @returns {{xf, s, dy, score, second}|null} second: the best other place, -1 if none
+ */
+export function slideSearch(photo, x, dir, range = null, { apart = 0.8, lift = 0 } = {}) {
+  const d3 = dir.length === 3 ? dir : [dir[0], 0, dir[1]];
+  dir = [d3[0], d3[2]];
+  const shifted = (s, dy = 0) => ({ yaw: x.yaw, t: [x.t[0] + d3[0] * s, x.t[1] + d3[1] * s + dy, x.t[2] + d3[2] * s] });
+  let lo, hi;
+  if (range) [lo, hi] = range;
+  else {
+    const r = photo.imgs[photo.imgs.length - 1].raw;
+    const c = xfApply(x, [r[12], r[13], r[14]]);
+    lo = Infinity;
+    hi = -Infinity;
+    for (const k of photo.keys) {
+      const s = (k.pos[0] - c[0]) * dir[0] + (k.pos[2] - c[2]) * dir[1];
+      lo = Math.min(lo, s);
+      hi = Math.max(hi, s);
+    }
+    lo = Math.max(-40, lo - 2);
+    hi = Math.min(40, hi + 2);
+    if (!(hi >= lo)) return null;
+  }
+  // Places worth a look: local peaks of the coarse scale (or, over a short range, every few cm).
+  let starts = [];
+  if (hi - lo <= 1.2) {
+    for (let s = lo; s <= hi + 1e-9; s += 0.04) starts.push(s);
+  } else {
+    const c = [];
+    for (let s = lo; s <= hi + 1e-9; s += 0.08) c.push([s, photoScore(photo, shifted(s), 3, COARSE)]);
+    const peaks = c.filter((p, i) => p[1] != null && !(c[i - 1] && c[i - 1][1] > p[1]) && !(c[i + 1] && c[i + 1][1] > p[1]));
+    peaks.sort((a, b) => b[1] - a[1]);
+    for (const p of peaks) {
+      if (p[1] < peaks[0][1] - 0.35 || starts.length >= 6) break;
+      if (starts.every((s) => Math.abs(s - p[0]) > 0.3)) starts.push(p[0]);
+    }
+  }
+  if (!starts.length) return null;
+  // Each one at the fine scale, close by (and up and down when the height is open).
+  const found = [];
+  for (const s0 of starts) {
+    let b = null;
+    const span = hi - lo <= 1.2 ? 0 : 0.12;
+    for (let s = s0 - span; s <= s0 + span + 1e-9; s += 0.03) {
+      for (let dy = -lift; dy <= lift + 1e-9; dy += 0.05) {
+        const v = photoScore(photo, shifted(s, dy), 2);
+        if (v != null && (!b || v > b.v)) b = { s, dy, v };
+      }
+    }
+    if (b) found.push(b);
+  }
+  if (!found.length) return null;
+  found.sort((a, b) => b.v - a.v);
+  const top = found[0];
+  // Polish the winner.
+  let best = { ...top, v: photoScore(photo, shifted(top.s, top.dy), 1) ?? top.v };
+  for (let s = top.s - 0.02; s <= top.s + 0.02 + 1e-9; s += 0.01) {
+    for (let dy = lift ? top.dy - 0.03 : 0; dy <= (lift ? top.dy + 0.03 : 0) + 1e-9; dy += 0.015) {
+      const v = photoScore(photo, shifted(s, dy), 1);
+      if (v != null && v > best.v) best = { s, dy, v };
+    }
+  }
+  let second = -1;
+  for (const f of found) if (Math.abs(f.s - top.s) > apart) second = Math.max(second, f.v);
+  return { xf: shifted(best.s, best.dy), s: best.s, dy: best.dy, score: best.v, second };
 }
 
 /**
  * Quick check that the current alignment still fits (drift and tracking jumps): ICP from `cur`
  * over the latest frames, against older parts of the map.
- * @returns {{xf, delta: {dist, yaw}, matched, inlierFrac, through, through0, weak, enough}}
+ * @param {{yaw, t}|null} [prior] keep what the surfaces leave open (along a hallway) near this guess
+ * @returns {{xf, delta: {dist, yaw}, matched, inlierFrac, through, through0, weak, weakDir, enough}}
  */
-export function checkAlignment(vm, frames, cur, accept) {
+export function checkAlignment(vm, frames, cur, accept, prior = null) {
   const live = poolLive(frames, 0.1, 800);
   const before = visibility(vm, frames, cur, accept, 4);
   const visN0 = before.match + before.through;
   if (live.n < 60) return { enough: false, through0: before.ratio, visMatch0: before.match, visN0 };
-  const fit = icp(vm, live.pts, cur, { iters: 8, maxDist: 0.3, minDist: 0.08, accept });
+  let fit = icp(vm, live.pts, cur, { iters: 8, maxDist: 0.3, minDist: 0.08, accept, prior });
+  // Still turning when the matching window closed in: once more from there, so a jump in heading
+  // isn't left half-corrected.
+  const d1 = xfDelta(fit.xf, cur, centreOf(live.pts));
+  if (d1.yaw > 1 || d1.dist > 0.12) fit = icp(vm, live.pts, fit.xf, { iters: 8, maxDist: 0.2, minDist: 0.06, accept, prior });
   const after = visibility(vm, frames, fit.xf, accept, 4);
   return {
     xf: fit.xf,
@@ -709,6 +913,7 @@ export function checkAlignment(vm, frames, cur, accept) {
     inlierFrac: fit.inlierFrac,
     overlap: fit.overlap,
     weak: fit.weak,
+    weakDir: fit.weakDir,
     through0: before.ratio,
     visMatch0: before.match,
     visN0,
@@ -716,6 +921,24 @@ export function checkAlignment(vm, frames, cur, accept) {
     visMatch: after.match,
     enough: fit.matched >= 120 && after.match + after.through >= 40,
   };
+}
+
+/**
+ * Share of the live camera positions (under x) that stand where the map saw open space, or next to
+ * it. A fit that puts the phone inside or behind a wall is wrong however well the surfaces match.
+ * null when the map has no open-space record.
+ */
+function camerasInOpen(vm, frames, x) {
+  if (!vm.free.size) return null;
+  const s = vm.size;
+  const near = [[0, 0, 0], [s, 0, 0], [-s, 0, 0], [0, 0, s], [0, 0, -s], [0, s, 0], [0, -s, 0]];
+  let ok = 0, n = 0;
+  for (let i = 0; i < frames.length; i += Math.max(1, frames.length >> 2)) {
+    const p = xfApply(x, [frames[i].pose[12], frames[i].pose[13], frames[i].pose[14]]);
+    n++;
+    if (near.some(([dx, dy, dz]) => vm.isFreeAt(p[0] + dx, p[1] + dy, p[2] + dz))) ok++;
+  }
+  return n ? ok / n : null;
 }
 
 function thinPoints(pts, max) {

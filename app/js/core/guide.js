@@ -1,10 +1,16 @@
 // Guided capture. Turns the scan area into a walking path for each pass (where to stand, which way to
 // aim), ticks off the parts of it that were photographed, and when a pass has no path (details,
 // freestyle, stairs) plans the best next viewpoint for surfaces that still need angles.
+//
+// The path is planned from the outline the user marked, then fitted to the walls the depth sensor
+// finds as the scan goes on: spots too close to a wall move away from it, spots behind a wall (an
+// outline drawn around door recesses, say) move to the nearest place that can be walked to, or drop
+// out until one can be.
 
 import { offsetPoly, principalAxes, clipLine, polyCentroid, inwardNormal, horiz, dist2D } from './bounds.js';
 import { DEG, v3, clamp, angleBetween, poseForward, posePosition } from './math.js';
 import { VoxelMap } from './coverage.js';
+import { FloorGrid } from './floorgrid.js';
 
 const SPACING = 0.4; // m between path stations
 const DONE_RADIUS = 0.6; // a photo this close to a station (and aimed about right) completes it
@@ -16,6 +22,13 @@ const NEAR = 1.2; // m from the next station: closer = follow the path, farther 
 const HEIGHT = { chest: 1.4, high: 1.9, low: 0.85 };
 
 export const passHeight = (pass) => HEIGHT[pass && pass.height] || HEIGHT.chest;
+
+/** How far from the walls a pass's path should stay. */
+function wallClearance(spec) {
+  if (!spec) return 0.6;
+  if (spec.kind === 'orbit') return 0.5;
+  return typeof spec.inset === 'number' ? Math.min(spec.inset, 0.8) : 0.6;
+}
 
 /** Aim direction from a horizontal heading (unit x/z) and a pitch in degrees. */
 function aimFrom(hx, hz, pitchDeg) {
@@ -191,6 +204,11 @@ export class Guide {
     this.dwellT = 0;
     this.aiming = false;
     this.skippedSpots = 0;
+    this.grid = null; // FloorGrid: walls and what can be walked to
+    this.gridT = -Infinity;
+    this.gridVer = -1;
+    this.gridAt = null;
+    this.fitted = null; // the grid the path was last fitted to
   }
 
   get floorY() {
@@ -219,6 +237,57 @@ export class Guide {
     this.nextIdx = -1;
     this.dwellT = 0;
     this.aiming = false;
+    this.fitted = null;
+    if (this.grid) this._fitPath();
+  }
+
+  /** Rebuild the walkable floor plan now and then (the map grows, the user moves). */
+  _refreshGrid(pos, t, floorY) {
+    const vm = this.voxels;
+    if (t - this.gridT < 1 || (vm.version === this.gridVer && this.gridAt && dist2D(this.gridAt, pos) < 0.5)) return;
+    this.gridT = t;
+    this.gridVer = vm.version;
+    this.gridAt = pos.slice();
+    let box;
+    const b = this.bounds;
+    if (b && b.poly) {
+      const xs = b.poly.map((p) => p[0]), zs = b.poly.map((p) => p[1]);
+      box = [Math.min(...xs) - 1, Math.max(...xs) + 1, Math.min(...zs) - 1, Math.max(...zs) + 1];
+    } else {
+      box = [pos[0] - 8, pos[0] + 8, pos[2] - 8, pos[2] + 8];
+    }
+    this.grid = new FloorGrid(vm, floorY, box).reachFrom(pos[0], pos[2]);
+    if (this.stations) this._fitPath();
+  }
+
+  /** Move the path's spots off the walls found so far; spots that can't be reached sit out. */
+  _fitPath() {
+    const g = this.grid;
+    if (!g || this.fitted === g) return;
+    this.fitted = g;
+    const want = wallClearance(this.pass && this.pass.guide);
+    const S = this.stations;
+    for (const st of S) {
+      if (st.done) continue;
+      if (!st.base) st.base = st.pos.slice();
+      const q = g.fit(st.base[0], st.base[2], want);
+      st.off = !q;
+      if (q) st.pos = [q[0], st.base[1], q[1]];
+    }
+    // Even out the moves along the path, so it doesn't zigzag in and out of every doorway.
+    const shift = S.map((st) => (st.base && !st.off ? [st.pos[0] - st.base[0], st.pos[2] - st.base[2]] : null));
+    S.forEach((st, i) => {
+      if (st.done || st.off || !st.base) return;
+      let sx = 0, sz = 0, n = 0;
+      for (let j = Math.max(0, i - 2); j <= Math.min(S.length - 1, i + 2); j++) {
+        if (!shift[j]) continue;
+        sx += shift[j][0];
+        sz += shift[j][1];
+        n++;
+      }
+      const p = [st.base[0] + sx / n, st.base[2] + sz / n];
+      if (g.standable(p[0], p[1]) && g.nearestWall(p[0], p[1]).d >= want - 0.1) st.pos = [p[0], st.base[1], p[1]];
+    });
   }
 
   /** Fraction of the current path that has been photographed. */
@@ -226,7 +295,7 @@ export class Guide {
     if (!this.stations) return null;
     let n = 0, d = 0;
     for (const st of this.stations) {
-      if (st.transit) continue;
+      if (st.transit || (st.off && !st.done)) continue;
       n++;
       if (st.done) d++;
     }
@@ -251,6 +320,7 @@ export class Guide {
    */
   update({ pos, fwd, t }) {
     const floorY = this.floorY != null ? this.floorY : pos[1] - 1.4;
+    this._refreshGrid(pos, t, floorY);
     let st;
     if (this.stations) st = this._updatePath(pos, fwd, floorY, t);
     else st = this._updateGaps(pos, fwd, t, floorY);
@@ -282,9 +352,10 @@ export class Guide {
     if (tl > 1e-3 && ((pos[0] - S[k].pos[0]) * tx + (pos[2] - S[k].pos[2]) * tz) / tl > 0.15) from = k + 1;
     let next = -1;
     for (let i = from; i < S.length; i++) {
-      if (S[i].done || S[i].transit) continue;
-      // Furniture where the path wants you to stand: walk around it, that spot doesn't count.
-      if (this._blocked(S[i].pos, floorY)) {
+      if (S[i].done || S[i].transit || S[i].off) continue;
+      // Furniture where the path wants you to stand (before the walkable floor plan knows about it):
+      // walk around it, that spot doesn't count.
+      if (!this.grid && this._blocked(S[i].pos, floorY)) {
         S[i].transit = true;
         continue;
       }
@@ -296,7 +367,7 @@ export class Guide {
       // Reached the end: send the user back to spots that were skipped, nearest first.
       let best = Infinity;
       S.forEach((s2, i) => {
-        if (s2.done || s2.transit) return;
+        if (s2.done || s2.transit || s2.off) return;
         const d = dist2D(s2.pos, pos);
         if (d < best) [best, next] = [d, i];
       });
@@ -343,6 +414,7 @@ export class Guide {
     const trail = [[pos[0], floorY, pos[2]]];
     let len = 0;
     for (let i = next; i < S.length && len < 6; i++) {
+      if (S[i].off && i > next) continue;
       const p = S[i].pos;
       const last = trail[trail.length - 1];
       len += Math.hypot(p[0] - last[0], p[2] - last[2]);
@@ -383,7 +455,7 @@ export class Guide {
     let cur = [a[0] + ex * u, a[2] + ez * u];
     let remain = ahead;
     for (let i = next; i < S.length; i++) {
-      if (S[i].transit && i > next) continue;
+      if ((S[i].transit || S[i].off) && i > next) continue;
       const p = [S[i].pos[0], S[i].pos[2]];
       const d = Math.hypot(p[0] - cur[0], p[1] - cur[1]);
       if (d >= remain) return [cur[0] + ((p[0] - cur[0]) * remain) / d, b[1], cur[1] + ((p[1] - cur[1]) * remain) / d];
@@ -478,6 +550,8 @@ export class Guide {
           const cam = v3.add(c.center, v3.scale(v, r));
           if (cam[1] < floorY + 0.45 || cam[1] > floorY + 2.05) continue;
           if (b && !b.standable(cam[0], cam[2], 0.4)) continue;
+          // Behind a wall, in furniture, or out of reach.
+          if (this.grid && !this.grid.standable(cam[0], cam[2])) continue;
           if (this.voxels.isSolidAt(cam[0], cam[1], cam[2])) continue;
           // Line of sight from the viewpoint to the surface.
           const hit = this.voxels.raycast(cam, v3.scale(v, -1), r + 0.3, 0.1);

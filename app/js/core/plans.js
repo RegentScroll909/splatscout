@@ -74,7 +74,7 @@ export const TEMPLATES = [
     viewDist: 1.4,
     framesPerM2: 7,
     minFrames: 120,
-    boundsHint: 'Tap the floor at the 4 corners of the stretch you want, e.g. just half the hallway.',
+    boundsHint: 'Mark 4 corners around the stretch you want, out to the back of any door recesses. Corners can sit in the walls.',
     passes: [
       {
         id: 'crab', name: 'Crab walk, both walls', height: 'chest', loop: true, bands: ['mid'], guide: { kind: 'loop', inset: 0.6, pitch: -5, yaw: 30 },

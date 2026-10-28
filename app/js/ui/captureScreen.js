@@ -33,10 +33,11 @@ const REASON = {
 const ALIGN_TEXT = {
   more: ['Look around slowly', 'Sweep the phone across walls and furniture you scanned before.'],
   new: ['This part isn\'t in the scan', 'Go back to an area you scanned and point the phone at it.'],
-  flat: ['Need more shape', 'Aim at a corner, a doorway or furniture. A plain wall could be anywhere.'],
+  flat: ['Aim at something you\'d recognise', 'Plain walls look the same all along a hallway. Point at a sign, poster, noticeboard or door number from your photos.'],
   floor: ['Show the floor for a moment', 'Tilt down until the floor is in view, then back up.'],
-  ambiguous: ['Two places look alike', 'Turn to something distinctive: a door, a cabinet, a corner.'],
+  ambiguous: ['Two places look alike', 'Aim at something that only appears once: a sign, a poster, a door number.'],
   mismatch: ['Not matching yet', 'The room\'s outline fits but its contents don\'t. Keep looking around, or check it\'s the same room.'],
+  unlike: ['Doesn\'t look the same', 'The shape fits here but the photos from this spot look different. Keep looking around.'],
   matching: ['Matching…', 'Keep moving the phone slowly over what you scanned.'],
   locked: ['Found it', 'Lining up…'],
 };
@@ -142,7 +143,8 @@ export async function captureScreen(root, { captureId, navigate }) {
   );
   const rotL = h('button.icon-btn.small.hud-interactive.hidden', { onclick: () => session && session.nudgeAlignment(0, 0, -2), 'aria-label': 'Turn the scan left' }, icon('refresh', 'flip'));
   const rotR = h('button.icon-btn.small.hud-interactive.hidden', { onclick: () => session && session.nudgeAlignment(0, 0, 2), 'aria-label': 'Turn the scan right' }, icon('refresh'));
-  const manualBtn = h('button.btn.small.hud-interactive', { onclick: () => setManual(!manual) }, icon('hand'), h('span', 'Line up by hand'));
+  const mapBtn = h('button.btn.small.hud-interactive', { onclick: () => openMapSheet() }, icon('map'), 'Show me on the map');
+  const manualBtn = h('button.btn.small.hud-interactive.hidden', { onclick: () => setManual(!manual) }, icon('hand'), h('span', 'Fine-tune'));
   const acceptBtn = h('button.btn.small.primary.hud-interactive.hidden', { onclick: () => acceptAlignment() }, icon('check'), 'Use this position');
   const alignPanel = h('div.align-panel.hidden.hud-interactive',
     h('div.panel-head', icon('align'), alignKicker),
@@ -150,10 +152,21 @@ export async function captureScreen(root, { captureId, navigate }) {
     alignDetail,
     h('div.meter', alignMeter),
     refBox,
-    h('div.row.tight.wrap', manualBtn, rotL, rotR, acceptBtn, h('button.btn.small.ghost.hud-interactive', { onclick: () => newMap() }, 'Start a new map')),
+    h('div.row.tight.wrap', mapBtn, acceptBtn, manualBtn, rotL, rotR, h('button.btn.small.ghost.hud-interactive', { onclick: () => newMap() }, 'Start a new map')),
   );
-  // Full-screen gesture layer for lining up by hand.
+  // Full-screen gesture layer for fine-tuning by hand.
   const alignPad = h('div.align-pad.hidden.hud-interactive', h('div.align-pad-hint', 'Drag to slide the scan · twist with two fingers to turn it'));
+
+  // "Where are you?": tap your spot on the scan's floor plan, drag to say which way you face.
+  const mapSheetCanvas = h('canvas.map-sheet-canvas');
+  const mapSheetHint = h('div.panel-detail');
+  const mapSheetGo = h('button.btn.primary.hud-interactive', { onclick: () => submitMapHint(), disabled: true }, icon('pin'), 'Search here');
+  const mapSheet = h('div.map-sheet.hidden.hud-interactive',
+    h('div.panel-head', icon('map'), h('div.panel-kicker', 'Where are you?')),
+    mapSheetHint,
+    h('div.map-sheet-frame', mapSheetCanvas),
+    h('div.row.tight.end', h('button.btn.ghost.hud-interactive', { onclick: () => closeMapSheet() }, 'Cancel'), mapSheetGo),
+  );
 
   const hud = h(
     'div.hud',
@@ -175,6 +188,7 @@ export async function captureScreen(root, { captureId, navigate }) {
     settings.showDebug ? debug : null,
     hudBottom,
     boundsBar,
+    mapSheet,
     sheet,
     overlay,
   );
@@ -266,6 +280,40 @@ export async function captureScreen(root, { captureId, navigate }) {
   };
   alignPad.addEventListener('pointerup', lift);
   alignPad.addEventListener('pointercancel', lift);
+
+  // The map sheet: a tap places you, a drag from your dot says which way you face.
+  let mapHint = null, mapView = null, mapDrag = false;
+  const mapPoint = (e) => {
+    const r = mapSheetCanvas.getBoundingClientRect();
+    return [(e.clientX - r.left) * (mapSheetCanvas.width / r.width), (e.clientY - r.top) * (mapSheetCanvas.height / r.height)];
+  };
+  mapSheetCanvas.addEventListener('pointerdown', (e) => {
+    if (!mapView) return;
+    try {
+      mapSheetCanvas.setPointerCapture(e.pointerId);
+    } catch {}
+    const px = mapPoint(e);
+    const dot = mapHint && mapView.toPx(mapHint.p[0], mapHint.p[1]);
+    const dpr = mapSheetCanvas.width / mapSheetCanvas.getBoundingClientRect().width;
+    if (dot && Math.hypot(px[0] - dot[0], px[1] - dot[1]) < 34 * dpr) mapDrag = true;
+    else {
+      mapHint = { p: mapView.toWorld(px[0], px[1]), heading: null };
+      mapDrag = true;
+    }
+    drawMapSheet();
+  });
+  mapSheetCanvas.addEventListener('pointermove', (e) => {
+    if (!mapDrag || !mapHint) return;
+    const w = mapView.toWorld(...mapPoint(e));
+    const dx = w[0] - mapHint.p[0], dz = w[1] - mapHint.p[1];
+    if (Math.hypot(dx, dz) > 0.35) {
+      mapHint.heading = Math.atan2(dx, dz);
+      drawMapSheet();
+    }
+  });
+  const mapUp = () => (mapDrag = false);
+  mapSheetCanvas.addEventListener('pointerup', mapUp);
+  mapSheetCanvas.addEventListener('pointercancel', mapUp);
 
   function feedback() {
     if (settings.sounds) tick('shot');
@@ -404,11 +452,14 @@ export async function captureScreen(root, { captureId, navigate }) {
     // Like a real AR session, a later session in the practice room starts in its own coordinates.
     const later = engine === 'demo6' && (capture.segments || 0) > 0;
     const sessionXf = later ? { yaw: (Math.random() * 2 - 1) * Math.PI, t: [(Math.random() * 2 - 1) * 1.5, (Math.random() * 2 - 1) * 0.1, (Math.random() * 2 - 1) * 1.5] } : null;
-    return new DemoSource({ container: stage, tracking: engine === 'demo3' ? '3dof' : '6dof', tourSpeed: capture.tour ? 1 : 0, sessionXf });
+    // Hallway captures practise in a hallway with door recesses.
+    const scene = template.id === 'hallway' ? 'hallway' : 'room';
+    return new DemoSource({ container: stage, tracking: engine === 'demo3' ? '3dof' : '6dof', tourSpeed: capture.tour ? 1 : 0, sessionXf, scene });
   }
 
   function setRoomBounds() {
-    // The auto-tour marks the practice room's corners itself.
+    // The auto-tour marks the practice scene's corners itself (in the hallway, a plain rectangle
+    // around the door recesses: the guide fits the path to the walls it finds).
     const m = 0.05;
     session.setBounds(new Bounds({
       poly: [[ROOM.min[0] + m, ROOM.min[2] + m], [ROOM.max[0] - m, ROOM.min[2] + m], [ROOM.max[0] - m, ROOM.max[2] - m], [ROOM.min[0] + m, ROOM.max[2] - m]],
@@ -445,11 +496,47 @@ export async function captureScreen(root, { captureId, navigate }) {
   function setManual(on) {
     manual = on;
     alignPad.classList.toggle('hidden', !on);
-    acceptBtn.classList.toggle('hidden', !on);
     rotL.classList.toggle('hidden', !on);
     rotR.classList.toggle('hidden', !on);
-    manualBtn.lastChild.textContent = on ? 'Back to automatic' : 'Line up by hand';
+    manualBtn.lastChild.textContent = on ? 'Done' : 'Fine-tune';
     if (on) toast('Drag to slide the dots onto the walls, twist with two fingers (or ⟲ ⟳) to turn them. Then tap "Use this position".', 6000);
+  }
+
+  function openMapSheet() {
+    if (!session) return;
+    setManual(false);
+    mapHint = null;
+    mapSheet.classList.remove('hidden');
+    drawMapSheet();
+  }
+
+  function closeMapSheet() {
+    mapSheet.classList.add('hidden');
+  }
+
+  function drawMapSheet() {
+    mapSheetGo.disabled = !mapHint;
+    mapSheetHint.textContent = !mapHint
+      ? 'Tap where you\'re standing. The dots are where earlier photos were taken.'
+      : mapHint.heading == null
+        ? 'Now drag from your dot towards where the phone is facing (optional), then tap Search here.'
+        : 'Tap Search here. Then sweep the phone slowly over the walls around you.';
+    // Canvas pixels matched to its size on screen (read after the hint above it is laid out).
+    const r = mapSheetCanvas.getBoundingClientRect();
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const w = Math.max(1, Math.round(r.width * dpr)), hh = Math.max(1, Math.round(r.height * dpr));
+    if (mapSheetCanvas.width !== w || mapSheetCanvas.height !== hh) [mapSheetCanvas.width, mapSheetCanvas.height] = [w, hh];
+    mapView = drawTopDown(mapSheetCanvas, {
+      voxels: session.voxels, frames: session.frames, pose: null, space: session.space, capture, bounds: session.bounds, hint: mapHint, big: true,
+    });
+  }
+
+  function submitMapHint() {
+    if (!session || !mapHint) return;
+    session.hintMapPosition(mapHint.p, mapHint.heading);
+    closeMapSheet();
+    feedback();
+    toast('Searching around that spot. Sweep the phone slowly over the walls.', 4000);
   }
 
   function acceptAlignment() {
@@ -463,6 +550,7 @@ export async function captureScreen(root, { captureId, navigate }) {
     if (!ok) return;
     session.startNewMap();
     setManual(false);
+    closeMapSheet();
     toggleGhost(false);
     if (source.kind === 'demo' && capture.tour && !source.sessionXf) setRoomBounds();
     else if (settings.guide !== false) startBounds();
@@ -570,6 +658,7 @@ export async function captureScreen(root, { captureId, navigate }) {
       if (settings.sounds) chime();
       buzz([20, 40, 20]);
       setManual(false);
+      closeMapSheet();
       toggleGhost(false);
       toast(e.reason === 'resume' ? 'Found your scan. Carry on where you left off.' : 'Back on track: lined up with your scan.', 4000);
       say(e.reason === 'resume' ? 'Found your scan.' : 'Back on track.');
@@ -614,7 +703,10 @@ export async function captureScreen(root, { captureId, navigate }) {
     }
     alignPanel.classList.toggle('hidden', !searching);
     if (searching) renderAlign(R);
-    else if (manual) setManual(false);
+    else {
+      if (manual) setManual(false);
+      if (!mapSheet.classList.contains('hidden')) closeMapSheet();
+    }
 
     boundsBar.classList.toggle('hidden', !marking);
     hudBottom.classList.toggle('hidden', marking);
@@ -671,17 +763,26 @@ export async function captureScreen(root, { captureId, navigate }) {
   }
 
   function renderAlign(R) {
-    const [title, detail] = R.manual
-      ? ['Line it up by hand', 'Drag until the dots sit on the real walls and furniture, then tap "Use this position".']
+    let [title, detail] = R.manual
+      ? ['Fine-tune by hand', 'Drag until the dots sit on the real walls and furniture, then tap "Use this position".']
       : ALIGN_TEXT[R.status] || ALIGN_TEXT.more;
+    // Placed on the map but the view can't confirm it yet: the user can take it as it is.
+    if (!R.manual && R.hint && R.preview && R.status !== 'locked') {
+      title = 'Do the dots sit on the walls?';
+      detail = 'If they line up, tap "Use this position". If not, keep sweeping slowly, or try the map again.';
+    }
     alignKicker.textContent = REASON[R.reason] || 'Re-aligning';
     alignTitle.textContent = title;
     // After a while without a match, point at the ways out.
-    alignDetail.textContent = !R.manual && R.since > 25 && R.status !== 'matching'
-      ? `${detail} Or line it up by hand, or start a new map.`
+    alignDetail.textContent = !R.manual && !R.hint && R.since > 20 && R.status !== 'matching'
+      ? `${detail} Or tap "Show me on the map".`
       : detail;
     alignMeter.style.width = Math.round(Math.min(1, R.confidence) * 100) + '%';
     alignMeter.className = 'meter-fill' + (R.confidence >= 0.55 ? ' good' : R.confidence >= 0.3 ? ' warn' : '');
+    // A guess is shown: it can be taken as it is, or nudged by hand.
+    acceptBtn.classList.toggle('hidden', !R.preview);
+    manualBtn.classList.toggle('hidden', !R.preview);
+    mapBtn.classList.toggle('hidden', !session.voxels.vox.size);
   }
 
   function placeTarget(ts, ok) {

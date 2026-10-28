@@ -365,6 +365,10 @@ input[type=checkbox]:checked::after { content: ''; width: 9px; height: 5px; bord
 .ghost-photo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0.38; pointer-events: none; mix-blend-mode: screen; }
 .cap.aligning .hud-bottom .shutter, .cap.aligning .hud-bottom .rec { opacity: 0.35; }
 .cap.aligning .readouts { display: none; }
+.map-sheet { position: absolute; inset: calc(56px + var(--safe-top)) 10px calc(14px + var(--safe-bottom)); z-index: 9; display: flex; flex-direction: column; gap: 8px; padding: 13px 14px; border-radius: 12px; background: rgba(9, 11, 14, 0.94); border: 1px solid rgba(61, 220, 255, 0.35); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+.map-sheet-frame { position: relative; flex: 1; min-height: 0; border: 1px solid var(--glass-line); border-radius: 10px; background: rgba(0, 0, 0, 0.35); overflow: hidden; }
+.map-sheet-canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+.map-sheet .row { flex: none; }
 
 /* sheets and overlays */
 .sheet { position: absolute; left: 0; right: 0; bottom: 0; max-height: 80%; overflow: auto; background: rgba(13, 16, 20, 0.97); border-top: 1px solid var(--glass-line); border-radius: 16px 16px 0 0; padding: 10px 16px calc(18px + var(--safe-bottom)); z-index: 10; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }

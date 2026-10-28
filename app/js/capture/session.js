@@ -12,6 +12,7 @@ import { Guide } from '../core/guide.js';
 import { Relocalizer } from './relocalizer.js';
 import { spaceOf, boundsFor, mainSpace } from '../core/spaces.js';
 import { integrateFrames } from '../core/score.js';
+import { makeKey, liveImage, grayFromBlob } from '../core/photomatch.js';
 import { boundsGeometry, chevronTrail, standMarker, ghostPhone, cursorGeometry } from './guideDraw.js';
 import { crc32 } from '../core/zip.js';
 import {
@@ -48,6 +49,10 @@ export class CaptureSession {
 
     this.frames = existingFrames.map(stripBlobs);
     this.seq = this.frames.reduce((m, f) => Math.max(m, f.seq), 0);
+    // Photo keys for re-alignment (photomatch.js): made as photos are taken, and from the saved
+    // thumbnails when an earlier scan is continued.
+    this.photoKeys = [];
+    this._thumbs = new Map(existingFrames.filter((f) => f.thumb).map((f) => [f.id, f.thumb]));
     this.segment = (capture.segments || 0) + 1;
     this.space = this.segment * 100; // this session's own coordinates until it's lined up with an earlier one
     this.splits = 0;
@@ -177,7 +182,23 @@ export class CaptureSession {
     this._resetPassGuide();
     this._emit('searching', { reason: 'resume' });
     this.reloc.begin('resume', this.lastT || 0);
+    this._keysFromThumbs(r.frames, r.space);
     return true;
+  }
+
+  /** Photo keys from saved thumbnails, a few at a time so the AR view keeps running. */
+  async _keysFromThumbs(frames, space) {
+    const todo = frames.filter((f) => f.dimg && f.dnx && this._thumbs.has(f.id) && !this.photoKeys.some((k) => k.id === f.id));
+    for (let i = 0; i < todo.length; i++) {
+      const f = todo[i];
+      try {
+        const g = await grayFromBlob(this._thumbs.get(f.id));
+        const d = Float32Array.from(f.dimg, (v) => v / 1000);
+        const key = makeKey(g.gray, g.w, g.h, f.pose, f.intr, { d, nx: f.dnx, ny: f.dny });
+        if (key) this.photoKeys.push({ ...key, id: f.id, space });
+      } catch {}
+      if (i % 6 === 5) await new Promise((r) => setTimeout(r, 0));
+    }
   }
 
   /** Stop trying to line up: this session gets its own coordinates and a fresh map. */
@@ -495,7 +516,7 @@ export class CaptureSession {
     // Image analysis at ~10 Hz.
     if (fi.requestAnalysis && !this.analysisPending && t - (this.lastAnalysis ? this.lastAnalysis.t : 0) >= ANALYSIS_INTERVAL) {
       this.analysisPending = true;
-      const snap = { t, pose: pose.slice(), intr: fi.intr };
+      const snap = { t, pose: pose.slice(), intr: fi.intr, raw: raw ? raw.slice() : null };
       fi.requestAnalysis()
         .then((a) => this._onAnalysis(a, snap))
         .catch((e) => console.warn('analysis', e))
@@ -584,8 +605,14 @@ export class CaptureSession {
     const r = this.reloc, st = r.state || {};
     return {
       mode: r.mode, reason: st.reason, status: st.status, confidence: st.confidence || 0, preview: !!st.preview,
-      manual: !!st.manual, since: this.lastT - (st.t0 || this.lastT), frames: st.frames ? st.frames.length : 0, metrics: st.metrics || null,
+      manual: !!st.manual, hint: st.mapHint || null, since: this.lastT - (st.t0 || this.lastT), frames: st.frames ? st.frames.length : 0,
+      metrics: st.metrics || null, photos: this.photoKeys.filter((k) => k.space === this.space).length,
     };
+  }
+
+  /** "I'm here" on the map while searching: [x, z] in scan coordinates, heading or null. */
+  hintMapPosition(p, heading) {
+    if (this.reloc && this.reloc.mode === 'search') this.reloc.hintMap(p, heading, this.reloc.prevRaw || this._rawNow());
   }
 
   /** Line up by hand while searching (drag on screen). */
@@ -687,6 +714,8 @@ export class CaptureSession {
 
   // ------------------------------------------------------------------ analysis tick
   _onAnalysis(a, snap) {
+    // While the position is checked or searched for, the camera image is compared with earlier photos.
+    if (this.reloc && this.reloc.mode && snap.raw && snap.intr) this.reloc.addImage(liveImage(a.gray, a.w, a.h, snap.intr, snap.raw));
     const A = analyzeImage(a.gray, a.w, a.h);
     const relSharp = this.sharpRef.update(A.sharp, snap.t);
     const q = downsample2(a.gray, a.w, a.h);
@@ -872,6 +901,10 @@ export class CaptureSession {
       if (meta.pts) this.voxels.integrate(meta.pts, pos);
       if (dg) this.voxels.observeView(snap.pose, snap.intr, dg);
       if (this.guide) this.guide.onPhoto(snap.pose);
+      if (dg) {
+        const key = makeKey(c.gray, c.w, c.h, snap.pose, snap.intr, dg);
+        if (key) this.photoKeys.push({ ...key, id: meta.id, space: this.space });
+      }
     }
     this.frames.push(meta);
     this.live.frames = this.frames.length;

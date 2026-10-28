@@ -10,18 +10,29 @@ import { spaceOf } from '../core/spaces.js';
 const QCOL = ['rgba(120,150,190,0.45)', '#f26d6d', '#f5b942', '#34d399'];
 const ACCENT = '#3ddcff';
 
-export function drawTopDown(canvas, { voxels, frames, pose, target, space = null, capture = null, bounds = null, draft = null, guidePath = null }) {
+/**
+ * @param {object} o
+ * @param {{p: number[], heading: number|null}|null} [o.hint] "I'm here" marker on the re-align map
+ * @param {boolean} [o.big] the full-size map (thicker marks)
+ * @returns {{toPx: (x, z) => number[], toWorld: (px, py) => number[]}|null} canvas pixels <-> floor x/z
+ */
+export function drawTopDown(canvas, { voxels, frames, pose, target, space = null, capture = null, bounds = null, draft = null, guidePath = null, hint = null, big = false }) {
   const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
-  ctx.clearRect(0, 0, W, H);
+  const CW = canvas.width, CH = canvas.height;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, CW, CH);
+  let W = CW, H = CH;
 
   // Collapse voxels to floor-plan columns, coloured by average capture quality (scan area only).
+  // The big map draws bare floor faintly, so walls, doorways and recesses stand out to find your spot.
+  const fy = bounds && bounds.poly ? bounds.floorY : voxels.floorY();
   const cols = new Map();
   for (const v of voxels.vox.values()) {
     if (!VoxelMap.isSolid(v)) continue;
     const k = v.ix * 65536 + v.iz;
     let c = cols.get(k);
-    if (!c) cols.set(k, (c = { ix: v.ix, iz: v.iz, q: 0, n: 0, out: 0 }));
+    if (!c) cols.set(k, (c = { ix: v.ix, iz: v.iz, q: 0, n: 0, out: 0, up: false }));
+    if (fy == null || (v.sy / v.n > fy + 0.3 && v.sy / v.n < fy + 2.2)) c.up = true;
     if (!voxels.inBounds(v)) {
       c.out++;
       continue;
@@ -40,18 +51,28 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, space = null
   for (const p of path) pts.push([p[0], p[2]]);
   const here = pose ? posePosition(pose) : null;
   if (here) pts.push([here[0], here[2]]);
+  // The re-align map frames the whole scan, not just the outline.
+  if (big && poly) for (const c of cols.values()) pts.push([(c.ix + 0.5) * s, (c.iz + 0.5) * s]);
   if (!pts.length) {
     drawEmpty(ctx, W, H, 'Map appears as you scan');
-    return;
+    return null;
   }
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
   for (const [x, z] of pts) {
     x0 = Math.min(x0, x); x1 = Math.max(x1, x);
     z0 = Math.min(z0, z); z1 = Math.max(z1, z);
   }
-  const span = Math.max(x1 - x0, z1 - z0, 3) * 1.15;
   const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
-  const scale = Math.min(W, H) / span;
+  // The big map turns a quarter so a hallway lies along the screen's long side. Everything below
+  // draws on a virtual W x H canvas; the transform turns it onto the real one.
+  const rot = big && Math.abs((x1 - x0) - (z1 - z0)) > 1 && (x1 - x0 > z1 - z0) !== (CW > CH);
+  if (rot) {
+    [W, H] = [CH, CW];
+    ctx.setTransform(0, -1, 1, 0, 0, CH);
+  }
+  // Fit the longer side of the scan to the matching side of the canvas.
+  const scale = Math.min(W / (Math.max(x1 - x0, 3) * 1.15), H / (Math.max(z1 - z0, 3) * 1.15));
+  const span = Math.max(W, H) / scale;
   const X = (x) => W / 2 + (x - cx) * scale;
   const Y = (z) => H / 2 + (z - cz) * scale;
 
@@ -71,7 +92,9 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, space = null
 
   const cell = Math.max(1.5, s * scale);
   for (const c of cols.values()) {
-    if (!c.n) {
+    if (big && !c.up) {
+      ctx.fillStyle = 'rgba(150,170,200,0.10)';
+    } else if (!c.n) {
       ctx.fillStyle = 'rgba(150,150,150,0.18)';
     } else {
       ctx.fillStyle = QCOL[Math.min(3, Math.round(c.q / c.n))];
@@ -116,7 +139,7 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, space = null
   // The guide's path for this pass: done parts green, the rest cyan.
   if (guidePath && guidePath.length) {
     for (const st of guidePath) {
-      if (st.transit) continue;
+      if (st.transit || (st.off && !st.done)) continue;
       ctx.fillStyle = st.done ? 'rgba(52,211,153,0.85)' : 'rgba(61,220,255,0.75)';
       ctx.fillRect(X(st.pos[0]) - 1.5, Y(st.pos[2]) - 1.5, 3, 3);
     }
@@ -131,9 +154,43 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, space = null
     ctx.fillStyle = ACCENT;
     for (const p of path) {
       ctx.beginPath();
-      ctx.arc(X(p[0]), Y(p[2]), 1.6, 0, Math.PI * 2);
+      ctx.arc(X(p[0]), Y(p[2]), big ? 2.6 : 1.6, 0, Math.PI * 2);
       ctx.fill();
     }
+  }
+
+  // "I'm here" on the re-align map: a dot, and which way the phone faces once dragged.
+  if (hint) {
+    const hx = X(hint.p[0]), hy = Y(hint.p[1]);
+    if (hint.heading != null) {
+      const a = Math.atan2(Math.cos(hint.heading), Math.sin(hint.heading));
+      ctx.save();
+      ctx.translate(hx, hy);
+      ctx.rotate(a);
+      ctx.fillStyle = 'rgba(61,220,255,0.22)';
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.arc(0, 0, 60, -0.5, 0.5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.moveTo(34, 0);
+      ctx.lineTo(18, -8);
+      ctx.lineTo(18, 8);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(hx, hy, 16, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(hx, hy, 6, 0, Math.PI * 2);
+    ctx.fill();
   }
 
   if (target) {
@@ -165,6 +222,16 @@ export function drawTopDown(canvas, { voxels, frames, pose, target, space = null
     ctx.fill();
     ctx.restore();
   }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // Canvas pixels <-> floor x/z (through the quarter turn when there is one).
+  const toV = (px, py) => (rot ? [CH - py, px] : [px, py]);
+  return {
+    toPx: (x, z) => (rot ? [Y(z), CH - X(x)] : [X(x), Y(z)]),
+    toWorld: (px, py) => {
+      const [vx, vy] = toV(px, py);
+      return [cx + (vx - W / 2) / scale, cz + (vy - H / 2) / scale];
+    },
+  };
 }
 
 export function drawPanorama(canvas, { sphere, pose, need = 2 }) {

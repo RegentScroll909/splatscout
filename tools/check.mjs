@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { poseFromEuler } from '../app/js/sources/orientation.js';
-import { poseForward, poseUp, poseRight, poseLookDir, projectPoint, projectionFromIntrinsics, intrinsicsFromProjection, angularVelocity, DEG } from '../app/js/core/math.js';
+import { poseForward, poseUp, poseRight, poseLookDir, projectPoint, projectionFromIntrinsics, intrinsicsFromProjection, angularVelocity, transformDir, DEG } from '../app/js/core/math.js';
 import { analyzeImage, FlowTracker } from '../app/js/core/analyzer.js';
 import { DirectionSphere, VoxelMap } from '../app/js/core/coverage.js';
 import { Keyframer } from '../app/js/core/keyframer.js';
@@ -18,10 +18,20 @@ import { Bounds } from '../app/js/core/bounds.js';
 import { planPass, Guide } from '../app/js/core/guide.js';
 import { getTemplate } from '../app/js/core/plans.js';
 import { depthToPoints, unprojectIntr } from '../app/js/core/depth.js';
-import { depthGrid } from '../app/js/sources/demoScene.js';
-import { xf, xfInverse, xfPoints, xfPose, xfDelta, solveAlignment, checkAlignment, XF_ID } from '../app/js/core/align.js';
+import { depthGrid, setScene, raycast, surfaceNormal, walkable } from '../app/js/sources/demoScene.js';
+import { xf, xfInverse, xfPoints, xfPose, xfDelta, solveAlignment, checkAlignment, slideSearch, XF_ID } from '../app/js/core/align.js';
+import { makeKey, liveImage } from '../app/js/core/photomatch.js';
 import { spaceOf, mainSpace } from '../app/js/core/spaces.js';
 import { rebuildCoverage } from '../app/js/core/score.js';
+
+// The simulated depth noise uses Math.random: seed it so every run (and CI) sees the same noise.
+let seed = 20261027;
+Math.random = () => {
+  seed = (seed + 0x6d2b79f5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
 
 let passed = 0;
 const near = (a, b, eps = 1e-4, msg = '') => {
@@ -346,7 +356,7 @@ test('re-alignment: refuses a look-alike room and a plain wall', () => {
     return { pts: xfPoints(Si, g.xyz), pose: xfPose(Si, pose), intr: INTR_AR, d: g.d, nx: g.nx, ny: g.ny };
   });
   const r = solveAlignment(vm, wall, { floorY: 0 });
-  assert.ok(!r.ok && ['flat', 'ambiguous'].includes(r.status), `a plain wall could be anywhere (${r.status})`);
+  assert.ok(!r.ok && ['flat', 'ambiguous'].includes(r.status), `a plain wall could be anywhere (${r.status} ${JSON.stringify(r.metrics)} err ${xfDelta(r.xf, S, [3, 1.4, -0.3]).dist.toFixed(2)})`);
 });
 
 test('re-alignment: drift check finds a 12 cm offset and leaves a good alignment alone', () => {
@@ -358,6 +368,140 @@ test('re-alignment: drift check finds a 12 cm offset and leaves a good alignment
   assert.ok(r.delta.dist > 0.08 && d.dist < 0.05 && d.yaw < 0.8, `found the offset (${r.delta.dist.toFixed(3)} m, error ${d.dist.toFixed(3)} m)`);
   const ok = checkAlignment(vm, lookAround(XF_ID, [-2, -1.5], 200, 6, 15), XF_ID, null);
   assert.ok(ok.delta.dist < 0.08 && ok.through0 < 0.05, `no correction needed (${ok.delta.dist.toFixed(3)} m)`);
+});
+
+// ---- The practice hallway: 2.5 m wide, 18 m long, door recesses on both sides.
+// A small CPU renderer gives the photos and camera images something hallway-like to match: mostly
+// plain walls, some posters with their own block layouts, numbered doors.
+const W_IMG = 640, H_IMG = 288;
+const hash = (a, b) => { const s = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return s - Math.floor(s); };
+function vnoise(x, y) {
+  const i = Math.floor(x), j = Math.floor(y), fx = x - i, fy = y - j;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  return (hash(i, j) * (1 - u) + hash(i + 1, j) * u) * (1 - v) + (hash(i, j + 1) * (1 - u) + hash(i + 1, j + 1) * u) * v;
+}
+function hallShade(p, n) {
+  if (Math.abs(n[1]) > 0.5) return 90 + 60 * vnoise(p[0] * 3, p[2] * 3) + 20 * vnoise(p[0] * 20, p[2] * 20);
+  const u = Math.abs(n[0]) > 0.5 ? p[2] : p[0];
+  let g = 170 + 12 * vnoise(u * 3, p[1] * 3) + 6 * vnoise(u * 18, p[1] * 18);
+  if (Math.abs(p[0]) > 1.7 && p[1] < 2.1) {
+    const id = Math.floor((p[2] + 30) / 1.2);
+    g = 70 + 60 * hash(id, n[0]) + 25 * vnoise(u * 3 + 9, p[1] * 40);
+    const px = (p[2] + 30) / 1.2 - id - 0.5, py = p[1] - 1.6;
+    if (Math.abs(px) < 0.12 && Math.abs(py) < 0.07) g = 40 + 200 * hash(Math.floor(px * 25), Math.floor(py * 40) + id);
+  }
+  const cell = Math.floor((u + 0.3) / 1.7), f = (u + 0.3) / 1.7 - cell, h = hash(cell, n[0] * 7 + n[2] * 3);
+  if (Math.abs(p[0]) < 1.7 && h > 0.62 && p[1] > 1.15 && p[1] < 2.35 && f > 0.12 && f < 0.88) {
+    g = 30 + 200 * hash(Math.floor(f * (5 + Math.floor(h * 4))) + h * 31, Math.floor(p[1] * 7) + h * 13);
+    if (p[1] > 1.9 && (p[1] * 28) % 1 > 0.55) g *= 0.4;
+  }
+  return p[1] < 0.12 ? 60 : g;
+}
+function hallImage(pose, half = false) {
+  const gray = new Uint8Array(W_IMG * H_IMG), o = [pose[12], pose[13], pose[14]];
+  for (let j = 0; j < H_IMG; j++) {
+    for (let i = 0; i < W_IMG; i++) {
+      const d = transformDir(pose, [(i + 0.5 - INTR_AR.cx / 2) / (INTR_AR.fx / 2), -(j + 0.5 - INTR_AR.cy / 2) / (INTR_AR.fy / 2), -1]);
+      const L = Math.hypot(d[0], d[1], d[2]), t = raycast(o, [d[0] / L, d[1] / L, d[2] / L]);
+      const p = [o[0] + (d[0] / L) * t, o[1] + (d[1] / L) * t, o[2] + (d[2] / L) * t];
+      gray[j * W_IMG + i] = Math.max(0, Math.min(255, hallShade(p, surfaceNormal(p))));
+    }
+  }
+  if (!half) return gray;
+  // Thumbnails are scaled down from the full photo.
+  const small = new Uint8Array((W_IMG / 2) * (H_IMG / 2));
+  for (let y = 0; y < H_IMG / 2; y++) {
+    for (let x = 0; x < W_IMG / 2; x++) {
+      const k = 2 * y * W_IMG + 2 * x;
+      small[y * (W_IMG / 2) + x] = (gray[k] + gray[k + 1] + gray[k + W_IMG] + gray[k + W_IMG + 1]) / 4;
+    }
+  }
+  return small;
+}
+/** A crab-walk scan of the hallway: coverage map and photo keys (from thumbnails, as when resuming). */
+function hallScan() {
+  setScene('hallway');
+  const vm = new VoxelMap(0.2, 7), keys = [];
+  for (const side of [1, -1]) {
+    for (let z = 8; z >= -8; z -= 0.4) {
+      const pos = [-side * 0.55, 1.4, side > 0 ? z : -z];
+      const pose = poseLookDir(pos, [side * Math.cos(25 * DEG), -0.1, -side * Math.sin(25 * DEG)]);
+      const g = depthGrid(pose, INTR_AR, 40, 30, 0.25, 6);
+      vm.integrate(g.xyz, pos);
+      if (Math.round(z * 10) % 8 === 0) {
+        const k = makeKey(hallImage(pose, true), W_IMG / 2, H_IMG / 2, pose, INTR_AR, g);
+        if (k) keys.push(k);
+      }
+    }
+  }
+  return { vm, keys };
+}
+/** Sweeping the phone across one wall at p, in an AR session whose coordinates are S⁻¹. */
+function hallLook(S, p, look) {
+  const Si = xfInverse(S), frames = [], imgs = [];
+  for (let k = 0; k < 12; k++) {
+    const h = (look - 30 + k * 6) * DEG;
+    const pose = poseLookDir([p[0], 1.35, p[1] - 0.04 * k], [Math.sin(h), -0.15 - 0.25 * Math.abs(Math.sin(k * 0.7)), -Math.cos(h)]);
+    const g = depthGrid(pose, INTR_AR, 32, 24, 0.25, 6);
+    const raw = xfPose(Si, pose);
+    frames.push({ pts: xfPoints(Si, g.xyz), pose: raw, intr: INTR_AR, d: g.d, nx: g.nx, ny: g.ny });
+    if (k >= 10) imgs.push(liveImage(hallImage(pose), W_IMG, H_IMG, INTR_AR, raw));
+  }
+  return { frames, imgs };
+}
+
+test('photo match: one spot along a plain hallway stands out', () => {
+  const { keys } = hallScan();
+  const S = xf(40 * DEG, [1.2, 0.1, -0.7]);
+  const L = hallLook(S, [0.3, 3.2], -100);
+  // Start 1.5 m off along the hallway (where depth alone can't tell).
+  const r = slideSearch({ keys, imgs: L.imgs }, xf(S.yaw, [S.t[0], S.t[1], S.t[2] + 1.5]), [0, 1]);
+  setScene('room');
+  assert.ok(r && Math.abs(r.s + 1.5) < 0.06, `found the spot (${r && r.s.toFixed(2)} m)`);
+  assert.ok(r.score > 0.6 && r.score - r.second > 0.15, `clearly (${r.score.toFixed(2)} vs ${r.second.toFixed(2)} elsewhere)`);
+});
+
+test('re-alignment in a hallway: depth alone can\'t say where along it, the photos can', () => {
+  const { vm, keys } = hallScan();
+  const S = xf(-95 * DEG, [0.3, -0.2, 2.5]), at = [0.2, 1.3, 3.2];
+  // The app tries again every 0.8 s with new views: a few tries, and never a wrong lock.
+  let placed = null;
+  for (let attempt = 0; attempt < 3 && !placed; attempt++) {
+    const L = hallLook(S, [0.2, 3.2], 60);
+    const depthOnly = solveAlignment(vm, L.frames, { floorY: 0 });
+    assert.ok(!depthOnly.ok || xfDelta(depthOnly.xf, S, at).dist < 0.12, `depth alone never locks in the wrong place (${depthOnly.status})`);
+    const r = solveAlignment(vm, L.frames, { floorY: 0, photo: { keys, imgs: L.imgs } });
+    const d = xfDelta(r.xf, S, at);
+    assert.ok(!r.ok || (d.dist < 0.1 && d.yaw < 1.5), `photos never lock in the wrong place (${d.dist.toFixed(2)} m, ${JSON.stringify(r.metrics)})`);
+    if (r.ok) placed = d;
+  }
+  setScene('room');
+  assert.ok(placed, 'photos place it within a few tries');
+});
+
+test('guide: a hallway outline drawn around its door recesses gets a path off the walls', () => {
+  setScene('hallway');
+  const vm = new VoxelMap(0.2, 7);
+  for (let z = 8; z >= -8; z -= 0.25) {
+    for (const h of [50, 90, 130, -50, -90, -130]) {
+      const pose = poseLookDir([0, 1.4, z], [Math.sin(h * DEG), -0.2, -Math.cos(h * DEG)]);
+      vm.integrate(depthGrid(pose, INTR_AR, 32, 24, 0.25, 6).xyz, [0, 1.4, z]);
+    }
+  }
+  const tpl = getTemplate('hallway');
+  // A plain rectangle out to the back of the recesses: its corners are inside the walls.
+  const b = new Bounds({ poly: [[-1.75, -8.5], [1.75, -8.5], [1.75, 8.5], [-1.75, 8.5]], floorY: 0 });
+  const g = new Guide({ template: tpl, bounds: b, voxels: vm });
+  g.setPass(tpl.passes[0], [0, 1.4, 7]);
+  const planned = g.stations.filter((s) => !walkable(s.pos[0], s.pos[2])).length;
+  g.update({ pos: [0, 1.4, 7], fwd: [0, 0, -1], t: 0 });
+  const live = g.stations.filter((s) => !s.off);
+  const stuck = live.filter((s) => !walkable(s.pos[0], s.pos[2])).length;
+  const close = Math.min(...live.map((s) => g.grid.nearestWall(s.pos[0], s.pos[2]).d));
+  setScene('room');
+  assert.ok(planned > 20, `the outline alone puts spots against the walls (${planned})`);
+  assert.equal(stuck, 0, 'every spot can be stood on');
+  assert.ok(close >= 0.45 && live.length > 0.9 * g.stations.length, `spots keep ${close.toFixed(2)} m from walls, ${live.length}/${g.stations.length} kept`);
 });
 
 test('spaces: sessions lined up into one map share coverage; others stay apart', () => {

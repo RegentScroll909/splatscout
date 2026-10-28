@@ -13,7 +13,7 @@ import { analyzeCapture } from '../core/score.js';
 import { drawTopDown, drawPanorama } from '../capture/minimap.js';
 import { mainSpace, spaceOf, spaceCount } from '../core/spaces.js';
 
-export const APP_VERSION = '2.1.0';
+export const APP_VERSION = '2.2.0';
 
 export function slugify(s) {
   return (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'capture';

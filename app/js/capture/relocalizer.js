@@ -8,10 +8,12 @@
 //  * While capturing, recent depth is compared with older parts of the map every few seconds, so
 //    slow drift is corrected before it smears the coverage map.
 //  * A new AR session (resuming a capture) starts by searching the whole scan.
+//  * Along a plain hallway depth can't tell one stretch from the next: the camera image is compared
+//    with the photos taken there earlier (photomatch.js), which can.
 
 import {
   XF_ID, xf as makeXf, xfPoints, xfInverse, xfPose, xfApply, xfApplyDir, xfDelta, xfBlend, xfFromPoses, xfIsIdentity,
-  FloorPlan, solveAlignment, checkAlignment, icp, poolLive, poseHeading,
+  FloorPlan, solveAlignment, checkAlignment, icp, poolLive, poseHeading, photoScore, slideSearch,
 } from '../core/align.js';
 import { DEG, v3, posePosition, rotationDelta } from '../core/math.js';
 
@@ -28,6 +30,7 @@ export class Relocalizer {
     this.mode = null; // null | 'check' (holding photos while verifying) | 'search'
     this.state = null; // search state for the UI
     this.recent = []; // latest depth frames (live coordinates) for drift checks
+    this.images = []; // camera images since the check or search started (live coordinates)
     this.clock = []; // [t, voxel frame id] at each map update
     this.lossT = 0;
     this.prevRaw = null;
@@ -76,7 +79,7 @@ export class Relocalizer {
     if (this.prevRaw && dt > 0) {
       const moved = v3.dist(posePosition(this.prevRaw), posePosition(raw));
       const turned = rotationDelta(this.prevRaw, raw) / DEG;
-      if (moved > Math.max(0.3, 3 * dt) || turned > Math.max(50, 600 * dt)) reason = reason || 'jump';
+      if (moved > Math.max(0.3, 3 * dt) || turned > Math.max(20, 600 * dt)) reason = reason || 'jump';
     }
     this.prevRaw = raw;
     if (reason && !this.mode && this._mapSize() >= MIN_MAP) this._startCheck(reason, raw, t);
@@ -97,6 +100,22 @@ export class Relocalizer {
       else st.frames[st.frames.length - 1] = f;
       if (st.frames.length > 30) st.frames.shift();
     }
+  }
+
+  /** A camera image (photomatch.liveImage) while checking or searching. */
+  addImage(img) {
+    if (!this.mode || !img.raw) return;
+    const last = this.images[this.images.length - 1];
+    const moved = !last || v3.dist(posePosition(last.raw), posePosition(img.raw)) > 0.05 || rotationDelta(last.raw, img.raw) > 6 * DEG;
+    if (moved) this.images.push(img);
+    else this.images[this.images.length - 1] = img;
+    if (this.images.length > 3) this.images.shift();
+  }
+
+  /** Earlier photos of this map and the latest camera images, or null without enough of either. */
+  _photo() {
+    const keys = this.s.photoKeys ? this.s.photoKeys.filter((k) => k.space === this.s.space) : [];
+    return keys.length >= 3 && this.images.length ? { keys, imgs: this.images.slice() } : null;
   }
 
   /** The map was updated (for telling old map parts from new ones). */
@@ -130,8 +149,13 @@ export class Relocalizer {
   // ---------------------------------------------------------------- after a loss or jump
   _startCheck(reason, raw, t) {
     this.mode = 'check';
+    this.images = [];
     this.state = {
       reason, t0: t, frames: [], status: 'checking', confidence: 0, raw0: raw,
+      // ARCore kept its coordinates (the alignment still holds), or it moved them while the phone
+      // stayed put (the alignment that carries on from the last good pose).
+      kept: { ...this.xf, t: this.xf.t.slice() },
+      stayed: this.lastGood ? xfFromPoses(this.lastGood, raw) : null,
       priors: [
         { xf: { ...this.xf, t: this.xf.t.slice() }, radius: 1.5, yawRange: 30 },
         ...(this.lastGood ? [{ xf: xfFromPoses(this.lastGood, raw), radius: 2, yawRange: 40 }] : []),
@@ -147,19 +171,61 @@ export class Relocalizer {
     }
     if (st.lastTry && t - st.lastTry < 0.5) return null;
     st.lastTry = t;
-    const r = checkAlignment(this.s.voxels, st.frames.slice(-8), this.xf, null);
-    // The live depth sees through mapped walls from here: the position is wrong, search now.
-    if (r.through0 > 0.25 && r.visN0 >= 40) return this._startSearch(st.reason, st.priors, t);
-    if (r.enough && r.delta.dist < 0.15 && r.delta.yaw < 5 && r.inlierFrac >= 0.55 && r.through <= 0.15 && !r.weak) {
-      // Still fits (ARCore found its place again): keep going, with the small correction.
-      this.xf = r.xf;
-      this._end();
-      this.log.push({ t, kind: st.reason, cm: Math.round(r.delta.dist * 100) });
-      return { type: 'trackingBack', reason: st.reason };
+    const frames = st.frames.slice(-8);
+    const at = posePosition(frames[frames.length - 1].pose);
+    const hyps = [st.kept];
+    if (st.stayed && xfDelta(st.stayed, st.kept, at).dist > 0.1) hyps.push(st.stayed);
+    if (st.reason === 'reset') hyps.reverse(); // a reset moves the coordinates for sure
+    const photo = this._photo();
+    const fits = [];
+    for (const h of hyps) {
+      // ICP held near the guess: along a plain hallway the walls fit anywhere, so depth alone mustn't move it.
+      const r = checkAlignment(this.s.voxels, frames, h, null, h);
+      if (!r.enough) continue;
+      const fit = { r, kept: h === st.kept, ok: r.inlierFrac >= 0.6 && r.through <= 0.12 && r.delta.dist < 0.3 && r.delta.yaw < 3, x: r.xf, ph: null };
+      if (fit.ok && photo) {
+        fit.ph = photoScore(photo, fit.x, 2);
+        if (r.weakDir) {
+          // Depth can't check the position along the hallway: the photos look a couple of metres either way.
+          const sl = slideSearch(photo, fit.x, r.weakDir, [-2, 2], { lift: r.weakHeight ? 0.2 : 0 });
+          if (sl && sl.score >= 0.6 && sl.score - sl.second >= 0.15) {
+            fit.x = sl.xf;
+            fit.ph = sl.score;
+            fit.placed = true;
+            fit.slid = Math.abs(sl.s);
+          }
+        }
+      }
+      fits.push(fit);
     }
-    if (r.enough && (r.through0 > 0.2 || r.inlierFrac < 0.4)) return this._startSearch(st.reason, st.priors, t);
-    if (t - st.t0 > 6) return this._startSearch(st.reason, st.priors, t);
-    return null;
+    const good = fits.filter((f) => f.ok);
+    if (!good.length) {
+      // Nothing fits: the live depth sees through mapped walls or lands off them. Search properly.
+      if (fits.length && fits.every((f) => f.r.through0 > 0.2 || f.r.inlierFrac < 0.4)) return this._startSearch(st.reason, st.priors, t);
+      if (t - st.t0 > 6) return this._startSearch(st.reason, st.priors, t);
+      return null;
+    }
+    // Both fit (a hallway): when the photos clearly prefer the other one, the coordinates did move.
+    let pick = good[0];
+    const rated = good.filter((g) => g.ph != null);
+    if (rated.length === good.length && good.length > 1) {
+      const b = rated.reduce((a, c) => (c.ph > a.ph ? c : a));
+      if (rated.every((g) => g === b || b.ph - g.ph >= 0.12)) pick = b;
+    }
+    // Only carry straight on when nothing moved: ARCore kept its coordinates and the view still fits
+    // where it was, confirmed by the photos (along a hallway, the photo match peaks right there).
+    // Anything that needs a correction gets the full search: a few seconds longer, but it compares far
+    // more of the view, while over a narrow view a turn and a slide can pass for each other.
+    const still = pick.kept && pick.r.delta.dist < 0.05 && pick.r.delta.yaw < 1;
+    const sure = still && (!photo
+      ? !good.some((g) => g !== pick && xfDelta(g.x, pick.x, at).dist > 0.15)
+      : pick.r.weakDir ? pick.placed && pick.slid < 0.06 : pick.ph == null || pick.ph >= 0.5);
+    if (!sure) return this._startSearch(st.reason, st.priors, t);
+    const cm = Math.round(xfDelta(pick.x, st.kept, at).dist * 100);
+    this.xf = pick.x;
+    this._end();
+    this.log.push({ t, kind: st.reason, cm, photo: pick.ph == null ? null : +pick.ph.toFixed(2), placed: !!pick.placed, weak: pick.r.weak, kept: pick.kept });
+    return cm <= 15 ? { type: 'trackingBack', reason: st.reason } : { type: 'corrected', cm };
   }
 
   // ---------------------------------------------------------------- slow drift
@@ -210,6 +276,7 @@ export class Relocalizer {
   // ---------------------------------------------------------------- search
   /** Look for where the phone is in the scan. */
   begin(reason, t, { priors = [], global = true } = {}) {
+    this.images = [];
     return this._startSearch(reason, priors, t, null, global);
   }
 
@@ -233,7 +300,7 @@ export class Relocalizer {
       st.plan = new FloorPlan(vm, this._scanFloor());
       st.planVer = vm.version;
     }
-    const r = solveAlignment(vm, st.frames, { plan: st.plan, floorY: this._scanFloor(), priors: st.priors, global: st.global });
+    const r = solveAlignment(vm, st.frames, { plan: st.plan, floorY: this._scanFloor(), priors: st.priors, global: st.global, photo: this._photo() });
     st.status = r.status;
     st.confidence = r.confidence;
     st.metrics = r.metrics;
@@ -263,7 +330,8 @@ export class Relocalizer {
   _lock(x, t, metrics) {
     const reason = this.state ? this.state.reason : 'manual';
     this.xf = x;
-    this.log.push({ t, kind: 'realigned', reason, rms: metrics ? metrics.rms : null });
+    const m = metrics || {};
+    this.log.push({ t, kind: 'realigned', reason, rms: m.rms != null ? m.rms : null, photo: m.photo, peak: m.photoPeak, weak: m.weak, hint: !!(this.state && this.state.mapHint) });
     this._end();
     return { type: 'realigned', reason, rms: metrics ? metrics.rms : null };
   }
@@ -280,6 +348,30 @@ export class Relocalizer {
     if (!this.state || !raw) return;
     this.state.priors = [{ xf: xfFromPoses(photoPose, raw), radius: 1.2, yawRange: 30 }, ...this.state.priors.slice(0, 2)];
     this.state.lastSolve = 0;
+  }
+
+  /**
+   * "I'm standing here" (tapped on the map), optionally "facing this way": the search then looks
+   * only around there, and the scan is shown at that spot until it locks.
+   * @param {number[]} p [x, z] in scan coordinates
+   * @param {number|null} heading poseHeading-style angle, or null when not given
+   */
+  hintMap(p, heading, raw) {
+    const st = this.state;
+    if (!st || !raw) return;
+    const base = st.preview || this.xf;
+    const h = heading != null ? heading : poseHeading(xfPose(base, raw));
+    const yaw = wrapAngle(h - poseHeading(raw));
+    const r = xfApplyDir({ yaw }, [raw[12], 0, raw[14]]);
+    const x = { yaw, t: [p[0] - r[0], base.t[1], p[1] - r[2]] };
+    // Without a heading the live points could lie any way round the spot: a wider window.
+    st.priors = [{ xf: x, radius: heading != null ? 1.0 : 3.0, yawRange: heading != null ? 35 : 180 }];
+    st.global = false;
+    st.mapHint = { p, heading };
+    st.preview = x;
+    st.lastSolve = 0;
+    st.lastOk = null;
+    this.xf = x;
   }
 
   /** Manual adjustment while searching: slide (metres, relative to where the phone faces) and turn. */
@@ -311,7 +403,8 @@ export class Relocalizer {
     const frames = st.frames.length >= 3 ? st.frames : this.recent;
     if (frames.length >= 3) {
       const live = poolLive(frames);
-      const fit = icp(this.s.voxels, live.pts, base, { iters: 8, maxDist: 0.3, minDist: 0.08 });
+      // Held near the shown position where the surfaces leave it open (along a hallway).
+      const fit = icp(this.s.voxels, live.pts, base, { iters: 8, maxDist: 0.3, minDist: 0.08, prior: base });
       if (fit.inlierFrac >= 0.5 && xfDelta(fit.xf, base, posePosition(frames[frames.length - 1].pose)).dist < 0.4) x = fit.xf;
     }
     return this._lock(x, t, null);
@@ -328,6 +421,8 @@ export class Relocalizer {
     return { yaw: +this.xf.yaw.toFixed(5), t: this.xf.t.map((v) => +v.toFixed(4)) };
   }
 }
+
+const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 
 function rotateAbout(x, ang, p) {
   // Turn the whole scan frame by `ang` about the vertical line through p (scan coordinates).

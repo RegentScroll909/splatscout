@@ -1,7 +1,7 @@
 // Practice source: walk through a virtual classroom with mouse/keyboard or touch (or an automatic
 // tour). It behaves like the AR source (6DoF + depth) or like camera mode (orientation only).
 
-import { DemoScene, depthGrid, depthImage, raycast, surfaceNormal, ROOM } from './demoScene.js';
+import { DemoScene, depthGrid, depthImage, raycast, surfaceNormal, setScene, walkable } from './demoScene.js';
 import { analysisSize, coverMapping } from './common.js';
 import { BitmapImage } from './frameImage.js';
 import { rgbaToGray } from '../core/analyzer.js';
@@ -20,14 +20,17 @@ export class DemoSource {
    * @param {number} [o.tourSpeed] 0 = manual control; >0 starts the automatic tour at that speed
    * @param {{yaw, t}|null} [o.sessionXf] like a real AR session: report poses in coordinates that are
    *   turned and shifted from the room's (a resumed capture starts somewhere else in "AR space")
+   * @param {'room'|'hallway'} [o.scene]
    */
-  constructor({ container, tracking = '6dof', tourSpeed = 0, sessionXf = null }) {
+  constructor({ container, tracking = '6dof', tourSpeed = 0, sessionXf = null, scene = 'room' }) {
     this.kind = 'demo';
     this.tracking = tracking;
     this.container = container;
     this.tourSpeed = tourSpeed;
-    this.info = { label: 'Practice room', camW: 0, camH: 0, depth: tracking === '6dof', sensors: true };
-    this.pos = [0, 1.45, 2.4];
+    this.sceneId = scene;
+    const sc = setScene(scene);
+    this.info = { label: scene === 'hallway' ? 'Practice hallway' : 'Practice room', camW: 0, camH: 0, depth: tracking === '6dof', sensors: true };
+    this.pos = sc.start.slice();
     this.yaw = 0; // 0 = looking towards -Z
     this.pitch = -5;
     this.keys = new Set();
@@ -176,16 +179,25 @@ export class DemoSource {
       const dx = clamp((p.x - p.x0) / 80, -1, 1), dy = clamp((p.y - p.y0) / 80, -1, 1);
       mv = v3.add(mv, v3.add(v3.scale(right, dx), v3.scale(fwd, -dy)));
     }
-    if (v3.len(mv) > 0) this.pos = v3.add(this.pos, v3.scale(v3.norm(mv), sp * Math.min(1, v3.len(mv))));
-    this.pos[0] = clamp(this.pos[0], ROOM.min[0] + 0.3, ROOM.max[0] - 0.3);
+    if (v3.len(mv) > 0) {
+      const step = v3.scale(v3.norm(mv), sp * Math.min(1, v3.len(mv)));
+      this._walk(this.pos[0] + step[0], this.pos[2] + step[2]);
+      this.pos[1] += step[1];
+    }
     this.pos[1] = clamp(this.pos[1], 0.3, 2.6);
-    this.pos[2] = clamp(this.pos[2], ROOM.min[2] + 0.3, ROOM.max[2] - 0.3);
+  }
+
+  /** Move to (x, z), sliding along walls instead of passing through them. */
+  _walk(x, z) {
+    if (walkable(x, z)) [this.pos[0], this.pos[2]] = [x, z];
+    else if (walkable(x, this.pos[2])) this.pos[0] = x;
+    else if (walkable(this.pos[0], z)) this.pos[2] = z;
   }
 
   // ---------------------------------------------------------------- automatic tour
   _tour(dt) {
     this.tourT += dt * this.tourSpeed;
-    const segs = TOUR;
+    const segs = this.sceneId === 'hallway' ? HALL_TOUR : TOUR;
     let t = this.tourT % segs.reduce((s, x) => s + x.dur, 0);
     let seg = segs[0];
     for (const s of segs) {
@@ -197,7 +209,12 @@ export class DemoSource {
     }
     const u = t / seg.dur;
     let pos, look;
-    if (seg.type === 'lap') {
+    if (seg.type === 'corridor') {
+      // Down the middle of the hallway and back, looking from side to side.
+      const zz = u < 0.5 ? 7 - 28 * u : -7 + 28 * (u - 0.5);
+      pos = [0.25 * Math.sin(u * 40), 0, zz];
+      look = (u < 0.5 ? 0 : 180) + 75 * Math.sin(u * Math.PI * 2 * 4);
+    } else if (seg.type === 'lap') {
       pos = rectPoint(u, 2.85, 2.3);
       const toC = [-pos[0], 0, -pos[2]];
       const baseYaw = Math.atan2(toC[0], -toC[2]) / DEG;
@@ -213,7 +230,9 @@ export class DemoSource {
     pos[1] = seg.y;
     // Smoothly approach the target pose (no teleports between segments).
     const a = 1 - Math.exp(-dt * 2.5);
-    this.pos = v3.add(this.pos, v3.scale(v3.sub(pos, this.pos), a));
+    const next = v3.add(this.pos, v3.scale(v3.sub(pos, this.pos), a));
+    this._walk(next[0], next[2]);
+    this.pos[1] = next[1];
     let dy = ((look - this.yaw + 540) % 360) - 180;
     this.yaw += dy * a;
     this.pitch += (seg.pitch - this.pitch) * a;
@@ -247,12 +266,9 @@ export class DemoSource {
     const d = Math.hypot(tx, tz);
     if (d > 1e-3) {
       const k = Math.min(d, sp) / d;
-      this.pos[0] += tx * k;
-      this.pos[2] += tz * k;
+      this._walk(this.pos[0] + tx * k, this.pos[2] + tz * k);
     }
     this.pos[1] += clamp(tgt.pos[1] - this.pos[1], -0.5 * dt, 0.5 * dt);
-    this.pos[0] = clamp(this.pos[0], ROOM.min[0] + 0.3, ROOM.max[0] - 0.3);
-    this.pos[2] = clamp(this.pos[2], ROOM.min[2] + 0.3, ROOM.max[2] - 0.3);
     const a = tgt.aim;
     const yaw = Math.atan2(a[0], -a[2]) / DEG, pitch = Math.asin(clamp(a[1], -1, 1)) / DEG;
     // Smooth, proportional turning capped at 12°/s (a person following the ring, not a robot).
@@ -378,6 +394,11 @@ export class DemoSource {
     this.overlay.draw(mat4InvertRigid(pose), map.proj, [0, 0, cw, ch], now);
   }
 }
+
+const HALL_TOUR = [
+  { type: 'corridor', y: 1.4, pitch: -8, dur: 120 },
+  { type: 'corridor', y: 1.9, pitch: -30, dur: 120 },
+];
 
 const TOUR = [
   { type: 'lap', y: 1.4, pitch: -8, dur: 80 },
