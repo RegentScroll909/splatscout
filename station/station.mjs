@@ -16,6 +16,7 @@ import { processJob, STAGES, sourceKind, guessNames } from './lib/pipeline.mjs';
 import { killTree, capture } from './lib/run.mjs';
 import { PhoneImporter } from './lib/adb.mjs';
 import { readZipText } from './lib/zipread.mjs';
+import { walkInputs, walkMapFor } from './lib/walkmap.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, 'web');
@@ -343,6 +344,30 @@ const server = createServer(async (req, res) => {
     }
     if (path === '/api/jobs') return sendJson(res, jobs.map(publicJob));
     if (path === '/api/library') return sendJson(res, library());
+    if (path === '/api/walkmap') {
+      // Where you can walk in a splat (viewer's walk mode). ?ply=<the viewer's /files/… URL>&up=x,y,z
+      const ply = url.searchParams.get('ply') || '';
+      const up = (url.searchParams.get('up') || '').split(',').map(Number);
+      let file = null, job = null, info = null, jm;
+      if ((jm = /^\/files\/jobs\/(\w+)\/(.+)$/.exec(ply))) {
+        job = jobs.find((j) => j.id === jm[1]);
+        file = job && under(job.dir, jm[2]);
+      } else if (ply.startsWith('/files/library/')) {
+        file = under(cfg.dirs.library, ply.slice('/files/library/'.length));
+        try {
+          info = JSON.parse(readFileSync(join(dirname(file), 'info.json'), 'utf8'));
+        } catch {}
+        job = info && jobs.find((j) => j.id === info.jobId);
+      }
+      if (!file || !/\.ply$/i.test(file) || !existsSync(file)) return sendJson(res, { error: 'Splat not found' }, 404);
+      const mode = (info && info.colmap && info.colmap.mode) || (job && job.colmap && job.colmap.mode) || null;
+      const inputs = walkInputs({ jobDir: job && job.dir, mode, view: info && info.view, up: up.length === 3 && up.every(Number.isFinite) ? up : null });
+      try {
+        return sendJson(res, await walkMapFor(file, inputs));
+      } catch (e) {
+        return sendJson(res, { error: String(e.message || e) }, 422);
+      }
+    }
     if (path === '/api/log') return sendJson(res, log.slice(-100));
     if (path === '/api/events') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });

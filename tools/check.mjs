@@ -1,6 +1,6 @@
 // Self-checks for the platform-independent core (run: node tools/check.mjs).
 import assert from 'node:assert/strict';
-import { writeFileSync, mkdtempSync, readFileSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -660,6 +660,151 @@ test('station crops a splat to the scan area', () => {
   assert.match(txt, /element vertex 3\n/);
   const start = txt.indexOf('end_header\n') + 11;
   assert.deepEqual([0, 1, 2].map((i) => out.readFloatLE(start + i * 16 + 12)), [0, 3, 4]);
+});
+
+// ---- walk mode: a made-up splat of two rooms joined by a doorway, in the AR frame (phone at y≈0).
+// Floor at y = -1.4 over x 0–6, z 0–4 with a shiny hole in it; textured walls at z = 0, x = 0 and
+// x = 3 (doorway at z 1.5–2.5); a plain wall at x = 6 made of a few big flat splats; no wall at
+// z = 4 (the floor just ends); a table in the second room; faint floaters in mid-air.
+const { buildWalkMap, readCameras } = await import('../station/lib/walkmap.mjs');
+const { decodeMap, Walker, FLOOR, BLOCK, toScene, toWalk } = await import('../station/web/walk.js');
+function walkScene() {
+  const s = [];
+  const add = (x, y, z, a, sc, q = [1, 0, 0, 0]) => s.push({ x, y, z, a, sc, q });
+  const F = -1.4;
+  for (let x = 0.025; x < 6; x += 0.05) for (let z = 0.025; z < 4; z += 0.05) {
+    if (x > 1.0 && x < 1.8 && z > 1.5 && z < 2.3) continue; // shiny patch: nothing reconstructed
+    add(x, F, z, 0.6, [0.03, 0.005, 0.03]);
+  }
+  for (let y = F; y < 1; y += 0.05) {
+    for (let x = 0.025; x < 6; x += 0.05) add(x, y, 0, 0.7, [0.03, 0.03, 0.005]);
+    for (let z = 0.025; z < 4; z += 0.05) {
+      add(0, y, z, 0.7, [0.005, 0.03, 0.03]);
+      if (z < 1.5 || z > 2.5 || y > F + 2.1) add(3, y, z, 0.7, [0.005, 0.03, 0.03]);
+    }
+  }
+  // Plain wall: big thin splats every 0.4 m, flat in their own x–y plane, turned 90° about y.
+  for (let y = F + 0.2; y < 1; y += 0.4) for (let z = 0.2; z < 4; z += 0.4) add(6, y, z, 0.9, [0.25, 0.25, 0.01], [Math.SQRT1_2, 0, Math.SQRT1_2, 0]);
+  for (let x = 4.0; x < 5.0; x += 0.05) for (let z = 0.7; z < 1.3; z += 0.05) add(x, F + 0.75, z, 0.8, [0.03, 0.005, 0.03]); // table top
+  for (const [x, z] of [[1.5, 3], [4.5, 2.6], [2.2, 1]]) add(x, F + 1.2, z, 0.3, [0.04, 0.04, 0.04]); // floaters
+  return s;
+}
+function writeWalkPly(file, splats, k = 1, flip = false) {
+  const props = ['x', 'y', 'z', 'opacity', 'scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3'];
+  const head = `ply\nformat binary_little_endian 1.0\nelement vertex ${splats.length}\n${props.map((p) => `property float ${p}\n`).join('')}end_header\n`;
+  const b = Buffer.alloc(splats.length * props.length * 4);
+  splats.forEach((s, i) => {
+    // flip = the scene turned upside down (180° about x), as an unposed solve can come out
+    const v = [s.x * k, (flip ? -s.y : s.y) * k, (flip ? -s.z : s.z) * k, Math.log(s.a / (1 - s.a)), ...s.sc.map((g) => Math.log(g * k)),
+      ...(flip ? [-s.q[1], s.q[0], -s.q[3], s.q[2]] : s.q)];
+    v.forEach((x, j) => b.writeFloatLE(x, (i * props.length + j) * 4));
+  });
+  writeFileSync(file, Buffer.concat([Buffer.from(head, 'latin1'), b]));
+}
+const walkCams = (k = 1, flip = false) =>
+  [[1.5, 0.6], [1.5, 1.4], [1.6, 2.0], [2.4, 2.0], [3.0, 2.0], [3.6, 2.0], [4.4, 2.2], [5.0, 2.8]].map(([x, z], i) => ({
+    name: `${String(i + 1).padStart(4, '0')}.jpg`,
+    C: [x * k, 0, (flip ? -z : z) * k],
+    fwd: [1, 0, 0],
+  }));
+const walkDir = mkdtempSync(join(tmpdir(), 'ssw-'));
+writeWalkPly(join(walkDir, 'scene.ply'), walkScene());
+const walkMap = decodeMap(await buildWalkMap(join(walkDir, 'scene.ply'), { cams: walkCams(), up: [0, 1, 0], metric: true }));
+// The same scene as an unposed (video) solve might give it: half size and upside down, so up is -y.
+writeWalkPly(join(walkDir, 'flipped.ply'), walkScene(), 0.5, true);
+const flippedMap = decodeMap(await buildWalkMap(join(walkDir, 'flipped.ply'), { cams: walkCams(0.5, true), up: [0, -1, 0], metric: false }));
+// Walk from (x, z) straight towards (tx, tz) for up to `far` metres; returns where you end up.
+const walkTo = (w, x, z, tx, tz, far = 8) => {
+  w.place(x, z);
+  const d = Math.hypot(tx - x, tz - z);
+  for (let s = 0; s < far / 0.05 && Math.hypot(tx - w.x, tz - w.z) > 0.03; s++) {
+    const r = Math.hypot(tx - w.x, tz - w.z);
+    w.move(((tx - w.x) / r) * Math.min(0.05, r), ((tz - w.z) / r) * Math.min(0.05, r));
+  }
+  return [w.x, w.z, d];
+};
+
+test('walk map: floor found, plain wall, table and doorway sorted out, floor holes filled', () => {
+  const m = walkMap;
+  assert.ok(Math.abs(m.floorY + 1.4) < 0.05, `floor at ${m.floorY.toFixed(3)}`);
+  assert.ok(Math.abs(m.eye - 1.4) < 0.06, `eye height ${m.eye.toFixed(2)}`);
+  const w = new Walker(m);
+  assert.equal(w.cellAt(4.5, 1.0), BLOCK, 'table blocks');
+  assert.equal(w.cellAt(6.0, 2.0), BLOCK, 'plain wall of big flat splats blocks');
+  assert.equal(w.cellAt(3.0, 1.0), BLOCK, 'partition wall');
+  assert.equal(w.cellAt(3.0, 2.0), FLOOR, 'doorway is open');
+  assert.equal(w.cellAt(1.4, 1.9), FLOOR, 'shiny hole in the floor is filled');
+  for (const [x, z] of [[1.5, 3], [4.5, 2.6], [2.2, 1]]) assert.equal(w.cellAt(x, z), FLOOR, `floater at ${x},${z} doesn't block`);
+  assert.ok(!w.canStand(4.5, 1.0) && w.canStand(1.5, 2.0));
+});
+
+test('walker: through the doorway, but not through walls, furniture or off the floor', () => {
+  const w = new Walker(walkMap);
+  const R = w.radius;
+  let [x, z] = walkTo(w, 1.5, 2.0, 4.5, 2.0);
+  assert.ok(Math.hypot(x - 4.5, z - 2.0) < 0.05, `through the doorway (ended at ${x.toFixed(2)}, ${z.toFixed(2)})`);
+  [x] = walkTo(w, 1.5, 0.8, 4.5, 0.8);
+  assert.ok(x < 3 - R + 0.02, `stopped by the partition (x ${x.toFixed(2)})`);
+  [x] = walkTo(w, 4.5, 3.0, 9, 3.0);
+  assert.ok(x < 6 - R + 0.02 && x > 5.4, `stopped by the plain wall (x ${x.toFixed(2)})`);
+  [, z] = walkTo(w, 1.5, 2.0, 1.5, 9);
+  assert.ok(z < 4 - R + 0.02 && z > 3.5, `stopped where the floor ends (z ${z.toFixed(2)})`);
+  [x, z] = walkTo(w, 4.5, 2.2, 4.5, 0.3);
+  assert.ok(z > 1.3 + R - 0.02, `stopped by the table (z ${z.toFixed(2)})`);
+  // Walking diagonally into a wall slides along it instead of sticking.
+  w.place(1.5, 1.0);
+  const z0 = w.z;
+  for (let i = 0; i < 40; i++) w.move(0.035, -0.035);
+  assert.ok(w.x > 2.0 && z0 - w.z < 1.0 && w.canStand(w.x, w.z), `slid along the wall to ${w.x.toFixed(2)}, ${w.z.toFixed(2)}`);
+});
+
+test('walk map: an upside-down splat at an unknown scale comes out the same', () => {
+  const m = flippedMap;
+  // The phone was 1.4 m up and the estimate assumes 1.5 m, so the scale comes out ~7 % large.
+  assert.ok(Math.abs(m.scale - 2) < 0.2, `scale ${m.scale.toFixed(3)}`);
+  const w = new Walker(m);
+  const at = (x, z) => toWalk(m, [x * 0.5, 0, -z * 0.5]); // scene point of a metric (x, z) in the original
+  const door = at(3, 2), table = at(4.5, 1.0), wall = at(3, 1.0);
+  assert.equal(w.cellAt(door[0], door[2]), FLOOR);
+  assert.equal(w.cellAt(table[0], table[2]), BLOCK);
+  assert.equal(w.cellAt(wall[0], wall[2]), BLOCK);
+  const plain = at(6, 2);
+  assert.equal(w.cellAt(plain[0], plain[2]), BLOCK, 'plain wall of turned big splats');
+  const back = toScene(m, toWalk(m, [1, 2, 3]));
+  near(back, [1, 2, 3], 1e-5, 'walk frame round trip');
+});
+
+test('station reads camera centres from COLMAP text and binary models alike', () => {
+  const cams = walkCams().slice(0, 3);
+  // Camera looking along +x: rows of world→camera rotation are camera x, y, z axes in world terms.
+  const Rw = [[0, 0, 1], [0, -1, 0], [1, 0, 0]];
+  const q = [0, Math.SQRT1_2, 0, Math.SQRT1_2]; // the same rotation as a quaternion (w, x, y, z)
+  const t = (C) => Rw.map((r) => -(r[0] * C[0] + r[1] * C[1] + r[2] * C[2]));
+  const txtDir = join(walkDir, 'txt'), binDir = join(walkDir, 'bin');
+  mkdirSync(txtDir);
+  mkdirSync(binDir);
+  // Text: one line per image plus its 2-D points line, which may be empty.
+  writeFileSync(join(txtDir, 'images.txt'), '# Image list\n' + cams.map((c, i) => `${i + 1} ${q.join(' ')} ${t(c.C).join(' ')} 1 ${c.name}\n${i === 1 ? '' : '10 20 -1'}\n`).join(''));
+  const parts = [Buffer.alloc(8)];
+  parts[0].writeBigUInt64LE(BigInt(cams.length));
+  cams.forEach((c, i) => {
+    const h = Buffer.alloc(4 + 56 + 4);
+    h.writeUInt32LE(i + 1, 0);
+    [...q, ...t(c.C)].forEach((v, k) => h.writeDoubleLE(v, 4 + k * 8));
+    h.writeUInt32LE(1, 60);
+    const n = Buffer.alloc(8);
+    n.writeBigUInt64LE(1n);
+    parts.push(h, Buffer.from(c.name + '\0'), n, Buffer.alloc(24));
+  });
+  writeFileSync(join(binDir, 'images.bin'), Buffer.concat(parts));
+  for (const dir of [txtDir, binDir]) {
+    const got = readCameras(dir);
+    assert.equal(got.length, 3, dir);
+    got.forEach((g, i) => {
+      near(g.C, cams[i].C, 1e-6, `${dir} centre ${i}`);
+      near(g.fwd, [1, 0, 0], 1e-6, `${dir} forward ${i}`);
+    });
+  }
 });
 
 console.log(`\n${passed} checks passed`);

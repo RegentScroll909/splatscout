@@ -10,13 +10,25 @@
     #bar { position: fixed; top: 0; left: 0; right: 0; display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: #000a; z-index: 10; flex-wrap: wrap; }
     #title { font-weight: 700; margin-right: auto; }
     button, a.b { font: inherit; color: #eee; background: #2a2230; border: 1px solid #3a3040; border-radius: 8px; padding: 5px 10px; cursor: pointer; text-decoration: none; }
+    button.on { background: #0e5f69; border-color: #1aa5b5; }
+    button:disabled { opacity: .55; cursor: progress; }
     #help { position: fixed; bottom: 10px; left: 12px; font-size: 12px; color: #bbb; background: #000a; padding: 6px 10px; border-radius: 8px; z-index: 10; }
+    body.walking #help { max-width: calc(100vw - 280px); min-width: 140px; }
     #msg { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: 15px; color: #ccc; }
+    #mini { position: fixed; right: 12px; bottom: 12px; z-index: 10; background: #000c; border: 1px solid #3a3040; border-radius: 8px; cursor: crosshair; display: none; touch-action: none; }
+    body.walking #mini.shown { display: block; }
+    #toast { position: fixed; left: 50%; top: 60px; transform: translateX(-50%); max-width: min(560px, calc(100vw - 32px)); text-align: center; background: #000d; border: 1px solid #3a3040; padding: 7px 12px; border-radius: 8px; z-index: 11; opacity: 0; transition: opacity .25s; pointer-events: none; }
+    #toast.show { opacity: 1; }
+    #dot { position: fixed; left: 50%; top: 50%; width: 5px; height: 5px; margin: -2.5px; border-radius: 50%; background: #fffa; box-shadow: 0 0 0 1px #0008; display: none; pointer-events: none; z-index: 9; }
+    body.walking #dot { display: block; }
+    #stick { position: fixed; width: 110px; height: 110px; margin: -55px 0 0 -55px; border-radius: 50%; border: 2px solid #fff6; background: #0003; display: none; pointer-events: none; z-index: 9; }
+    #knob { position: absolute; left: 50%; top: 50%; width: 46px; height: 46px; margin: -23px 0 0 -23px; border-radius: 50%; background: #fff6; }
   </style>
   <script type="importmap">
     {
       "imports": {
         "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
         "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
       }
     }
@@ -25,6 +37,7 @@
 <body>
   <div id="bar">
     <span id="title">Splat</span>
+    <button id="walk" title="Walk through the splat at eye height; walls and furniture stop you">🚶 Walk</button>
     <button id="flip" title="Turn the scene upside down if it loads inverted">⇅ Flip up</button>
     <button id="home" title="Back to the first photo's viewpoint">⌂ Start view</button>
     <a class="b" id="dl" download>⬇ .ply</a>
@@ -32,23 +45,53 @@
   </div>
   <div id="msg">Loading splat…</div>
   <div id="help">Drag to orbit · right-drag to pan · scroll to zoom</div>
+  <canvas id="mini" class="shown" title="Where you are. Click a spot to jump there."></canvas>
+  <div id="toast"></div>
+  <div id="dot"></div>
+  <div id="stick"><div id="knob"></div></div>
   <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
+    import { decodeMap, Walker, toScene, toWalk, FLOOR, BLOCK } from './walk.js';
 
+    const $ = (id) => document.getElementById(id);
     const q = new URLSearchParams(location.search);
     const ply = q.get('ply');
     const view = q.get('view') ? JSON.parse(q.get('view')) : null;
-    document.getElementById('title').textContent = q.get('title') || 'Splat';
+    $('title').textContent = q.get('title') || 'Splat';
     document.title = (q.get('title') || 'Splat') + ' · SplatStation';
-    document.getElementById('dl').href = ply;
+    $('dl').href = ply;
+
+    const touchFirst = matchMedia('(pointer: coarse)').matches;
+    const HELP = {
+      orbit: 'Drag to orbit · right-drag to pan · scroll to zoom',
+      walk: touchFirst
+        ? 'Left thumb walks · right thumb looks · tap the map to jump'
+        : 'W A S D to walk · click, then move the mouse to look (Esc frees it) · ← → turn · Shift hurry · G ghost · M map',
+      ghost: touchFirst ? 'Ghost: no walls · walk to fly where you look' : 'Ghost: fly through walls · Space/E up · C/Q down · G to land',
+    };
+    const WALK_SPEED = 1.4, RUN_SPEED = 3, LOOK = 0.0025, TOUCH_LOOK = 0.005;
 
     let up = view && view.up ? view.up : [0, -1, 0];
-    let viewer = null;
+    let viewer = null, orbit = null, baseFov = 50;
 
+    // ------------------------------------------------------------------ toast
+    let toastTimer = 0;
+    function toast(text, ms = 2500) {
+      $('toast').textContent = text;
+      $('toast').classList.add('show');
+      clearTimeout(toastTimer);
+      if (ms) toastTimer = setTimeout(() => $('toast').classList.remove('show'), ms);
+    }
+
+    // ------------------------------------------------------------------ splat
     async function load() {
+      leaveWalk();
       if (viewer) {
+        orbit.dispose();
         await viewer.dispose();
-        document.querySelectorAll('canvas').forEach((c) => c.remove());
+        document.querySelectorAll('canvas:not(#mini)').forEach((c) => c.remove());
       }
       const pos = view ? view.position : [0, 0, 0];
       const look = view ? view.lookAt : [0, 0, -1];
@@ -58,23 +101,345 @@
         initialCameraLookAt: look,
         sharedMemoryForWorkers: false,
         antialiased: true,
+        useBuiltInControls: false, // orbit and walk controls are ours
       });
+      baseFov = viewer.camera.fov;
+      orbit = new OrbitControls(viewer.camera, viewer.renderer.domElement);
+      Object.assign(orbit, { rotateSpeed: 0.5, maxPolarAngle: Math.PI * 0.75, minPolarAngle: 0.1, enableDamping: true, dampingFactor: 0.05 });
+      orbit.target.fromArray(look);
+      orbit.listenToKeyEvents(window);
+      orbit.update();
+      hookPointer(viewer.renderer.domElement);
       try {
         await viewer.addSplatScene(ply, { splatAlphaRemovalThreshold: 5, showLoadingUI: true, progressiveLoad: true, format: GaussianSplats3D.SceneFormat.Ply });
         viewer.start();
-        document.getElementById('msg').textContent = '';
+        $('msg').textContent = '';
       } catch (e) {
-        document.getElementById('msg').textContent = 'Could not load the splat: ' + (e.message || e);
+        $('msg').textContent = 'Could not load the splat: ' + (e.message || e);
       }
     }
 
-    document.getElementById('flip').onclick = () => {
-      up = up.map((v) => -v);
-      load();
+    // ------------------------------------------------------------------ walk map
+    let mapReq = null;
+    function fetchMap() {
+      const key = up.map((v) => +(+v).toFixed(4)).join(',');
+      if (mapReq && mapReq.key === key) return mapReq.promise;
+      const promise = fetch(`/api/walkmap?ply=${encodeURIComponent(ply)}&up=${key}`).then(async (r) => {
+        if (!(r.headers.get('content-type') || '').includes('json')) {
+          throw new Error('Restart SplatStation to turn on walk mode (it was started before walk mode existed).');
+        }
+        const j = await r.json();
+        if (!r.ok || j.error) throw new Error('Walk mode isn’t available for this splat: ' + (j.error || r.status));
+        return decodeMap(j);
+      });
+      promise.catch(() => {}); // reported when someone presses Walk
+      mapReq = { key, promise };
+      return promise;
+    }
+
+    // ------------------------------------------------------------------ walking
+    const walk = { on: false, ghost: false, map: null, walker: null, yaw: 0, pitch: 0, y: 0, vx: 0, vy: 0, vz: 0 };
+    const keys = new Set();
+    const stick = { id: null, x0: 0, y0: 0, x: 0, y: 0 };
+    const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+    const sceneDir = (m, d) => {
+      const o = toScene(m, [0, 0, 0]), p = toScene(m, d);
+      return new THREE.Vector3(p[0] - o[0], p[1] - o[1], p[2] - o[2]).normalize();
     };
-    document.getElementById('home').onclick = () => load();
-    if (!ply) document.getElementById('msg').textContent = 'No splat given (?ply=…).';
-    else load();
+
+    async function enterWalk() {
+      if (walk.on || !viewer) return;
+      $('walk').disabled = true;
+      toast('Preparing walk mode…', 0);
+      let m;
+      try {
+        m = await fetchMap();
+      } catch (e) {
+        toast(e.message, 7000);
+        return;
+      } finally {
+        $('walk').disabled = false;
+      }
+      if (walk.map !== m) {
+        walk.map = m;
+        walk.walker = new Walker(m);
+        drawMiniBase();
+      }
+      const cam = viewer.camera, w = walk.walker;
+      // Start where the camera is if that's over the floor, else where the first photo was taken.
+      const here = toWalk(m, cam.position.toArray());
+      const dir = new THREE.Vector3();
+      cam.getWorldDirection(dir);
+      const f = toWalk(m, dir.toArray());
+      let spot = w.nearestFree(here[0], here[2], 1.5);
+      if (spot) {
+        walk.yaw = Math.atan2(f[0], f[2]);
+        walk.pitch = clamp(Math.atan2(f[1], Math.hypot(f[0], f[2])), -0.6, 0.6);
+      } else {
+        spot = w.nearestFree(m.start.x, m.start.z);
+        walk.yaw = m.start.yaw;
+        walk.pitch = 0;
+      }
+      if (!spot) {
+        toast('There’s no floor to stand on in this splat.', 5000);
+        return;
+      }
+      [w.x, w.z] = spot;
+      Object.assign(walk, { on: true, ghost: false, y: m.floorY + m.eye, vx: 0, vy: 0, vz: 0 });
+      orbit.enabled = false;
+      cam.up.copy(sceneDir(m, [0, 1, 0]));
+      cam.fov = 70;
+      cam.updateProjectionMatrix();
+      document.body.classList.add('walking');
+      $('walk').classList.add('on');
+      $('walk').textContent = '✕ Stop walking';
+      $('help').textContent = HELP.walk;
+      toast(m.floorGuessed ? 'Walking. The floor was hard to find in this splat, so heights may be off.'
+        : touchFirst ? 'Walking. Walls and furniture stop you.' : 'Walking. Click the scene to look around with the mouse.', 3500);
+      $('walk').blur();
+    }
+
+    function leaveWalk() {
+      if (!walk.on) return;
+      walk.on = false;
+      keys.clear();
+      endStick();
+      if (document.pointerLockElement) document.exitPointerLock();
+      const cam = viewer.camera;
+      cam.fov = baseFov;
+      cam.updateProjectionMatrix();
+      cam.up.fromArray(up).normalize();
+      const dir = new THREE.Vector3();
+      cam.getWorldDirection(dir);
+      orbit.target.copy(cam.position).addScaledVector(dir, 1.5 / walk.map.scale);
+      orbit.enabled = true;
+      orbit.update();
+      document.body.classList.remove('walking');
+      $('walk').classList.remove('on');
+      $('walk').textContent = '🚶 Walk';
+      $('help').textContent = HELP.orbit;
+    }
+
+    function setGhost(on) {
+      const m = walk.map, w = walk.walker;
+      if (!on) {
+        // Land on the nearest floor you can stand on.
+        const p = w.nearestFree(w.x, w.z);
+        if (p) [w.x, w.z] = p;
+      }
+      walk.ghost = on;
+      $('help').textContent = on ? HELP.ghost : HELP.walk;
+      toast(on ? 'Ghost mode: walls don’t stop you' : 'Back on the floor');
+    }
+
+    function turn(dx, dy, k = LOOK) {
+      walk.yaw -= dx * k;
+      walk.pitch = clamp(walk.pitch - dy * k, -1.45, 1.45);
+    }
+
+    function stepWalk(dt) {
+      const m = walk.map, w = walk.walker;
+      let fwd = 0, side = 0, rise = 0;
+      if (keys.has('KeyW') || keys.has('ArrowUp')) fwd += 1;
+      if (keys.has('KeyS') || keys.has('ArrowDown')) fwd -= 1;
+      if (keys.has('KeyD')) side += 1;
+      if (keys.has('KeyA')) side -= 1;
+      if (keys.has('ArrowLeft')) walk.yaw += 1.8 * dt;
+      if (keys.has('ArrowRight')) walk.yaw -= 1.8 * dt;
+      if (keys.has('Space') || keys.has('KeyE')) rise += 1;
+      if (keys.has('KeyC') || keys.has('KeyQ')) rise -= 1;
+      fwd += stick.y;
+      side += stick.x;
+      const n = Math.hypot(fwd, side);
+      if (n > 1) [fwd, side] = [fwd / n, side / n];
+      const speed = keys.has('ShiftLeft') || keys.has('ShiftRight') ? RUN_SPEED : WALK_SPEED;
+      const sy = Math.sin(walk.yaw), cy = Math.cos(walk.yaw);
+      const flat = walk.ghost ? Math.cos(walk.pitch) : 1;
+      const tx = (sy * fwd * flat - cy * side) * speed, tz = (cy * fwd * flat + sy * side) * speed;
+      const ease = Math.min(1, dt * 10);
+      walk.vx += (tx - walk.vx) * ease;
+      walk.vz += (tz - walk.vz) * ease;
+      if (walk.ghost) {
+        walk.vy += ((rise + Math.sin(walk.pitch) * fwd) * speed - walk.vy) * ease;
+        w.x += walk.vx * dt;
+        w.z += walk.vz * dt;
+        walk.y += walk.vy * dt;
+      } else {
+        w.move(walk.vx * dt, walk.vz * dt);
+        walk.y += (m.floorY + m.eye - walk.y) * Math.min(1, dt * 6);
+      }
+      const cam = viewer.camera, cp = Math.cos(walk.pitch);
+      const eye = toScene(m, [w.x, walk.y, w.z]);
+      const at = toScene(m, [w.x + sy * cp, walk.y + Math.sin(walk.pitch), w.z + cy * cp]);
+      cam.position.fromArray(eye);
+      cam.lookAt(at[0], at[1], at[2]);
+      drawMini();
+    }
+
+    // ------------------------------------------------------------------ mini-map
+    const mini = $('mini'), mctx = mini.getContext('2d');
+    let base = null;
+    function drawMiniBase() {
+      const m = walk.map, w = walk.walker;
+      base = document.createElement('canvas');
+      base.width = m.W;
+      base.height = m.H;
+      const bctx = base.getContext('2d');
+      const img = bctx.createImageData(m.W, m.H);
+      for (let c = 0; c < m.W * m.H; c++) {
+        const v = m.cells[c];
+        const free = v === FLOOR && m.dist[c] - m.cell / 2 >= w.radius;
+        const rgba = v === BLOCK ? [224, 112, 64, 255] : v === FLOOR ? (free ? [47, 111, 122, 255] : [31, 68, 75, 255]) : [0, 0, 0, 0];
+        img.data.set(rgba, c * 4);
+      }
+      bctx.putImageData(img, 0, 0);
+      const long = Math.min(220, Math.max(130, innerWidth * 0.3));
+      const s = long / Math.max(m.W, m.H), dpr = devicePixelRatio || 1;
+      mini.style.width = Math.round(m.W * s) + 'px';
+      mini.style.height = Math.round(m.H * s) + 'px';
+      mini.width = Math.round(m.W * s * dpr);
+      mini.height = Math.round(m.H * s * dpr);
+    }
+
+    function drawMini() {
+      if (!base || !mini.classList.contains('shown')) return;
+      const m = walk.map, w = walk.walker, dpr = devicePixelRatio || 1;
+      mctx.clearRect(0, 0, mini.width, mini.height);
+      mctx.imageSmoothingEnabled = false;
+      mctx.drawImage(base, 0, 0, mini.width, mini.height);
+      const ppm = mini.width / (m.W * m.cell); // pixels per metre
+      const px = (w.x - m.x0) * ppm, py = (w.z - m.z0) * ppm;
+      const len = 2.2 * ppm, half = 0.55;
+      mctx.fillStyle = '#5fe3f033';
+      mctx.beginPath();
+      mctx.moveTo(px, py);
+      mctx.lineTo(px + Math.sin(walk.yaw + half) * len, py + Math.cos(walk.yaw + half) * len);
+      mctx.lineTo(px + Math.sin(walk.yaw - half) * len, py + Math.cos(walk.yaw - half) * len);
+      mctx.closePath();
+      mctx.fill();
+      mctx.beginPath();
+      mctx.arc(px, py, Math.max(3.5 * dpr, w.radius * ppm), 0, Math.PI * 2);
+      mctx.fillStyle = walk.ghost ? '#ffffff' : '#5fe3f0';
+      mctx.fill();
+    }
+
+    mini.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      if (!walk.on) return;
+      const m = walk.map, r = mini.getBoundingClientRect();
+      const x = m.x0 + ((e.clientX - r.left) / r.width) * m.W * m.cell;
+      const z = m.z0 + ((e.clientY - r.top) / r.height) * m.H * m.cell;
+      const p = walk.walker.nearestFree(x, z, 1.2);
+      if (!p) return toast('You can’t stand there');
+      [walk.walker.x, walk.walker.z] = p;
+      if (walk.ghost) walk.y = m.floorY + m.eye;
+    });
+
+    // ------------------------------------------------------------------ input
+    function hookPointer(canvas) {
+      canvas.style.touchAction = 'none';
+      let drag = null;
+      canvas.addEventListener('pointerdown', (e) => {
+        if (!walk.on) return;
+        if (e.pointerType === 'touch') {
+          if (e.clientX < innerWidth * 0.45 && stick.id == null) {
+            Object.assign(stick, { id: e.pointerId, x0: e.clientX, y0: e.clientY, x: 0, y: 0 });
+            Object.assign($('stick').style, { display: 'block', left: e.clientX + 'px', top: e.clientY + 'px' });
+            $('knob').style.transform = '';
+          } else if (!drag) drag = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: 0, touch: true };
+        } else if (!document.pointerLockElement) {
+          drag = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: 0, touch: false };
+        }
+      });
+      canvas.addEventListener('pointermove', (e) => {
+        if (!walk.on) return;
+        if (e.pointerId === stick.id) {
+          let dx = e.clientX - stick.x0, dy = e.clientY - stick.y0;
+          const d = Math.hypot(dx, dy), R = 50;
+          if (d > R) [dx, dy] = [(dx / d) * R, (dy / d) * R];
+          stick.x = dx / R;
+          stick.y = -dy / R;
+          $('knob').style.transform = `translate(${dx}px, ${dy}px)`;
+        } else if (drag && e.pointerId === drag.id && !document.pointerLockElement) {
+          const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+          drag.moved += Math.abs(dx) + Math.abs(dy);
+          [drag.x, drag.y] = [e.clientX, e.clientY];
+          turn(dx, dy, drag.touch ? TOUCH_LOOK : LOOK);
+        }
+      });
+      const release = (e) => {
+        if (e.pointerId === stick.id) endStick();
+        if (drag && e.pointerId === drag.id) {
+          // A click (not a drag) with the mouse captures it for looking around.
+          if (!drag.touch && drag.moved < 6 && walk.on && canvas.requestPointerLock) {
+            try {
+              const p = canvas.requestPointerLock();
+              if (p && p.catch) p.catch(() => {});
+            } catch {}
+          }
+          drag = null;
+        }
+      };
+      canvas.addEventListener('pointerup', release);
+      canvas.addEventListener('pointercancel', release);
+    }
+
+    function endStick() {
+      Object.assign(stick, { id: null, x: 0, y: 0 });
+      $('stick').style.display = 'none';
+    }
+
+    document.addEventListener('mousemove', (e) => {
+      if (walk.on && document.pointerLockElement) turn(e.movementX, e.movementY);
+    });
+
+    const MOVE_KEYS = ['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+    addEventListener('keydown', (e) => {
+      if (!walk.on || e.ctrlKey || e.metaKey || e.altKey) return;
+      keys.add(e.code);
+      if (MOVE_KEYS.includes(e.code)) e.preventDefault();
+      if (e.repeat) return;
+      if (e.code === 'KeyG') setGhost(!walk.ghost);
+      if (e.code === 'KeyM') {
+        mini.classList.toggle('shown');
+        drawMini();
+      }
+    });
+    addEventListener('keyup', (e) => keys.delete(e.code));
+    addEventListener('blur', () => keys.clear());
+    addEventListener('resize', () => walk.map && (drawMiniBase(), drawMini()));
+
+    // ------------------------------------------------------------------ loop & buttons
+    let last = performance.now();
+    function frame(now) {
+      requestAnimationFrame(frame);
+      const dt = Math.min(0.2, Math.max(0, (now - last) / 1000)); // walker sub-steps, so slow frames stay solid
+      last = now;
+      if (!viewer) return;
+      if (walk.on) stepWalk(dt);
+      else if (orbit) orbit.update();
+    }
+    requestAnimationFrame(frame);
+
+    $('walk').onclick = () => (walk.on ? leaveWalk() : enterWalk());
+    $('flip').onclick = () => {
+      up = up.map((v) => -v);
+      walk.map = null;
+      load();
+      fetchMap();
+    };
+    $('home').onclick = () => {
+      if (!walk.on) return load();
+      const p = walk.walker.nearestFree(walk.map.start.x, walk.map.start.z);
+      if (p) [walk.walker.x, walk.walker.z] = p;
+      walk.yaw = walk.map.start.yaw;
+      walk.pitch = 0;
+    };
+    if (!ply) $('msg').textContent = 'No splat given (?ply=…).';
+    else {
+      load();
+      fetchMap(); // get the walk map ready in the background
+    }
   </script>
 </body>
 </html>

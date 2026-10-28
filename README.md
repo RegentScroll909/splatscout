@@ -186,6 +186,17 @@ format, works in SuperSplat, Postshot, Unity/Unreal plugins and the web viewers)
 quality, training stats, capture grade) and `thumb.jpg`. Click **View** for the built-in viewer, or **Edit in
 SuperSplat** to crop and clean floaters.
 
+**Walk through it.** In the viewer, press **🚶 Walk** to explore the splat in first person, at the height the phone
+was held. Use W A S D (or ↑ ↓, with ← → to turn), click the scene and move the mouse to look around, hold Shift to
+hurry, press G for ghost mode (fly through walls; G again lands you on the floor) and M to hide the mini-map; click
+the mini-map to jump somewhere. On a phone or tablet the left thumb walks and the right thumb looks. Walls,
+furniture and the edge of the scanned floor stop you, and you slide along them instead of sticking. SplatStation
+works this out from the splat itself: it finds the floor below where the phone went, treats solid splats between
+knee and head height as walls and furniture, and keeps you where it saw floor and inside the scan area. Plain
+white walls are often too faint to block on their own, but the scanned floor stops at them, so they hold you in
+too. The map is saved next to the splat (`scene.walk.json`) the first time it's needed. Splats from a video have
+no real-world size, so their walking height assumes the phone was held 1.5 m up.
+
 **What it needs:** an NVIDIA GPU, plus the following, all found automatically. Paths can be changed in
 `%USERPROFILE%\SplatStation\station.config.json`.
 - COLMAP 4.x with CUDA (`C:\Tools\COLMAP`).
@@ -196,14 +207,21 @@ SuperSplat** to crop and clean floaters.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (33 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (37 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
   walls, drift), hallway re-alignment (depth alone can't place you along it, the photos can), hallway paths
   kept off the walls when the outline is drawn around the door recesses, lined-up sessions sharing one map,
-  photos while walking, coaching priority/hysteresis, scoring, COLMAP/transforms export, ZIP validity and
-  splat cropping.
+  photos while walking, coaching priority/hysteresis, scoring, COLMAP/transforms export, ZIP validity,
+  splat cropping, and walk mode (floor, walls, a plain wall of big flat splats, a table, a doorway, floor holes,
+  floaters, sliding along walls, an upside-down splat of unknown size, COLMAP text and binary camera files).
+- **Walk mode** on three real hallway splats from the library (Memorial Union lobby and Ggg, Hayden Library):
+  the maps built in 0.1–0.3 s; walking straight out from the start in 36 directions never left the scanned
+  floor; following the phone's own path got blocked on 7 of 411 legs in the lobby (where the phone was held
+  out close to a wall) and on none in the other two. In the viewer: walking, mouse and touch look, the touch
+  stick, ghost mode and landing, jumping from the mini-map, and back to orbiting. Only checked at a few frames
+  per second in a preview window, not yet at full speed on the RTX 5080.
 - **Hallway re-alignment (2.2)** in the new Practice hallway (18 m, door recesses both sides, posters and
   numbered doors, planked floor and tiled ceiling) and the Practice room, with photo-taking paused so a bad
   result couldn't spoil the next. Continuing a scan in a new, turned and shifted session locked in 2–4 s
@@ -253,7 +271,8 @@ app/js/capture/   session engine, 3D overlay (+ guide geometry), minimap, audio
 app/js/data/      IndexedDB storage, settings, ZIP export
 app/js/ui/        screens
 tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs
-station/          SplatStation: station.mjs (server, queue, inbox), lib/ (zip, COLMAP, Brush, crop, video, adb), web/ (dashboard, viewer)
+station/          SplatStation: station.mjs (server, queue, inbox), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb),
+                  web/ (dashboard, viewer, walk.js: walk-mode collision shared with the self-checks)
 ```
 
 - `npm start`: local server on http://localhost:8080

@@ -7,7 +7,7 @@ import { Bounds } from '../../app/js/core/bounds.js';
 
 const SIZES = { char: 1, uchar: 1, int8: 1, uint8: 1, short: 2, ushort: 2, int16: 2, uint16: 2, int: 4, uint: 4, int32: 4, uint32: 4, float: 4, float32: 4, double: 8, float64: 8 };
 
-function readHeader(fd) {
+export function readHeader(fd) {
   const buf = Buffer.alloc(65536);
   const n = readSync(fd, buf, 0, buf.length, 0);
   const txt = buf.subarray(0, n).toString('latin1');

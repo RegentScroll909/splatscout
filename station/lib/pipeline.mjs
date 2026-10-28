@@ -9,6 +9,7 @@ import { trainBrush } from './trainer.mjs';
 import { selectFrames, extractFrames } from './video.mjs';
 import { run } from './run.mjs';
 import { cropPly } from './crop.mjs';
+import { walkInputs, walkMapFor } from './walkmap.mjs';
 import { PRESETS, saveConfig } from './config.mjs';
 
 export const STAGES = [
@@ -212,6 +213,12 @@ export async function processJob(job, ctx) {
     sizeMB: +(statSync(finalPly).size / 1048576).toFixed(1),
   };
   writeFileSync(join(lib, 'info.json'), JSON.stringify(info, null, 2));
+  // Map of where you can walk, so the viewer's walk mode opens straight away.
+  try {
+    await walkMapFor(finalPly, walkInputs({ jobDir: dir, mode: rec.mode, view }));
+  } catch (e) {
+    ctx.say('No walk map: ' + e.message);
+  }
   ctx.stage('finish', 1);
   return { ply: finalPly, folder: lib, thumb: existsSync(thumb) ? thumb : null, info, totalSec: Math.round((Date.now() - t0) / 1000) };
 }
