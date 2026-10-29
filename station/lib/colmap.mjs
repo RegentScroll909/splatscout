@@ -35,7 +35,7 @@ export async function viewHint(colmap, modelDir, tmpDir) {
   const up = [0, 0, 0];
   const center = [0, 0, 0];
   for (const c of cams) for (let k = 0; k < 3; k++) {
-    up[k] += c.up[k];
+    if (!c.name.startsWith('up/')) up[k] += c.up[k]; // a 360 frame's upward view is turned on its back
     center[k] += c.C[k] / cams.length;
   }
   const n = Math.hypot(...up) || 1;
@@ -72,6 +72,16 @@ export async function modelStats(colmap, modelDir) {
 }
 
 const isModel = (d) => existsSync(join(d, 'cameras.bin')) || existsSync(join(d, 'cameras.txt'));
+
+/** Photos in a folder, including one level of subfolders (the views cut from 360 video). */
+export function countImages(dir) {
+  let n = 0;
+  for (const f of readdirSync(dir, { withFileTypes: true })) {
+    if (f.isDirectory()) n += readdirSync(join(dir, f.name)).filter((x) => /\.(jpe?g|png)$/i.test(x)).length;
+    else if (/\.(jpe?g|png)$/i.test(f.name)) n++;
+  }
+  return n;
+}
 
 /** The sub-model with the most registered images in a mapper output folder. */
 export async function largestModel(colmap, dir) {
@@ -126,6 +136,8 @@ export function posePairs(frames, { temporal = 10, spatial = 25, maxAngleDeg = 7
  * @param {object|null} p.posed {modelDir, frames:[{name, pose}]} AR prior, or null
  * @param {Array|null} [p.align] [{name, pose}] AR poses: an SfM solve is moved into their frame
  * @param {string} p.matcher auto | exhaustive | sequential
+ * @param {object|null} [p.rig] views cut from 360 video: {config} COLMAP rig configuration; the
+ *   images sit in one folder per view, and p.camera holds the views' exact (PINHOLE) lens
  * @param {(stage:string, fraction:number, note?:string)=>void} p.progress
  * @param {(msg:string)=>void} p.say
  * @param {object} p.token cancellation token
@@ -133,11 +145,11 @@ export function posePairs(frames, { temporal = 10, spatial = 25, maxAngleDeg = 7
  * @returns {Promise<{modelDir, stats, mode}>}
  */
 export async function reconstruct(p) {
-  const { colmap, imagesDir, work, camera, posed, progress, say, token, log } = p;
+  const { colmap, imagesDir, work, camera, posed, rig, progress, say, token, log } = p;
   mkdirSync(work, { recursive: true });
   const db = join(work, 'database.db');
   if (existsSync(db)) rmSync(db);
-  const nImages = readdirSync(imagesDir).filter((f) => /\.(jpe?g|png)$/i.test(f)).length;
+  const nImages = countImages(imagesDir);
   if (nImages < 10) throw new Error(`Only ${nImages} images: at least 10 are needed (100+ recommended).`);
 
   // ---- 1. Features
@@ -145,7 +157,10 @@ export async function reconstruct(p) {
   say(`Extracting features from ${nImages} images (GPU)…`);
   const fx = ['feature_extractor', '--database_path', db, '--image_path', imagesDir,
     '--FeatureExtraction.use_gpu', '1', '--SiftExtraction.max_num_features', '8192'];
-  if (camera) {
+  if (rig) {
+    fx.push('--ImageReader.camera_model', camera.model, '--ImageReader.camera_params', camera.params,
+      '--ImageReader.single_camera_per_folder', '1');
+  } else if (camera) {
     fx.push('--ImageReader.camera_model', camera.model, '--ImageReader.single_camera', camera.single ? '1' : '0');
     if (camera.params) fx.push('--ImageReader.camera_params', camera.params);
   } else {
@@ -161,10 +176,17 @@ export async function reconstruct(p) {
     },
   });
 
+  if (rig) {
+    // Group the views of each 360 frame into one rig frame (same file name in every view folder).
+    const cfg = join(work, 'rig.json');
+    writeFileSync(cfg, JSON.stringify(rig.config, null, 2));
+    await run(colmap, ['rig_configurator', '--database_path', db, '--rig_config_path', cfg], { log, token });
+  }
+
   // ---- 2. Matching
   progress('matching', 0);
   let mode = p.matcher;
-  if (mode === 'auto') mode = nImages <= 700 ? 'exhaustive' : posed ? 'poses' : 'sequential';
+  if (mode === 'auto') mode = rig ? 'sequential' : nImages <= 700 ? 'exhaustive' : posed ? 'poses' : 'sequential';
   say(`Matching features (${mode === 'poses' ? 'pairs chosen from AR poses' : mode})…`);
   const onMatch = (l) => {
     // Exhaustive matching works in blocks: "Processing block [i/n, j/n]".
@@ -181,8 +203,10 @@ export async function reconstruct(p) {
     await run(colmap, ['matches_importer', '--database_path', db, '--match_list_path', pairsFile, '--match_type', 'pairs',
       '--FeatureMatching.use_gpu', '1'], { log, token, onLine: onMatch });
   } else {
+    // With a rig, each neighbouring frame brings all of its views along (expand_rig_images), so
+    // fewer neighbours cover the same ground.
     await run(colmap, ['sequential_matcher', '--database_path', db, '--FeatureMatching.use_gpu', '1',
-      '--SequentialMatching.overlap', '25', '--SequentialMatching.quadratic_overlap', '1'], { log, token, onLine: onMatch });
+      '--SequentialMatching.overlap', rig ? '8' : '25', '--SequentialMatching.quadratic_overlap', '1'], { log, token, onLine: onMatch });
   }
 
   // ---- 3. Cameras + points
@@ -267,7 +291,10 @@ async function unposedReconstruction(p, db, nImages) {
   mkdirSync(sfm, { recursive: true });
   say('Solving camera positions (COLMAP global mapper)…');
   progress('mapping', 0.05, 'structure-from-motion');
-  await run(colmap, ['global_mapper', '--database_path', db, '--image_path', imagesDir, '--output_path', sfm], {
+  // Views cut from 360 frames have an exact lens and a known turn between them: keep both fixed.
+  const fixed = p.rig ? ['--GlobalMapper.refine_sensor_from_rig', '0', '--GlobalMapper.ba_refine_focal_length', '0',
+    '--GlobalMapper.ba_refine_extra_params', '0'] : [];
+  await run(colmap, ['global_mapper', '--database_path', db, '--image_path', imagesDir, '--output_path', sfm, ...fixed], {
     log, token,
     onLine: (l) => {
       if (/rotation averaging/i.test(l)) progress('mapping', 0.25, 'rotation averaging');

@@ -50,7 +50,7 @@ There's also a **Practice room**: a virtual classroom that runs the full pipelin
 so club members can learn the technique before scanning a real building.
 
 The repo also contains **SplatStation** ([`station/`](station/)), the PC side. It turns SplatScout exports
-(or plain phone videos) into finished Gaussian splats on your NVIDIA GPU, with no Python and no cloud.
+(or plain phone videos and 360° videos) into finished Gaussian splats on your NVIDIA GPU, with no Python and no cloud.
 See [SplatStation](#splatstation-turn-captures-into-splats-on-your-pc) below.
 
 ---
@@ -141,7 +141,7 @@ finished Gaussian splats:
 
 ```
 SplatScout ZIP  ─┐                        ┌─ COLMAP 4 (GPU SIFT + matching)
-phone video     ─┼─► inbox / upload / USB ─┤   • AR poses → triangulate + bundle-adjust (fast, robust)
+phone/360 video ─┼─► inbox / upload / USB ─┤   • AR poses → triangulate + bundle-adjust (fast, robust)
                  │                        │   • no poses → global SfM, moved into the AR frame when the phone had poses
                  │                        └─ Brush (trains the splat on the GPU) ─► library/<Building>/<Room>/<date>/scene.ply
 ```
@@ -197,17 +197,33 @@ white walls are often too faint to block on their own, but the scanned floor sto
 too. The map is saved next to the splat (`scene.walk.json`) the first time it's needed. Splats from a video have
 no real-world size, so their walking height assumes the phone was held 1.5 m up.
 
+**360° video: the quickest capture.** A 360 camera (Insta360, Ricoh Theta, GoPro Max and the like) films every
+direction at once, so one slow walk through a room or down a hallway, a minute or two, can stand in for a guided
+SplatScout session. Export the clip from the camera's app as an ordinary 360° MP4 (equirectangular; the raw
+`.insv`/`.360` files aren't read) and drop it in like any video. SplatStation recognises it by its 2:1 frame or its
+360 tag, takes the sharpest frame from every half second (up to 160), and cuts each one into eight normal views
+around the horizon plus one straight up. None looks down, where you are. COLMAP then solves each frame's nine
+views together as one camera rig, and Brush trains on them like photos. To film:
+- Hold the camera on a stick above your head, so you're out of the side views.
+- Walk slowly and steadily, and keep the horizon level (FlowState or horizon lock on).
+- Walk a loop, or go there and back on the other side, so each wall is seen from several places.
+- Keep people out of the shot as far as you can.
+
+The catches, compared with SplatScout photos: each view has less detail (a 5.7K camera gives 1440-pixel views and
+an 8K one 1920), and there are no AR positions, so there's no scan-area crop and the splat's size is a guess. Walk
+mode assumes the camera was held 1.9 m up. Not yet tried with real 360 footage; see below.
+
 **What it needs:** an NVIDIA GPU, plus the following, all found automatically. Paths can be changed in
 `%USERPROFILE%\SplatStation\station.config.json`.
 - COLMAP 4.x with CUDA (`C:\Tools\COLMAP`).
 - Brush v0.3 (`C:\Tools\Brush\brush_app.exe`, from github.com/ArthurBrussee/brush releases).
-- ffmpeg (video input only).
+- ffmpeg (video and 360° video input only).
 - adb (USB import only).
 
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (37 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (38 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
@@ -215,7 +231,16 @@ Tested on this PC:
   kept off the walls when the outline is drawn around the door recesses, lined-up sessions sharing one map,
   photos while walking, coaching priority/hysteresis, scoring, COLMAP/transforms export, ZIP validity,
   splat cropping, and walk mode (floor, walls, a plain wall of big flat splats, a table, a doorway, floor holes,
-  floaters, sliding along walls, an upside-down splat of unknown size, COLMAP text and binary camera files).
+  floaters, sliding along walls, an upside-down splat of unknown size, COLMAP text and binary camera files), and the
+  360° camera rig (each cut view turned the way ffmpeg cuts it).
+- **360° video** on a rendered 62-second walk down the Practice hallway and back (1600×800, camera 1.9 m up):
+  125 frames picked, cut into 1,125 views in 3 s; COLMAP placed all 1,125 as a 9-view rig at 0.76 px error; the
+  Quick splat trained in 39 s, 3 min 10 s end to end. In the viewer it's an upright, recognisable hallway, and
+  walk mode found the floor 1.9 m down with walls and door recesses in place. This run also exposed two problems,
+  both fixed: Brush 0.3 can't load JPEGs under 16 KB (plain cut views can be that small, so they're padded), and
+  walk mode's floor finder used to count splats, so a band of detailed posters outweighed a plain floor (it now
+  weighs level surface area). Not yet tried with real 360 footage, which will be noisier, with people and
+  exposure changes.
 - **Walk mode** on three real hallway splats from the library (Memorial Union lobby and Ggg, Hayden Library):
   the maps built in 0.1–0.3 s; walking straight out from the start in 36 directions never left the scanned
   floor; following the phone's own path got blocked on 7 of 411 legs in the lobby (where the phone was held

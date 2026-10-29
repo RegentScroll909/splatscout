@@ -361,7 +361,8 @@ const server = createServer(async (req, res) => {
       }
       if (!file || !/\.ply$/i.test(file) || !existsSync(file)) return sendJson(res, { error: 'Splat not found' }, 404);
       const mode = (info && info.colmap && info.colmap.mode) || (job && job.colmap && job.colmap.mode) || null;
-      const inputs = walkInputs({ jobDir: job && job.dir, mode, view: info && info.view, up: up.length === 3 && up.every(Number.isFinite) ? up : null });
+      const pano = !!((info && info.pano) || (job && job.pano));
+      const inputs = walkInputs({ jobDir: job && job.dir, mode, view: info && info.view, up: up.length === 3 && up.every(Number.isFinite) ? up : null, pano });
       try {
         return sendJson(res, await walkMapFor(file, inputs));
       } catch (e) {

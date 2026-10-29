@@ -807,4 +807,29 @@ test('station reads camera centres from COLMAP text and binary models alike', ()
   }
 });
 
+const { rigConfig, VIEWS_360, isEquirect, viewSize } = await import('../station/lib/video.mjs');
+test('360 video: views cut from each frame make a rig that turns the right way', () => {
+  assert.ok(isEquirect({ width: 5760, height: 2880 }) && isEquirect({ width: 1600, height: 800, spherical: false }));
+  assert.ok(!isEquirect({ width: 1920, height: 1080 }) && !isEquirect({ width: 1080, height: 1920 }));
+  assert.ok(isEquirect({ width: 1920, height: 1080, spherical: true }), 'tagged as spherical');
+  assert.equal(viewSize({ width: 5760 }), 1440);
+  assert.equal(viewSize({ width: 7680 }), 1920);
+  const cams = rigConfig()[0].cameras;
+  assert.equal(cams.length, VIEWS_360.length);
+  assert.ok(cams[0].ref_sensor && !VIEWS_360.some((v) => v.pitch < 0), 'reference view; nothing looks down at the holder');
+  cams.slice(1).forEach((c, i) => {
+    const v = VIEWS_360[i + 1];
+    const [w, x, y, z] = c.cam_from_rig_rotation;
+    assert.ok(Math.abs(Math.hypot(w, x, y, z) - 1) < 1e-6, `${v.name} unit quaternion`);
+    // The view's forward axis (its third row of cam_from_rig) in reference-view coordinates, which
+    // look along +z with y down: ffmpeg's v360 turns right for +yaw and up for +pitch.
+    const fwd = [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)];
+    const a = (v.yaw * Math.PI) / 180, b = (v.pitch * Math.PI) / 180;
+    near(fwd, [Math.sin(a) * Math.cos(b), -Math.sin(b), Math.cos(a) * Math.cos(b)], 1e-6, `${v.name} forward`);
+    // Right stays level for the horizon views.
+    if (!v.pitch) near([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], [Math.cos(a), 0, -Math.sin(a)], 1e-6, `${v.name} right`);
+    assert.deepEqual(c.cam_from_rig_translation, [0, 0, 0]);
+  });
+});
+
 console.log(`\n${passed} checks passed`);

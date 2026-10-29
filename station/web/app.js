@@ -223,7 +223,7 @@ function title(j) {
 function summary(j) {
   const s = j.summary;
   const bits = [];
-  if (j.source.kind === 'video') bits.push('Video', fmtMB(j.source.size));
+  if (j.source.kind === 'video') bits.push(j.pano ? '360° video' : 'Video', fmtMB(j.source.size));
   else if (s) {
     bits.push(`${s.photos} photos`);
     if (s.posed) bits.push(`${s.posed} with AR positions`);
@@ -282,7 +282,7 @@ function queueCard(j, i) {
   return h('div', { class: 'job' + (active ? ' running' : '') },
     h('div', { class: 'job-head' }, title(j),
       h('span', { class: 'badge ' + j.status }, active ? `${pct}%` : `#${i + (queueHasRunning() ? 0 : 1)} in queue`)),
-    h('div', { class: 'meta' }, h('span', {}, `${presetName(j.preset)}${j.nImages ? ` · ${j.nImages} photos` : j.summary ? ` · ${j.summary.photos} photos` : ''}${elapsed ? ` · ${fmtDur(elapsed)}` : ''}`)),
+    h('div', { class: 'meta' }, h('span', {}, `${presetName(j.preset)}${j.nImages ? ` · ${j.nImages} ${j.pano ? 'views' : 'photos'}` : j.summary ? ` · ${j.summary.photos} photos` : ''}${elapsed ? ` · ${fmtDur(elapsed)}` : ''}`)),
     active ? stages(j) : null,
     active ? h('div', { class: 'note mono' }, stageNote || '') : null,
     active && j.messages && j.messages.length ? h('ul', { class: 'msgs' }, j.messages.slice(-3).map((m) => h('li', {}, m.text))) : null,

@@ -1,12 +1,12 @@
 // One job = one capture → one splat. Stages: import → features → matching → mapping →
 // (undistort) → train → finish. Progress and messages go through `ctx.update`.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, copyFileSync, symlinkSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, copyFileSync, cpSync, symlinkSync, rmSync, statSync } from 'node:fs';
 import { join, basename, extname } from 'node:path';
 import { extractZip } from './zipread.mjs';
-import { reconstruct, viewHint } from './colmap.mjs';
+import { reconstruct, viewHint, countImages } from './colmap.mjs';
 import { trainBrush } from './trainer.mjs';
-import { selectFrames, extractFrames } from './video.mjs';
+import { selectFrames, extractFrames, probeVideo, isEquirect, extract360, viewSize, rigConfig, VIEWS_360 } from './video.mjs';
 import { run } from './run.mjs';
 import { cropPly } from './crop.mjs';
 import { walkInputs, walkMapFor } from './walkmap.mjs';
@@ -23,6 +23,7 @@ export const STAGES = [
 ];
 
 const VIDEO = /\.(mp4|mov|m4v|mkv|webm|avi)$/i;
+const MAX_360_FRAMES = 160; // × 9 views each
 
 export function sourceKind(file) {
   if (/\.zip$/i.test(file)) return 'zip';
@@ -49,6 +50,8 @@ export async function processJob(job, ctx) {
   // ---------------------------------------------------------------- import
   ctx.stage('import', 0);
   let manifest = null;
+  let camera = null;
+  let rig = null; // views cut from 360 video, solved together per frame
   if (job.source.kind === 'zip') {
     ctx.say('Unpacking capture…');
     if (existsSync(dataset)) rmSync(dataset, { recursive: true, force: true });
@@ -63,15 +66,27 @@ export async function processJob(job, ctx) {
     }
   } else if (job.source.kind === 'video') {
     if (!T.ffmpeg || !T.ffprobe) throw new Error('ffmpeg/ffprobe are needed for video input.');
-    ctx.say('Analysing video for sharp, well-spaced frames…');
-    const sel = await selectFrames({ ffmpeg: T.ffmpeg, ffprobe: T.ffprobe, file: job.source.file, maxFrames: 450,
-      progress: (f) => ctx.stage('import', f * 0.6), token, log });
-    ctx.say(`Selected ${sel.selected.length} of ${sel.total} frames${sel.info.hdr ? ' (HDR video tone-mapped)' : ''}. Extracting…`);
+    const pano = isEquirect(await probeVideo(T.ffprobe, job.source.file));
+    ctx.update({ pano });
+    ctx.say(pano ? 'Analysing 360° video for sharp frames…' : 'Analysing video for sharp, well-spaced frames…');
+    const sel = await selectFrames({ ffmpeg: T.ffmpeg, ffprobe: T.ffprobe, file: job.source.file, maxFrames: pano ? MAX_360_FRAMES : 450,
+      every: pano ? 0.5 : 0, progress: (f) => ctx.stage('import', f * 0.6), token, log });
     if (existsSync(dataset)) rmSync(dataset, { recursive: true, force: true });
-    await extractFrames({ ffmpeg: T.ffmpeg, file: job.source.file, frames: sel.selected, info: sel.info, outDir: imagesDir, token, log });
+    const hdr = sel.info.hdr ? ' (HDR video tone-mapped)' : '';
+    if (pano) {
+      const size = viewSize(sel.info);
+      ctx.say(`360° video: selected ${sel.selected.length} of ${sel.total} frames${hdr}. Cutting each into ${VIEWS_360.length} views of ${size}×${size} px…`);
+      await extract360({ ffmpeg: T.ffmpeg, file: job.source.file, frames: sel.selected, info: sel.info, outDir: imagesDir, size, token, log });
+      const f = (size / 2).toFixed(4); // 90° view: focal length is half the width
+      camera = { model: 'PINHOLE', params: [f, f, f, f].join(','), single: false };
+      rig = { config: rigConfig(VIEWS_360) };
+    } else {
+      ctx.say(`Selected ${sel.selected.length} of ${sel.total} frames${hdr}. Extracting…`);
+      await extractFrames({ ffmpeg: T.ffmpeg, file: job.source.file, frames: sel.selected, info: sel.info, outDir: imagesDir, token, log });
+    }
   }
   const photos = job.imagesDirOverride || imagesDir;
-  const nImages = readdirSync(photos).filter((f) => /\.(jpe?g|png)$/i.test(f)).length;
+  const nImages = countImages(photos);
   if (manifest) {
     const c = manifest.capture || {};
     ctx.update({
@@ -84,7 +99,6 @@ export async function processJob(job, ctx) {
   ctx.stage('import', 1, `${nImages} photos`);
 
   // ---------------------------------------------------------------- camera hint & AR poses
-  let camera = null;
   let posed = null;
   let arFrames = null; // AR camera poses, also used to put an SfM solve into the AR frame
   if (manifest && manifest.frames && manifest.frames.length) {
@@ -121,6 +135,7 @@ export async function processJob(job, ctx) {
     work: join(dir, 'colmap'),
     camera,
     posed,
+    rig,
     align: arFrames,
     matcher: cfg.matcher || 'auto',
     progress: (stage, f, note) => ctx.stage(stage, f, note),
@@ -139,8 +154,7 @@ export async function processJob(job, ctx) {
   try {
     symlinkSync(rec.imagesDir, join(train, 'images'), 'junction');
   } catch {
-    mkdirSync(join(train, 'images'), { recursive: true });
-    for (const f of readdirSync(rec.imagesDir)) copyFileSync(join(rec.imagesDir, f), join(train, 'images', f));
+    cpSync(rec.imagesDir, join(train, 'images'), { recursive: true });
   }
   for (const f of readdirSync(rec.modelDir)) {
     if (/\.(bin|txt)$/.test(f)) copyFileSync(join(rec.modelDir, f), join(train, 'sparse', '0', f));
@@ -209,13 +223,13 @@ export async function processJob(job, ctx) {
     photos: nImages, placed: rec.stats.images, colmap: { ...rec.stats, mode: rec.mode },
     training: { preset: job.preset || cfg.preset, steps: tr.iter, seconds: Math.round(tr.seconds), splats: crop ? crop.kept : tr.splats },
     crop: crop ? { removed: crop.removed, uncropped: tr.ply } : null,
-    capture: job.capture || null, source: basename(job.source.file),
+    capture: job.capture || null, source: basename(job.source.file), pano: !!job.pano,
     sizeMB: +(statSync(finalPly).size / 1048576).toFixed(1),
   };
   writeFileSync(join(lib, 'info.json'), JSON.stringify(info, null, 2));
   // Map of where you can walk, so the viewer's walk mode opens straight away.
   try {
-    await walkMapFor(finalPly, walkInputs({ jobDir: dir, mode: rec.mode, view }));
+    await walkMapFor(finalPly, walkInputs({ jobDir: dir, mode: rec.mode, view, pano: !!job.pano }));
   } catch (e) {
     ctx.say('No walk map: ' + e.message);
   }
@@ -240,7 +254,10 @@ function findImageFolder(root) {
 
 function pickThumb(dir) {
   const files = readdirSync(dir).filter((f) => /\.(jpe?g|png)$/i.test(f)).sort();
-  return files.length ? join(dir, files[Math.floor(files.length / 2)]) : null;
+  if (files.length) return join(dir, files[Math.floor(files.length / 2)]);
+  // Views cut from 360 video: the forward-looking folder.
+  const sub = readdirSync(dir, { withFileTypes: true }).filter((f) => f.isDirectory()).map((f) => f.name).sort()[0];
+  return sub ? pickThumb(join(dir, sub)) : null;
 }
 
 const safe = (s) => (s || 'Unknown').replace(/[<>:"/\\|?*\x00-\x1f]+/g, '_').trim().slice(0, 60) || 'Unknown';

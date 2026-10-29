@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { readHeader } from './crop.mjs';
 import { NOTHING, FLOOR, BLOCK, encodeCells } from '../web/walk.js';
 
-export const WALKMAP_VERSION = 1;
+export const WALKMAP_VERSION = 2;
 
 const MIN_OPACITY = 0.15; // fainter splats are haze, not surfaces
 const MAX_SIGMA = 1.0; // metres; bigger blobs are background fill
@@ -92,6 +92,7 @@ async function readSplats(plyFile, R) {
       if (!(p in off)) throw new Error(`The splat has no ${p} values`);
     }
     const P = new Float32Array(count * 3), A = new Float32Array(count), S = new Float32Array(count * 3), Q = new Float32Array(count * 4);
+    const L = new Float32Array(count);
     const per = Math.max(1, Math.floor((8 << 20) / stride));
     const chunk = Buffer.alloc(per * stride);
     let n = 0;
@@ -109,17 +110,42 @@ async function readSplats(plyFile, R) {
         A[n] = a;
         for (let k = 0; k < 3; k++) S[n * 3 + k] = Math.exp(chunk.readFloatLE(o + off['scale_' + k]));
         for (let k = 0; k < 4; k++) Q[n * 4 + k] = chunk.readFloatLE(o + off['rot_' + k]);
+        L[n] = levelArea(S, Q, n, R) * a;
         n++;
       }
       await new Promise((r) => setImmediate(r)); // keep the station responsive on big splats
     }
-    return { n, P, A, S, Q, total: count };
+    // A few huge flat splats shouldn't outweigh a whole floor.
+    const cap = n ? percentile(L.subarray(0, n), 1, 0, 0.99) : 0;
+    for (let i = 0; i < n; i++) L[i] = Math.min(L[i], cap);
+    return { n, P, A, S, Q, L, total: count };
   } finally {
     closeSync(fd);
   }
 }
 
-/** Height (walk frame) of the densest horizontal layer between lo and hi, near the phone's path. */
+/**
+ * How much level surface a splat stands for: the area of its flat side, times how level that side
+ * is (its thinnest axis pointing up) and how flat the splat is. Counting splats instead would let
+ * a band of detailed posters outweigh a plain floor, which training covers with fewer, bigger splats.
+ */
+function levelArea(S, Q, n, R) {
+  const s = [S[n * 3], S[n * 3 + 1], S[n * 3 + 2]];
+  const m = s[0] <= s[1] && s[0] <= s[2] ? 0 : s[1] <= s[2] ? 1 : 2; // thinnest axis
+  const [lo, mid, hi] = [...s].sort((a, b) => a - b);
+  let w = Q[n * 4], x = Q[n * 4 + 1], y = Q[n * 4 + 2], z = Q[n * 4 + 3];
+  const qn = Math.hypot(w, x, y, z) || 1;
+  [w, x, y, z] = [w / qn, x / qn, y / qn, z / qn];
+  const col = [
+    [1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w)],
+    [2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w)],
+    [2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)],
+  ][m]; // column m of the splat's rotation
+  const up = R[3] * col[0] + R[4] * col[1] + R[5] * col[2];
+  return up * up * (1 - lo / mid) * mid * hi;
+}
+
+/** Height (walk frame) of the layer with the most level surface between lo and hi, near the path. */
 function densestLayer(sp, lo, hi, bin, near) {
   const nb = Math.max(3, Math.ceil((hi - lo) / bin));
   const h = new Float64Array(nb);
@@ -127,8 +153,8 @@ function densestLayer(sp, lo, hi, bin, near) {
   for (let i = 0; i < sp.n; i++) {
     const y = sp.P[i * 3 + 1];
     if (y < lo || y >= hi || !near(sp.P[i * 3], sp.P[i * 3 + 2])) continue;
-    h[Math.floor((y - lo) / bin)] += sp.A[i];
-    total += sp.A[i];
+    h[Math.floor((y - lo) / bin)] += sp.L[i];
+    total += sp.L[i];
   }
   let best = -1, bw = 0;
   for (let b = 0; b < nb; b++) {
@@ -136,14 +162,14 @@ function densestLayer(sp, lo, hi, bin, near) {
     if (w > bw) [best, bw] = [b, w];
   }
   if (best < 0) return null;
-  // Refine to the opacity-weighted mean height around the peak.
+  // Refine to the weighted mean height around the peak.
   const c = lo + (best + 0.5) * bin;
   let sw = 0, sy = 0;
   for (let i = 0; i < sp.n; i++) {
     const y = sp.P[i * 3 + 1];
     if (Math.abs(y - c) > bin * 2.5 || !near(sp.P[i * 3], sp.P[i * 3 + 2])) continue;
-    sw += sp.A[i];
-    sy += sp.A[i] * y;
+    sw += sp.L[i];
+    sy += sp.L[i] * y;
   }
   return { y: sw ? sy / sw : c, share: total ? bw / 4 / total : 0 };
 }
@@ -184,8 +210,9 @@ function distToPoly(poly, x, z) {
  * @param {number[]} [o.up] splat-space up direction
  * @param {boolean} [o.metric] splat is in metres (AR frame); otherwise the scale is estimated
  * @param {number[][]} [o.poly] scan-area outline [[x, z], …] (AR frame only)
+ * @param {number} [o.camHeight] when not metric: how high the camera was held, which sets the scale
  */
-export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric = true, poly = null } = {}) {
+export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric = true, poly = null, camHeight = 1.5 } = {}) {
   if (!cams.length) throw new Error('No camera path to find the floor from');
   const R = upRotation(up);
   const sp = await readSplats(plyFile, R);
@@ -197,8 +224,8 @@ export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric 
   }
   let camY = median(C.map((c) => c.C[1]));
 
-  // Unknown scale (a video): take the densest layer below the phone as the floor and assume the
-  // phone was held 1.5 m above it.
+  // Unknown scale (a video): take the densest layer below the camera as the floor and assume the
+  // camera was held camHeight above it.
   let k = 1;
   if (!metric) {
     const pad = Math.max(bx1 - bx0, bz1 - bz0) * 0.25;
@@ -206,7 +233,7 @@ export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric 
     const span = camY - percentile(sp.P, 3, 1, 0.01);
     const f = span > 0 && densestLayer(sp, camY - span * 1.15, camY - span * 0.15, span / 300, near);
     if (!f) throw new Error('Could not find a floor below the camera path');
-    k = 1.5 / (camY - f.y);
+    k = camHeight / (camY - f.y);
     for (let i = 0; i < sp.n * 3; i++) {
       sp.P[i] *= k;
       sp.S[i] *= k;
@@ -365,9 +392,10 @@ export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric 
 /**
  * What a walk map needs for one splat: the phone's path, up direction, scale and scan outline,
  * from the job folder when it still exists (else just the viewer's start view).
- * @param {object} o {jobDir, mode, view, up} — `up` is the viewer's current up (it can be flipped)
+ * @param {object} o {jobDir, mode, view, up, pano} — `up` is the viewer's current up (it can be
+ *   flipped); `pano` marks 360 video, filmed with the camera on a stick above head height
  */
-export function walkInputs({ jobDir = null, mode = null, view = null, up = null }) {
+export function walkInputs({ jobDir = null, mode = null, view = null, up = null, pano = false }) {
   const ar = /^(ar-poses|sfm-ar)$/.test(mode || '');
   let cams = [];
   for (const d of jobDir ? [join(jobDir, 'colmap', 'final_txt'), join(jobDir, 'train', 'sparse', '0')] : []) {
@@ -390,7 +418,7 @@ export function walkInputs({ jobDir = null, mode = null, view = null, up = null 
   let u = up || (view && view.up) || [0, 1, 0];
   // AR splats are exactly y-up (unless someone flipped the viewer).
   if (ar) u = u[1] < 0 ? [0, -1, 0] : [0, 1, 0];
-  return { cams, up: u, metric: ar, poly };
+  return { cams, up: u, metric: ar, poly, camHeight: pano ? 1.9 : 1.5 };
 }
 
 const building = new Map();
