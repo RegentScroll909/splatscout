@@ -279,6 +279,13 @@ export async function reconstruct(p) {
   return { modelDir: result.modelDir, imagesDir, stats: result.stats, mode: result.mode, undistorted: false };
 }
 
+// Refining AR poses. Above 1,000 photos COLMAP switches Ceres to an iterative solver: on a 1,052-photo
+// capture it took 8 min a pass, kept failing to find a step and never settled. The direct sparse solver
+// copes with a few thousand photos and did the same pass in 5 min. Ceres also never stops early unless
+// told to, so it stops once a step improves the error by less than one part in a million.
+const BA_ARGS = ['--BundleAdjustment.refine_principal_point', '0',
+  '--BundleAdjustmentCeres.max_num_images_direct_sparse_cpu_solver', '4000', '--BundleAdjustmentCeres.function_tolerance', '1e-6'];
+
 async function posedReconstruction(p, db, nImages) {
   const { colmap, imagesDir, work, posed, progress, say, token, log } = p;
   say(`Triangulating with ${posed.frames.length} AR camera poses…`);
@@ -288,13 +295,23 @@ async function posedReconstruction(p, db, nImages) {
     if (existsSync(d)) rmSync(d, { recursive: true, force: true });
     mkdirSync(d, { recursive: true });
   }
+  // Bundle adjustment prints nothing until it's done, which takes minutes on a big capture: keep
+  // the stage note ticking so a working step doesn't look stuck.
+  const step = async (frac, note, args) => {
+    const t0 = Date.now();
+    progress('mapping', frac, note);
+    const tick = setInterval(() => progress('mapping', frac, `${note} · ${Math.floor((Date.now() - t0) / 60000)} min`), 15000);
+    try {
+      await run(colmap, args, { log, token });
+    } finally {
+      clearInterval(tick);
+    }
+  };
   try {
     await run(colmap, ['point_triangulator', '--database_path', db, '--image_path', imagesDir, '--input_path', posed.modelDir,
       '--output_path', tri1, '--clear_points', '1', '--refine_intrinsics', '0'], { log, token });
-    progress('mapping', 0.3, 'refining poses');
-    say('Refining the AR poses (bundle adjustment)…');
-    await run(colmap, ['bundle_adjuster', '--input_path', tri1, '--output_path', ba1,
-      '--BundleAdjustment.refine_principal_point', '0'], { log, token });
+    say(`Refining the AR poses (bundle adjustment)…${nImages > 600 ? ` ${nImages} photos: this takes a few minutes.` : ''}`);
+    await step(0.3, 'refining poses', ['bundle_adjuster', '--input_path', tri1, '--output_path', ba1, ...BA_ARGS]);
     progress('mapping', 0.55, 're-triangulating');
     await run(colmap, ['point_triangulator', '--database_path', db, '--image_path', imagesDir, '--input_path', ba1,
       '--output_path', tri2, '--clear_points', '1', '--refine_intrinsics', '0'], { log, token });
@@ -306,12 +323,10 @@ async function posedReconstruction(p, db, nImages) {
       await run(colmap, ['image_registrator', '--database_path', db, '--input_path', tri2, '--output_path', reg], { log, token });
       model = reg;
     }
-    progress('mapping', 0.85, 'final refinement');
     const fin = join(work, 'posed_final');
     if (existsSync(fin)) rmSync(fin, { recursive: true, force: true });
     mkdirSync(fin, { recursive: true });
-    await run(colmap, ['bundle_adjuster', '--input_path', model, '--output_path', fin,
-      '--BundleAdjustment.refine_principal_point', '0'], { log, token });
+    await step(0.85, 'final refinement', ['bundle_adjuster', '--input_path', model, '--output_path', fin, ...BA_ARGS]);
     const stats = await modelStats(colmap, fin);
     say(`AR-pose model: ${stats.images}/${nImages} photos, ${stats.points} points, ${stats.reprojError.toFixed(2)} px error.`);
     progress('mapping', 1);
