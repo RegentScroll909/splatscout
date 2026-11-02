@@ -26,8 +26,8 @@ const SECTIONS = [
 <li><b>Mark the scan area.</b> When AR starts, aim the centre cross at the floor in each corner of the space and tap <b>Corner</b> (or tap the spot on screen). Tap <b>Done</b>. Only surfaces inside the outline count, so you can capture half a hallway, or leave out what you can see through a window. A rough rectangle is fine: in a hallway with door recesses, mark it out to the back of the recesses. Corners can sit inside a wall: the path keeps clear of the walls the phone finds, and spots behind a wall drop out.</li>
 <li><b>Follow the arrow.</b> Each pass draws a trail on the floor. The arrow under the centre cross gives one instruction at a time: <b>walk</b> to the path, <b>turn</b> or <b>tilt</b> the phone ("Turn right 40°", "Tilt up 20°", "Turn around"), then <b>sidestep</b> along it. The ring shows exactly where to aim. The trail fills in on the map as you go, and the next pass starts by itself.</li>
 <li><b>Keep walking.</b> Photos are taken automatically while you move at a slow, steady pace. You don't need to stop. If you see "A little slower", ease off a bit.</li>
-<li><b>Fill the gaps.</b> The last pass sends you to the spots that still need angles: walk to the ring on the floor, aim at the red area inside the blue ring, and hold for a second. Repeat until the app says the area is complete (about <b>85%</b>).</li>
-<li><b>Skip what you can't capture.</b> Tap <b>Skip</b> (left), then tap a window, mirror or a corner you can't reach. It stops counting. Can't reach a spot the path wants? A <b>Skip this spot</b> button appears after a few seconds, and spots that can't be reached are skipped by themselves after about 15 seconds. You never have to shuffle back and forth: the guide only points ahead of you.</li>
+<li><b>Fill the gaps.</b> The last pass sends you to the spots that still need angles: walk to the ring on the floor, aim at the red area inside the blue ring at the height you're holding the phone, and hold for a second. It works its way along in one direction rather than sending you back and forth, and says it's done at about <b>93%</b>. Keep going if you like, or tap Done.</li>
+<li><b>Skip what you can't capture.</b> Tap <b>Skip</b> (left), then tap a window, mirror or a corner you can't reach. It stops counting. Can't reach a spot the path wants? A <b>Skip this spot</b> button appears after a few seconds, and spots that can't be reached are skipped by themselves after about 15 seconds. A skipped spot doesn't come back, and neither does the patch next to it. You never have to shuffle back and forth: the guide only points ahead of you.</li>
 </ol>
 <p class="small muted">Every dot doesn't have to be green. Corners behind furniture and the tops of tall cabinets rarely matter. The area percentage weighs green fully and amber half, and 85% trains well.</p>`,
   },
@@ -101,7 +101,7 @@ const SECTIONS = [
     title: 'Tricky surfaces',
     body: `
 <ul>
-<li><b>Blank walls.</b> Nothing to match. Keep edges, trim, outlets or furniture in every frame. Step back rather than pointing at a plain wall from close up.</li>
+<li><b>Blank walls.</b> Nothing to match, and the phone's tracking has nothing to hold on to either. Keep edges, trim, outlets or furniture in every frame, step back rather than pointing at a plain wall from close up, and turn slowly there: fast turns in front of a plain wall are the usual way tracking gets lost. The coach asks for slower turns when the view is plain, says "Tracking is slipping" before it's lost, and holds photos until it steadies.</li>
 <li><b>Glass, mirrors, glossy floors, screens.</b> Splats can't fully represent reflections. Capture them at angles from several positions, and turn monitors off.</li>
 <li><b>Thin things</b> (railings, chair legs, plants) need many close, overlapping views from all around.</li>
 <li><b>Dark corners and under tables</b>: low pass, tilted up and in.</li>

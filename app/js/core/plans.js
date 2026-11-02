@@ -274,4 +274,5 @@ export const PREFLIGHT = [
   { id: 'doors', text: 'Doors and chairs set how you want them archived. Don\'t move anything mid-capture.' },
   { id: 'battery', text: 'Battery over 40% and at least 2 GB free.' },
   { id: 'orientation', text: 'Hold the phone sideways (landscape) and keep it that way. It sees twice as wide, so the scan finishes much faster.' },
+  { id: 'plain', text: 'Plain walls: turn slowly near them and keep a door, corner or the floor\'s edge in view, or tracking can slip.' },
 ];

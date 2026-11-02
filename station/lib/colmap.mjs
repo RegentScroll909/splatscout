@@ -128,6 +128,31 @@ export function posePairs(frames, { temporal = 10, spatial = 25, maxAngleDeg = 7
 }
 
 /**
+ * Pairs to match when merging captures from several phones: each capture with itself (photos
+ * close in time, plus pairs from its AR poses), and each capture against the others through an
+ * evenly thinned set of photos. Their coordinates are unrelated, so poses can't say which overlap.
+ * @param {Array<{names: string[], frames?: Array<{name, pose}>}>} parts image names as COLMAP knows them
+ */
+export function mergePairs(parts, across = parts.length > 2 ? 80 : 120) {
+  const set = new Set();
+  const add = (a, b) => {
+    if (a !== b) set.add(a < b ? `${a} ${b}` : `${b} ${a}`);
+  };
+  for (const part of parts) {
+    const n = part.names;
+    for (let i = 0; i < n.length; i++) for (const k of [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32]) if (i + k < n.length) add(n[i], n[i + k]);
+    if (part.frames && part.frames.length >= 10) for (const l of posePairs(part.frames)) add(...l.split(' '));
+  }
+  const thin = parts.map((part) => {
+    const n = part.names, step = Math.max(1, n.length / across), out = [];
+    for (let x = 0; x < n.length; x += step) out.push(n[Math.floor(x)]);
+    return out;
+  });
+  for (let i = 0; i < parts.length; i++) for (let j = i + 1; j < parts.length; j++) for (const a of thin[i]) for (const b of thin[j]) add(a, b);
+  return [...set];
+}
+
+/**
  * @param {object} p
  * @param {string} p.colmap path to colmap.exe
  * @param {string} p.imagesDir folder with the photos
@@ -138,6 +163,7 @@ export function posePairs(frames, { temporal = 10, spatial = 25, maxAngleDeg = 7
  * @param {string} p.matcher auto | exhaustive | sequential
  * @param {object|null} [p.rig] views cut from 360 video: {config} COLMAP rig configuration; the
  *   images sit in one folder per view, and p.camera holds the views' exact (PINHOLE) lens
+ * @param {Array|null} [p.parts] captures being merged: [{names, camera, frames?}], one folder each
  * @param {(stage:string, fraction:number, note?:string)=>void} p.progress
  * @param {(msg:string)=>void} p.say
  * @param {object} p.token cancellation token
@@ -155,26 +181,39 @@ export async function reconstruct(p) {
   // ---- 1. Features
   progress('features', 0, `${nImages} images`);
   say(`Extracting features from ${nImages} images (GPU)…`);
-  const fx = ['feature_extractor', '--database_path', db, '--image_path', imagesDir,
-    '--FeatureExtraction.use_gpu', '1', '--SiftExtraction.max_num_features', '8192'];
-  if (rig) {
-    fx.push('--ImageReader.camera_model', camera.model, '--ImageReader.camera_params', camera.params,
-      '--ImageReader.single_camera_per_folder', '1');
-  } else if (camera) {
-    fx.push('--ImageReader.camera_model', camera.model, '--ImageReader.single_camera', camera.single ? '1' : '0');
-    if (camera.params) fx.push('--ImageReader.camera_params', camera.params);
-  } else {
-    fx.push('--ImageReader.camera_model', 'SIMPLE_RADIAL', '--ImageReader.single_camera', '1');
-  }
+  const cameraArgs = (cam) => {
+    if (!cam) return ['--ImageReader.camera_model', 'SIMPLE_RADIAL', '--ImageReader.single_camera', '1'];
+    const a = ['--ImageReader.camera_model', cam.model, '--ImageReader.single_camera', cam.single ? '1' : '0'];
+    return cam.params ? a.concat('--ImageReader.camera_params', cam.params) : a;
+  };
+  // Merged captures: one run per phone, each with its own lens.
+  const runs = p.parts
+    ? p.parts.map((part, i) => {
+      const list = join(work, `images_${i + 1}.txt`);
+      writeFileSync(list, part.names.join('\n') + '\n');
+      return { args: ['--image_list_path', list, ...cameraArgs(part.camera)], n: part.names.length };
+    })
+    : [{
+      args: rig
+        ? ['--ImageReader.camera_model', camera.model, '--ImageReader.camera_params', camera.params, '--ImageReader.single_camera_per_folder', '1']
+        : cameraArgs(camera),
+      n: nImages,
+    }];
   let done = 0;
-  await run(colmap, fx, {
-    log, token,
-    onLine: (l) => {
-      const m = /Processed file \[(\d+)\/(\d+)\]/.exec(l);
-      if (m) progress('features', +m[1] / +m[2]);
-      else if (/Processed file/.test(l)) progress('features', Math.min(0.99, ++done / nImages));
-    },
-  });
+  for (const r of runs) {
+    const before = done;
+    await run(colmap, ['feature_extractor', '--database_path', db, '--image_path', imagesDir,
+      '--FeatureExtraction.use_gpu', '1', '--SiftExtraction.max_num_features', '8192', ...r.args], {
+      log, token,
+      onLine: (l) => {
+        const m = /Processed file \[(\d+)\/(\d+)\]/.exec(l);
+        if (m) done = before + (+m[1] / +m[2]) * r.n;
+        else if (/Processed file/.test(l)) done++;
+        progress('features', Math.min(0.99, done / nImages));
+      },
+    });
+    done = before + r.n;
+  }
 
   if (rig) {
     // Group the views of each 360 frame into one rig frame (same file name in every view folder).
@@ -186,8 +225,9 @@ export async function reconstruct(p) {
   // ---- 2. Matching
   progress('matching', 0);
   let mode = p.matcher;
-  if (mode === 'auto') mode = rig ? 'sequential' : nImages <= 700 ? 'exhaustive' : posed ? 'poses' : 'sequential';
-  say(`Matching features (${mode === 'poses' ? 'pairs chosen from AR poses' : mode})…`);
+  if (p.parts) mode = 'merge';
+  else if (mode === 'auto') mode = rig ? 'sequential' : nImages <= 700 ? 'exhaustive' : posed ? 'poses' : 'sequential';
+  say(`Matching features (${mode === 'poses' ? 'pairs chosen from AR poses' : mode === 'merge' ? 'within each capture, and across them' : mode})…`);
   const onMatch = (l) => {
     // Exhaustive matching works in blocks: "Processing block [i/n, j/n]".
     const b = /block \[(\d+)\/(\d+),\s*(\d+)\/(\d+)\]/.exec(l);
@@ -197,9 +237,9 @@ export async function reconstruct(p) {
   };
   if (mode === 'exhaustive') {
     await run(colmap, ['exhaustive_matcher', '--database_path', db, '--FeatureMatching.use_gpu', '1'], { log, token, onLine: onMatch });
-  } else if (mode === 'poses') {
+  } else if (mode === 'poses' || mode === 'merge') {
     const pairsFile = join(work, 'pairs.txt');
-    writeFileSync(pairsFile, posePairs(posed.frames).join('\n') + '\n');
+    writeFileSync(pairsFile, (mode === 'merge' ? mergePairs(p.parts) : posePairs(posed.frames)).join('\n') + '\n');
     await run(colmap, ['matches_importer', '--database_path', db, '--match_list_path', pairsFile, '--match_type', 'pairs',
       '--FeatureMatching.use_gpu', '1'], { log, token, onLine: onMatch });
   } else {
@@ -346,6 +386,6 @@ async function unposedReconstruction(p, db, nImages) {
   }
   progress('mapping', 1);
   say(`Model: ${best.stats.images}/${nImages} photos, ${best.stats.points} points, ${best.stats.reprojError.toFixed(2)} px error.`);
-  const model = camera ? camera.model : 'SIMPLE_RADIAL';
-  return { modelDir, stats: best.stats, mode, needsUndistort: !/PINHOLE/.test(model) };
+  const models = (p.parts ? p.parts.map((x) => x.camera) : [camera]).map((c) => (c ? c.model : 'SIMPLE_RADIAL'));
+  return { modelDir, stats: best.stats, mode, needsUndistort: models.some((m) => !/PINHOLE/.test(m)) };
 }

@@ -9,6 +9,10 @@ export const LIMITS = {
 
 const LIGHT = { dark: 60, veryDark: 32, clipWarn: 0.04, clipBad: 0.12 };
 const TEXTURE = { warn: 0.06, bad: 0.025 };
+// In front of a plain wall AR tracking has little to hold on to, and fast turns are what lose it:
+// the turn limits tighten there.
+const PLAIN_TURN = 0.6;
+const plain = (s) => s.texture != null && s.texture < TEXTURE.warn;
 
 /**
  * Rule table, highest priority first.
@@ -30,8 +34,17 @@ const RULES = [
     },
   },
   {
+    // ARCore says it's only estimating the position: the step before tracking is lost.
+    id: 'limited', level: 'bad', on: 0.3, off: 1.0, voice: 'Tracking is slipping. Slow down and aim at something with detail',
+    test: (s) => s.trackState === 'limited' && {
+      title: 'Tracking is slipping',
+      detail: 'Stop turning, step back from the wall and aim at something with detail (a door frame, a corner, the floor\'s edge) until it steadies. Photos wait till then.',
+    },
+  },
+  {
     id: 'fast', level: 'bad', on: 0.25, off: 0.8, voice: 'Slow down',
     test: (s, L) => {
+      if (s.rotSpeed > L.rotBad && plain(s)) return { title: 'Turn slowly here', detail: 'This wall is plain: turn slowly or tracking slips. Keep a door, corner or the floor\'s edge in view.' };
       if (s.rotSpeed > L.rotBad) return { title: 'Slow down — turning too fast', detail: 'Turn about a quarter as fast. Fast turns smear every frame.' };
       if (s.linSpeed != null && s.linSpeed > L.linBad) return { title: 'Slow down — walking too fast', detail: 'Take slow, small steps. Think "museum walk".' };
       if (s.linSpeed == null && s.flowSpeed > L.flowBad) return { title: 'Slow down', detail: 'The view is sliding past too quickly for sharp, overlapping photos.' };
@@ -43,6 +56,14 @@ const RULES = [
     test: (s) => s.mean < LIGHT.veryDark && {
       title: 'Too dark',
       detail: 'Turn on every light you can. Dark frames are noisy and blurry, and they make splats muddy. Never use the flashlight: moving light ruins splats.',
+    },
+  },
+  {
+    // Ahead of blur and the rest: a blank view is how tracking gets lost.
+    id: 'lowtex', level: 'warn', on: 0.8, off: 1.0, voice: 'Include more detail in the frame',
+    test: (s) => (s.texture < TEXTURE.bad || (plain(s) && s.depthMed > 0 && s.depthMed < 1.0)) && {
+      title: 'Blank surface — nothing to match',
+      detail: 'Step back or tilt so edges, corners, trim or furniture are in frame. Plain walls on their own can\'t be matched, and tracking can slip.',
     },
   },
   {
@@ -64,13 +85,6 @@ const RULES = [
     test: (s) => s.clipHi > LIGHT.clipBad && {
       title: 'Bright window or lamp in view',
       detail: 'Blown-out areas turn into floaters. Close the blinds, or angle so the window is only at the frame edge.',
-    },
-  },
-  {
-    id: 'lowtex', level: 'warn', on: 1.2, off: 1.0, voice: 'Include more detail in the frame',
-    test: (s) => s.texture < TEXTURE.bad && {
-      title: 'Blank surface — nothing to match',
-      detail: 'Step back or tilt so edges, corners, trim or furniture are in frame. Plain walls on their own can\'t be matched.',
     },
   },
   {
@@ -123,13 +137,6 @@ const RULES = [
     },
   },
   {
-    id: 'limited', level: 'info', on: 1.0, off: 1.0, voice: null,
-    test: (s) => s.trackState === 'limited' && {
-      title: 'Tracking is weak',
-      detail: 'Move a little slower and keep textured surfaces in view.',
-    },
-  },
-  {
     id: 'height', level: 'info', on: 1.5, off: 1.0, voice: null,
     test: (s) => s.heightHint && { title: s.heightHint.title, detail: s.heightHint.detail },
   },
@@ -145,13 +152,20 @@ export class Coach {
     this.counts = {}; // how often each issue became active (for the report)
   }
 
+  /** Turn limits for this moment: tighter in front of a plain wall. */
+  limits(s) {
+    const L = this.L;
+    return plain(s) ? { ...L, rotWarn: L.rotWarn * PLAIN_TURN, rotBad: L.rotBad * PLAIN_TURN } : L;
+  }
+
   update(s) {
     const t = s.t;
+    const L = this.limits(s);
     const active = [];
     for (const rule of RULES) {
       let st = this.state.get(rule.id);
       if (!st) this.state.set(rule.id, (st = { since: -1, lastTrue: -1, active: false, msg: null }));
-      const msg = rule.test(s, this.L);
+      const msg = rule.test(s, L);
       if (msg) {
         if (st.since < 0) st.since = t;
         st.lastTrue = t;
@@ -188,7 +202,7 @@ export class Coach {
   }
 
   chips(s) {
-    const L = this.L;
+    const L = this.limits(s);
     const chips = {};
     // Speed
     let speedLevel = 'good', speedText;

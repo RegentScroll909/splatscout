@@ -37,13 +37,18 @@ export function readHeader(fd) {
 /**
  * @param {string} src input .ply
  * @param {string} dst output .ply
- * @param {object} boundsData SplatScout manifest "bounds" ({poly, floorY, top, ...})
+ * @param {object|object[]} boundsData SplatScout manifest "bounds" ({poly, floorY, top, ...}), or
+ *   several (merged captures): a splat stays if it's inside any of them
  * @param {number} [margin] metres kept outside the outline (walls sit on it, splats have size)
  * @returns {{kept:number, removed:number}}
  */
 export function cropPly(src, dst, boundsData, margin = 0.5) {
-  const b = new Bounds({ ...boundsData, margin, skips: [] });
-  if (!b.poly) throw new Error('No scan-area outline');
+  const areas = (Array.isArray(boundsData) ? boundsData : [boundsData]).map((d) => {
+    const b = new Bounds({ ...d, margin, skips: [] });
+    return { b, floor: b.floorY - 0.4, top: b.top == null ? Infinity : b.top + 0.4 };
+  });
+  if (!areas.length || areas.some((a) => !a.b.poly)) throw new Error('No scan-area outline');
+  const inside = (x, y, z) => areas.some(({ b, floor, top }) => y >= floor && y <= top && b.inArea(x, b.floorY, z));
   const fd = openSync(src, 'r');
   try {
     const { header, dataStart, count, stride, off } = readHeader(fd);
@@ -51,14 +56,13 @@ export function cropPly(src, dst, boundsData, margin = 0.5) {
     const chunk = Buffer.alloc(per * stride);
     const keep = new Uint8Array(count);
     let kept = 0;
-    const floor = b.floorY - 0.4, top = b.top == null ? Infinity : b.top + 0.4;
     for (let i = 0; i < count; i += per) {
       const m = Math.min(per, count - i);
       readSync(fd, chunk, 0, m * stride, dataStart + i * stride);
       for (let j = 0; j < m; j++) {
         const o = j * stride;
         const x = chunk.readFloatLE(o + off.x), y = chunk.readFloatLE(o + off.y), z = chunk.readFloatLE(o + off.z);
-        if (y >= floor && y <= top && b.inArea(x, b.floorY, z)) {
+        if (inside(x, y, z)) {
           keep[i + j] = 1;
           kept++;
         }

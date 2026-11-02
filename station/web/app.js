@@ -105,6 +105,28 @@ setting('#phoneAutoImport', 'phoneAutoImport', loadStatus);
 setting('#autoProcess', 'autoProcess', loadStatus);
 $('#pauseQueue').addEventListener('change', (e) => api('/api/queue', { paused: e.target.checked }));
 $('#processAll').addEventListener('click', () => api('/api/process-all', {}));
+// Captures ticked for merging into one splat.
+const mergePick = new Set();
+$('#mergeBtn').addEventListener('click', async () => {
+  const r = await api('/api/merge', { ids: [...mergePick] });
+  if (r && r.ok) mergePick.clear();
+  else if (r && r.error) alert(r.error);
+  renderJobs();
+});
+function mergeToggle(j) {
+  if (j.source.kind !== 'zip' && j.source.kind !== 'video') return null;
+  const box = h('input', { type: 'checkbox', checked: mergePick.has(j.id), onchange: () => {
+    if (box.checked) mergePick.add(j.id);
+    else mergePick.delete(j.id);
+    renderMergeBtn();
+  } });
+  return h('label', { class: 'check inline merge-pick', title: 'Tick two or more captures of the same place, then press Merge' }, box, h('span', {}, 'Merge'));
+}
+function renderMergeBtn() {
+  for (const id of [...mergePick]) if (!jobs.has(id)) mergePick.delete(id);
+  $('#mergeBtn').classList.toggle('hidden', mergePick.size < 2);
+  $('#mergeBtn').textContent = `Merge ${mergePick.size} into one splat`;
+}
 $('#phoneRefresh').addEventListener('click', () => api('/api/phone/refresh', {}).then(renderPhone));
 
 // ------------------------------------------------------------------ phone
@@ -207,6 +229,7 @@ function renderJobs() {
   $('#queueCount').textContent = String(queue.length).padStart(2, '0');
   $('#historyCount').textContent = String(history.length).padStart(2, '0');
   $('#processAll').classList.toggle('hidden', waiting.length < 2);
+  renderMergeBtn();
   $('#waiting').replaceChildren(...(waiting.length ? waiting.map(waitingCard) : [empty('Nothing waiting. New captures land here and wait until you press Process.')]));
   $('#queue').replaceChildren(...(queue.length ? queue.map((j, i) => queueCard(j, i)) : [empty(status.queuePaused ? 'The queue is paused.' : 'Nothing queued.')]));
   $('#history').replaceChildren(...(history.length ? history.map(historyCard) : [empty('Finished and failed jobs appear here.')]));
@@ -224,7 +247,11 @@ function summary(j) {
   const s = j.summary;
   const bits = [];
   if (j.source.kind === 'video') bits.push(j.pano ? '360° video' : 'Video', fmtMB(j.source.size));
-  else if (s) {
+  else if (j.source.kind === 'merge') {
+    bits.push(`${j.source.parts.length} captures merged`);
+    if (s && s.photos) bits.push(`${s.photos} photos${s.posed ? `, ${s.posed} with AR positions` : ''}`);
+    bits.push(fmtMB(j.source.size));
+  } else if (s) {
     bits.push(`${s.photos} photos`);
     if (s.posed) bits.push(`${s.posed} with AR positions`);
     if (s.sessions > 1) bits.push(`${s.sessions} sessions${s.maps > 1 ? `, ${s.maps} maps` : ' lined up'}`);
@@ -249,7 +276,8 @@ function optionControls(j) {
   const box = h('div', { class: 'opts' },
     h('label', { class: 'field inline' }, h('span', { class: 'lbl' }, 'Quality'), sel),
     j.source.kind === 'zip' ? h('label', { class: 'check inline' }, poses, h('span', {}, 'AR positions')) : null,
-    j.source.kind === 'zip' ? h('label', { class: 'check inline' }, crop, h('span', {}, 'Crop to scan area')) : null);
+    mergeToggle(j),
+    j.source.kind === 'zip' || j.source.kind === 'merge' ? h('label', { class: 'check inline' }, crop, h('span', {}, 'Crop to scan area')) : null);
   return { box, read };
 }
 

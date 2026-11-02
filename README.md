@@ -7,7 +7,9 @@ building interiors well enough to make **clean Gaussian splats**. While you scan
   each pass draws a path on the floor and an arrow under the centre cross gives one instruction at a time:
   walk to the path, turn or tilt the phone ("Turn right 40°", "Tilt up 20°"), then sidestep along it. It only
   ever points ahead (no shuffling back and forth in corners), takes the photo when you stand on a spot, and
-  skips spots that can't be reached. The last pass sends you to the spots that still need angles.
+  skips spots that can't be reached. The last pass sends you to the spots that still need angles, sweeping
+  along in one direction at the height you hold the phone, and says it's done at 93% (2.3). A skipped spot
+  never comes back.
 - **Keeps its place in your scan (2.1, 2.2)**: when tracking is lost, the position jumps, or the AR session
   stops (screen off, app closed, another day), the next view is matched against the surfaces already scanned,
   so the scan area, coverage and path come back instead of starting over. Along a hallway, where plain walls
@@ -26,6 +28,8 @@ building interiors well enough to make **clean Gaussian splats**. While you scan
   moved far enough for good overlap, without making you stop, and skips blurry, dark and duplicate frames.
 - **Coaches you live**, one instruction at a time: slow down, you're turning in place, too close, blank
   wall, window blowing out, tracking lost, gap in overlap, wrong height for this pass… Optional voice coaching.
+  In front of a plain wall it asks for slower turns, and it warns "Tracking is slipping" (and holds photos)
+  before tracking is lost (2.3).
 - **Walks you through a capture plan** for the type of space (room, hallway, large hall, stairwell,
   object, freestyle), pass by pass (eye level, overhead, low, cross, details), with progress for each pass.
 - **Points you at what's missing** with an AR beacon and the centre arrow, and shows a live floor-plan map
@@ -45,6 +49,11 @@ Two capture engines:
 | Parallax check | Exact (metres moved) | Estimated from image motion vs. gyro |
 | Photo size | AR camera stream (usually ~1920 px long side) | Full camera stream (up to 4K) |
 | Extras in export | Camera poses + depth point cloud | — |
+
+**iPhone:** Safari on iOS still has no WebXR AR, and every iPhone browser has to use Safari's engine, so no web
+app can reach ARKit's tracking; AR mode would need a native iOS app (built on a Mac with Xcode and an Apple
+developer account). Camera mode works on iPhones today, and SplatStation can merge an iPhone's camera-mode
+photos with a Pixel's AR capture of the same place, which gives them the Pixel's positions, size and level.
 
 There's also a **Practice room**: a virtual classroom that runs the full pipeline on a laptop or phone,
 so club members can learn the technique before scanning a real building.
@@ -213,6 +222,13 @@ The catches, compared with SplatScout photos: each view has less detail (a 5.7K 
 an 8K one 1920), and there are no AR positions, so there's no scan-area crop and the splat's size is a guess. Walk
 mode assumes the camera was held 1.9 m up. Not yet tried with real 360 footage; see below.
 
+**Merge captures from several phones.** Tick **Merge** on two or more captures of the same place (other
+phones, other days, an iPhone in camera mode, a phone video) and press **Merge N into one splat**. Each keeps
+its own lens; COLMAP matches photos within each capture and across them, solves everything together, and puts
+the result in the AR coordinates of the capture with the most AR positions. So the splat has real size and a
+level floor, every phone's scan area is used for cropping (moved into those coordinates), and walk mode works.
+The original captures stay as they are. 360° videos can't be merged yet.
+
 **What it needs:** an NVIDIA GPU, plus the following, all found automatically. Paths can be changed in
 `%USERPROFILE%\SplatStation\station.config.json`.
 - COLMAP 4.x with CUDA (`C:\Tools\COLMAP`).
@@ -223,16 +239,30 @@ mode assumes the camera was held 1.9 m up. Not yet tried with real 360 footage; 
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (38 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (42 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
   walls, drift), hallway re-alignment (depth alone can't place you along it, the photos can), hallway paths
-  kept off the walls when the outline is drawn around the door recesses, lined-up sessions sharing one map,
-  photos while walking, coaching priority/hysteresis, scoring, COLMAP/transforms export, ZIP validity,
+  kept off the walls when the outline is drawn around the door recesses, the gap pass (spots you can reach at
+  the height you hold the phone, a skipped spot never coming back, everywhere you've walked counting as
+  reachable), lined-up sessions sharing one map, photos while walking, coaching priority/hysteresis (slower
+  turns at plain walls, slipping tracking first), scoring, COLMAP/transforms export, ZIP validity,
   splat cropping, and walk mode (floor, walls, a plain wall of big flat splats, a table, a doorway, floor holes,
   floaters, sliding along walls, an upside-down splat of unknown size, COLMAP text and binary camera files), and the
-  360° camera rig (each cut view turned the way ffmpeg cuts it).
+  360° camera rig (each cut view turned the way ffmpeg cuts it), and merging phones (pairs within and across
+  captures; each phone's scan area moved into the main phone's coordinates).
+- **The guide loop (2.3)**, with a simulated person following every pass of the Practice hallway and room
+  (walking, turning, taking the photos the app asks for, pressing Skip when it offers). Before: the last pass
+  never ended (in the hallway, still going after 15 minutes with 83 turn reversals and 96 trips back), and since
+  2.2 it could even crash on reaching that pass, leaving the guide silent. In some runs it also gave up at once
+  with the room 54–75% covered, because a gap in the depth map cut the user's spot off from the rest of the
+  floor. After: 40–110 s in the room, 3–3½ minutes in the hallway, both ending at 93%, over 7 runs each.
+- **Merging (2.3)** on the real Ggg capture split into pretend phones (odd photos with AR; even photos
+  either with AR in a frame turned 70° and moved 6 m, or with no AR like an iPhone in camera mode). Both merges
+  placed 535–536 of 537 photos at 0.8 px error in about 5 minutes on Quick. The camera-mode photos landed a
+  median 8.5 cm (90% within 13 cm) from the AR positions they really had, about the AR session's own drift over
+  the hallway; the other phone's scan outline landed within 1 mm of the first one's, with the same floor height.
 - **360° video** on a rendered 62-second walk down the Practice hallway and back (1600×800, camera 1.9 m up):
   125 frames picked, cut into 1,125 views in 3 s; COLMAP placed all 1,125 as a 9-view rig at 0.76 px error; the
   Quick splat trained in 39 s, 3 min 10 s end to end. In the viewer it's an upright, recognisable hallway, and
@@ -296,7 +326,7 @@ app/js/capture/   session engine, 3D overlay (+ guide geometry), minimap, audio
 app/js/data/      IndexedDB storage, settings, ZIP export
 app/js/ui/        screens
 tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs
-station/          SplatStation: station.mjs (server, queue, inbox), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb),
+station/          SplatStation: station.mjs (server, queue, inbox, merges), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb),
                   web/ (dashboard, viewer, walk.js: walk-mode collision shared with the self-checks)
 ```
 

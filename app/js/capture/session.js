@@ -525,16 +525,15 @@ export class CaptureSession {
 
     // Keyframe selection. Candidates are evaluated whenever a photo is (nearly) due, also while
     // moving: the keyframer keeps the sharpest one instead of waiting for the user to stop.
+    // Not while AR tracking is lost or slipping ('limited'): those photos' positions are guesses.
     const canShoot = this.recording && !this.paused && !holding && !this.orientationChanged && fi.requestCandidate &&
-      !(this.sixdof && fi.trackState === 'lost');
+      !(this.sixdof && (fi.trackState === 'lost' || fi.trackState === 'limited'));
     // Standing on a gap marker, aimed at the ring: that's the photo the guide asked for.
     const gs = this.live.guide;
-    if (canShoot && gs && gs.mode === 'gaps' && gs.next && this.guide.gap === gs.next && !this.keyframer.forced) {
-      const at = Math.hypot(gs.next.pos[0] - pos[0], gs.next.pos[2] - pos[2]) < 0.6;
-      const aimed = v3.dot(fwd, gs.next.aim) > Math.cos(22 * DEG);
+    if (canShoot && gs && gs.mode === 'gaps' && gs.wantPhoto && this.guide.gap === gs.next && !this.keyframer.forced) {
       const last = this.frames.length ? this.frames[this.frames.length - 1] : null;
       const recent = last && last.segment === this.segment && this.t0 + last.t > t - 1;
-      if (at && aimed && !recent && this.rotSpeed < 25) this.keyframer.request();
+      if (!recent && this.rotSpeed < 25) this.keyframer.request();
     }
     // Same on a path: standing on the next spot, aimed, a photo is due even without moving on.
     if (canShoot && gs && gs.mode === 'path' && gs.wantPhoto && !this.keyframer.forced) {
@@ -1014,6 +1013,11 @@ export class CaptureSession {
       if (gs && gs.skipped) this._emit('spotSkipped');
       if (gs && gs.next && gs.instruction && !this.paused) {
         this.target = { point: gs.aimPoint, title: gs.instruction.title, detail: gs.instruction.detail, kind: gs.mode };
+      }
+      // Gaps: nothing left within reach that would add angles. Say so once.
+      if (gs && gs.complete && !g.hasPath && !this.passCompleteAt) {
+        this.passCompleteAt = t;
+        this._emit('passComplete', { pass: this.pass, last: this.passIndex >= this.template.passes.length - 1 });
       }
       // A walked path is done: say so, then move on to the next pass by itself.
       if (gs && gs.complete && g.hasPath) {

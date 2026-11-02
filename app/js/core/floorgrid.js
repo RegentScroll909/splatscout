@@ -7,6 +7,7 @@
 import { VoxelMap } from './coverage.js';
 
 const BODY = 0.3; // m: closer than this to an obstacle, nobody stands there
+const SQUEEZE = 0.15; // m: but people squeeze past things this close when walking somewhere
 const SEARCH = 1.6; // m: how far a spot may move to get clear of walls
 
 export class FloorGrid {
@@ -63,37 +64,48 @@ export class FloorGrid {
   }
 
   /** Too close to an obstacle to stand (unknown space counts as free). */
-  tight(x, z) {
-    const s = this.s, r = Math.ceil(BODY / s);
+  tight(x, z, body = BODY) {
+    const s = this.s, r = Math.ceil(body / s);
     const ix = Math.floor(x / s), iz = Math.floor(z / s);
     for (let dz = -r; dz <= r; dz++) {
       for (let dx = -r; dx <= r; dx++) {
         const k = this.key(ix + dx, iz + dz);
         if (k < 0 || !this.block[k]) continue;
         const cx = (ix + dx + 0.5) * s, cz = (iz + dz + 0.5) * s;
-        if (Math.hypot(Math.max(0, Math.abs(cx - x) - s / 2), Math.max(0, Math.abs(cz - z) - s / 2)) < BODY) return true;
+        if (Math.hypot(Math.max(0, Math.abs(cx - x) - s / 2), Math.max(0, Math.abs(cz - z) - s / 2)) < body) return true;
       }
     }
     return false;
   }
 
-  /** Flood the floor from where the user stands, around obstacles: what can be walked to. */
-  reachFrom(x, z) {
+  /**
+   * Flood the floor around obstacles from where the user stands, and from everywhere they've
+   * already walked (those places are reachable, whatever a gap in the depth map suggests): what
+   * can be walked to. One spot cut off by a narrow gap or a depth speck used to make most of a
+   * room look unreachable.
+   * @param {number[][]} seeds [[x, z], …], the first being where the user is now
+   */
+  reachFrom(seeds) {
     const N = this.W * this.H;
     const open = new Uint8Array(N);
     for (let iz = 0; iz < this.H; iz++) {
       for (let ix = 0; ix < this.W; ix++) {
         const cx = (ix + this.ix0 + 0.5) * this.s, cz = (iz + this.iz0 + 0.5) * this.s;
-        open[iz * this.W + ix] = this.tight(cx, cz) ? 0 : 1;
+        open[iz * this.W + ix] = this.tight(cx, cz, SQUEEZE) ? 0 : 1;
       }
     }
     const reach = new Uint8Array(N);
-    // Standing close to a wall is fine: start from the nearest open cell.
-    let start = this.cellOf(x, z);
-    if (start < 0 || !open[start]) start = this._nearest(x, z, 1.0, (k) => open[k]);
-    if (start >= 0) {
-      const queue = [start];
-      reach[start] = 1;
+    const queue = [];
+    for (const [x, z] of seeds) {
+      // Standing close to a wall is fine: start from the nearest open cell.
+      let start = this.cellOf(x, z);
+      if (start < 0 || !open[start]) start = this._nearest(x, z, 1.0, (k) => open[k]);
+      if (start >= 0 && !reach[start]) {
+        reach[start] = 1;
+        queue.push(start);
+      }
+    }
+    {
       while (queue.length) {
         const k = queue.pop();
         const ix = k % this.W, iz = (k - ix) / this.W;

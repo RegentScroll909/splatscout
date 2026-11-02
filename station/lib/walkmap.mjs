@@ -209,10 +209,12 @@ function distToPoly(poly, x, z) {
  * @param {Array<{name, C, fwd}>} o.cams camera centres/directions in splat coordinates (the phone's path)
  * @param {number[]} [o.up] splat-space up direction
  * @param {boolean} [o.metric] splat is in metres (AR frame); otherwise the scale is estimated
- * @param {number[][]} [o.poly] scan-area outline [[x, z], …] (AR frame only)
+ * @param {number[][][]} [o.polys] scan-area outlines [[[x, z], …], …] (AR frame only; several when
+ *   captures were merged): you stay inside any of them
  * @param {number} [o.camHeight] when not metric: how high the camera was held, which sets the scale
  */
-export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric = true, poly = null, camHeight = 1.5 } = {}) {
+export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric = true, polys = [], camHeight = 1.5 } = {}) {
+  polys = polys.filter((p) => p && p.length >= 3);
   if (!cams.length) throw new Error('No camera path to find the floor from');
   const R = upRotation(up);
   const sp = await readSplats(plyFile, R);
@@ -250,7 +252,7 @@ export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric 
 
   // Map area: around the phone's path and the scan outline, but not beyond the splat itself.
   let gx0 = bx0 - 3, gx1 = bx1 + 3, gz0 = bz0 - 3, gz1 = bz1 + 3;
-  if (poly && poly.length >= 3) {
+  for (const poly of polys) {
     for (const [x, z] of poly) {
       gx0 = Math.min(gx0, x - 0.6); gx1 = Math.max(gx1, x + 0.6);
       gz0 = Math.min(gz0, z - 0.6); gz1 = Math.max(gz1, z + 0.6);
@@ -361,16 +363,16 @@ export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric 
   }
   for (let c = 0; c < W * H; c++) if (cells[c] === NOTHING && !outside[c]) cells[c] = FLOOR;
   // Stay inside the scan area marked on the phone.
-  if (poly && poly.length >= 3) {
-    const P2 = poly.map(([x, z]) => {
+  if (polys.length) {
+    const P2s = polys.map((poly) => poly.map(([x, z]) => {
       const p = mul(R, [x, 0, z]);
       return [p[0] * k, p[2] * k];
-    });
+    }));
     for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
       const c = j * W + i;
       if (cells[c] !== FLOOR) continue;
       const x = gx0 + (i + 0.5) * cell, z = gz0 + (j + 0.5) * cell;
-      if (!insidePoly(P2, x, z) && distToPoly(P2, x, z) > 0.25) cells[c] = NOTHING;
+      if (!P2s.some((P2) => insidePoly(P2, x, z) || distToPoly(P2, x, z) <= 0.25)) cells[c] = NOTHING;
     }
   }
 
@@ -407,18 +409,20 @@ export function walkInputs({ jobDir = null, mode = null, view = null, up = null,
     const n = Math.hypot(...f) || 1;
     cams = [{ name: 'start', C: view.position, fwd: f.map((v) => v / n) }];
   }
-  let poly = null;
-  const mf = jobDir && join(jobDir, 'dataset', 'splatscout.json');
-  if (ar && mf && existsSync(mf)) {
-    try {
+  // Scan areas: the capture's own, or (merged captures) every phone's, already in splat coordinates.
+  let polys = [];
+  const mf = jobDir && join(jobDir, 'dataset', 'splatscout.json'), mm = jobDir && join(jobDir, 'dataset', 'merge.json');
+  try {
+    if (ar && mm && existsSync(mm)) polys = JSON.parse(readFileSync(mm, 'utf8')).areas.map((a) => a.poly);
+    else if (ar && mf && existsSync(mf)) {
       const b = JSON.parse(readFileSync(mf, 'utf8')).bounds;
-      if (b && b.poly && b.poly.length >= 3) poly = b.poly;
-    } catch {}
-  }
+      if (b && b.poly) polys = [b.poly];
+    }
+  } catch {}
   let u = up || (view && view.up) || [0, 1, 0];
   // AR splats are exactly y-up (unless someone flipped the viewer).
   if (ar) u = u[1] < 0 ? [0, -1, 0] : [0, 1, 0];
-  return { cams, up: u, metric: ar, poly, camHeight: pano ? 1.9 : 1.5 };
+  return { cams, up: u, metric: ar, polys, camHeight: pano ? 1.9 : 1.5 };
 }
 
 const building = new Map();

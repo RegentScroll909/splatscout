@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { poseFromEuler } from '../app/js/sources/orientation.js';
-import { poseForward, poseUp, poseRight, poseLookDir, projectPoint, projectionFromIntrinsics, intrinsicsFromProjection, angularVelocity, transformDir, DEG } from '../app/js/core/math.js';
+import { poseForward, poseUp, poseRight, poseLookDir, projectPoint, projectionFromIntrinsics, intrinsicsFromProjection, angularVelocity, transformDir, DEG, v3 } from '../app/js/core/math.js';
 import { analyzeImage, FlowTracker } from '../app/js/core/analyzer.js';
 import { DirectionSphere, VoxelMap } from '../app/js/core/coverage.js';
 import { Keyframer } from '../app/js/core/keyframer.js';
@@ -16,6 +16,7 @@ import { Coach } from '../app/js/core/coach.js';
 import { analyzeCapture } from '../app/js/core/score.js';
 import { Bounds } from '../app/js/core/bounds.js';
 import { planPass, Guide } from '../app/js/core/guide.js';
+import { FloorGrid } from '../app/js/core/floorgrid.js';
 import { getTemplate } from '../app/js/core/plans.js';
 import { depthToPoints, unprojectIntr } from '../app/js/core/depth.js';
 import { depthGrid, setScene, raycast, surfaceNormal, walkable } from '../app/js/sources/demoScene.js';
@@ -504,6 +505,45 @@ test('guide: a hallway outline drawn around its door recesses gets a path off th
   assert.ok(close >= 0.45 && live.length > 0.9 * g.stations.length, `spots keep ${close.toFixed(2)} m from walls, ${live.length}/${g.stations.length} kept`);
 });
 
+test('guide: the gap pass plans reachable spots and a skipped spot never comes back', () => {
+  setScene('room');
+  const vm = practiceMap();
+  const tpl = getTemplate('room');
+  const b = new Bounds({ poly: [[-3.8, -3.3], [3.8, -3.3], [3.8, 3.3], [-3.8, 3.3]], floorY: 0 });
+  vm.setBounds(b);
+  const g = new Guide({ template: tpl, bounds: b, voxels: vm });
+  const pos = [0, 1.3, 1.6], fwd = [0, 0, -1];
+  g.setPass(tpl.passes[0], pos);
+  g.update({ pos, fwd, t: 0 }); // builds the wall map
+  g.setPass(tpl.passes.find((p) => p.guide.kind === 'gaps'), pos); // used to throw once the wall map existed
+  let st = g.update({ pos, fwd, t: 1 });
+  assert.ok(st.next && !st.complete, 'a gap to fill');
+  assert.ok(Math.abs(st.next.pos[1] - 1.3) < 1e-6, 'from the height the phone is held, not one you\'d have to reach');
+  assert.ok(g.grid.standable(st.next.pos[0], st.next.pos[2]), 'a spot that can be stood on');
+  // Standing on the marker and aimed: the photo is due (the same distance the session uses).
+  const on = g.update({ pos: [st.next.pos[0] + 0.3, 1.3, st.next.pos[2]], fwd: st.next.aim, t: 2 });
+  assert.ok(on.wantPhoto && on.phase === 'hold', `photo wanted when on the marker (${on.phase})`);
+  // Skip it: neither it nor the patch next to it is suggested again, however long it takes.
+  const skipped = st.next.target;
+  g.skip(3);
+  for (const t of [4, 300, 5000]) {
+    const p = g.planGap(pos, fwd, t, 0);
+    assert.ok(p && v3.dist(p.target, skipped) >= 0.9, `skipped spot stays skipped at t=${t}`);
+  }
+  setScene('room');
+});
+
+test('guide: everywhere you have walked counts as reachable, even past a gap in the depth map', () => {
+  // A closed ring of wall around the spot you stand on (a depth speck can close a gap like this).
+  const vm = new VoxelMap(0.2, 7);
+  const ring = [];
+  for (let a = 0; a < 360; a += 4) for (let y = 0.35; y < 1.9; y += 0.15) ring.push(Math.cos(a * DEG) * 0.7, y, Math.sin(a * DEG) * 0.7);
+  for (let i = 0; i < 3; i++) vm.integrate(new Float32Array(ring), [0, 1.4, 0], false);
+  const box = [-4, 4, -4, 4];
+  assert.ok(!new FloorGrid(vm, 0, box).reachFrom([[0, 0]]).reachable(2.5, 2), 'cut off from where you stand alone');
+  assert.ok(new FloorGrid(vm, 0, box).reachFrom([[0, 0], [2, 0], [2.5, 1]]).reachable(2.5, 2), 'reachable from where you walked');
+});
+
 test('spaces: sessions lined up into one map share coverage; others stay apart', () => {
   const cap = { engine: 'xr', tracking: '6dof', template: 'room' };
   const pts = new Float32Array([1, 1, -2, 1.05, 1, -2, 1, 1.05, -2]);
@@ -556,6 +596,27 @@ test('coach prioritises critical issues and has hysteresis', () => {
   assert.equal(r.primary.id, 'fast', 'still shown during hysteresis');
   r = c.update({ ...base, t: 3 });
   assert.equal(r.primary.level, 'good');
+});
+
+test('coach: in front of a plain wall it asks for slower turns, and slipping tracking comes first', () => {
+  const base = { trackState: 'ok', rotSpeed: 5, linSpeed: 0.1, flowSpeed: 0.05, relSharp: 0.9, blurRisk: 0, mean: 120, clipHi: 0, clipLo: 0, texture: 0.2, depthMed: 2 };
+  // 20°/s: fine with detail in view, too fast at a plain wall.
+  let c = new Coach();
+  c.update({ ...base, t: 0, rotSpeed: 20 });
+  assert.notEqual(c.update({ ...base, t: 0.5, rotSpeed: 20 }).primary.id, 'fast');
+  c = new Coach();
+  c.update({ ...base, t: 0, rotSpeed: 20, texture: 0.04 });
+  const r = c.update({ ...base, t: 0.5, rotSpeed: 20, texture: 0.04 });
+  assert.equal(r.primary.id, 'fast');
+  assert.match(r.primary.title, /slowly/);
+  // A plain wall up close warns before it gets blank.
+  c = new Coach();
+  c.update({ ...base, t: 0, texture: 0.04, depthMed: 0.8 });
+  assert.equal(c.update({ ...base, t: 1, texture: 0.04, depthMed: 0.8 }).primary.id, 'lowtex');
+  // Tracking slipping outranks everything but a lost one.
+  c = new Coach();
+  c.update({ ...base, t: 0, trackState: 'limited', relSharp: 0.3, blurRisk: 0.8 });
+  assert.equal(c.update({ ...base, t: 1, trackState: 'limited', relSharp: 0.3, blurRisk: 0.8 }).primary.id, 'limited');
 });
 
 test('score: well-covered posed capture grades well', () => {
@@ -805,6 +866,32 @@ test('station reads camera centres from COLMAP text and binary models alike', ()
       near(g.fwd, [1, 0, 0], 1e-6, `${dir} forward ${i}`);
     });
   }
+});
+
+const { partAreas } = await import('../station/lib/pipeline.mjs');
+const { mergePairs } = await import('../station/lib/colmap.mjs');
+test('merging phones: pairs within and across captures; each scan area lands in the main phone\'s coordinates', () => {
+  // Phone B's AR frame is phone A's turned 70° and moved; the solve put B's photos where A has them.
+  const th = 70 * DEG, rot = (x, y, z) => [Math.cos(th) * x + Math.sin(th) * z, y, -Math.sin(th) * x + Math.cos(th) * z];
+  const toB = (p) => { const r = rot(...p); return [r[0] + 3, r[1] + 0.2, r[2] - 5]; };
+  const polyA = [[-1, 0], [2, 0], [2, 9], [-1, 9]];
+  const real = Array.from({ length: 30 }, (_, i) => [0.5 + Math.sin(i), 0, i * 0.3]);
+  const partB = {
+    bounds: { poly: polyA.map(([x, z]) => { const q = toB([x, -1.5, z]); return [q[0], q[2]]; }), floorY: -1.3, top: null },
+    frames: real.map((p, i) => {
+      const q = toB(p);
+      return { name: `p2/${i}.jpg`, pose: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, q[0], q[1], q[2], 1] };
+    }),
+  };
+  const [area] = partAreas([partB], real.map((p, i) => ({ name: `p2/${i}.jpg`, C: p })));
+  near(area.poly.flat(), polyA.flat(), 1e-6, 'B\'s outline back on A\'s');
+  assert.ok(Math.abs(area.floorY + 1.5) < 1e-6, `floor ${area.floorY}`);
+  const names = (tag, n) => Array.from({ length: n }, (_, i) => `${tag}/${String(i + 1).padStart(4, '0')}.jpg`);
+  const pairs = mergePairs([{ names: names('p1', 300) }, { names: names('p2', 250) }]);
+  assert.equal(new Set(pairs).size, pairs.length, 'no pair twice');
+  assert.ok(pairs.includes('p1/0001.jpg p1/0002.jpg') && pairs.includes('p2/0010.jpg p2/0026.jpg'), 'neighbours within each capture');
+  const across = pairs.filter((p) => p.startsWith('p1/') && p.includes(' p2/')).length;
+  assert.ok(across >= 100 * 100 && across <= 120 * 120, `${across} pairs across the captures`);
 });
 
 const { rigConfig, VIEWS_360, isEquirect, viewSize } = await import('../station/lib/video.mjs');

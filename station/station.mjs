@@ -7,7 +7,7 @@
 // New captures wait until you press Process (unless automatic processing is switched on).
 
 import { createServer } from 'node:http';
-import { createReadStream, createWriteStream, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync, linkSync, copyFileSync } from 'node:fs';
 import { join, extname, normalize, basename, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { networkInterfaces } from 'node:os';
@@ -421,6 +421,41 @@ const server = createServer(async (req, res) => {
       }
       pump();
       return sendJson(res, { ok: true, queued: n });
+    }
+    if (path === '/api/merge' && req.method === 'POST') {
+      // Several captures of the same place (other phones, other days) into one splat. The originals
+      // stay as they are; their files are linked into the new job, so deleting one doesn't matter.
+      const b = await readBody(req);
+      const parts = (b.ids || []).map((id) => jobs.find((j) => j.id === id))
+        .filter((j) => j && j.status !== 'running' && j.status !== 'queued' && j.source && (j.source.kind === 'zip' || j.source.kind === 'video') && existsSync(j.source.file));
+      if (parts.length < 2) return sendJson(res, { error: 'Pick at least two captures (ZIPs or videos) to merge.' }, 400);
+      // The one with the most AR positions first: it names the merge (and sets its coordinates).
+      const posedOf = (j) => (j.summary && j.summary.posed) || 0;
+      parts.sort((a, b) => posedOf(b) - posedOf(a));
+      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      const dir = join(cfg.dirs.jobs, id);
+      mkdirSync(join(dir, 'source'), { recursive: true });
+      const sources = parts.map((p, i) => {
+        const dest = join(dir, 'source', `${i + 1}_${basename(p.source.file)}`);
+        try {
+          linkSync(p.source.file, dest);
+        } catch {
+          copyFileSync(p.source.file, dest);
+        }
+        return { kind: p.source.kind, file: dest, name: p.source.name, size: p.source.size };
+      });
+      const photos = parts.reduce((a, p) => a + ((p.summary && p.summary.photos) || 0), 0);
+      const job = {
+        id, dir, created: Date.now(), status: 'waiting', order: Date.now(), preset: parts[0].preset || cfg.preset,
+        source: { kind: 'merge', parts: sources, name: parts.map((p) => p.source.name).join(' + '), size: sources.reduce((a, s) => a + s.size, 0) },
+        building: parts[0].building, room: `${parts[0].room} (merged)`,
+        stages: Object.fromEntries(STAGES.map((s) => [s.id, { p: 0, note: '' }])), messages: [],
+        summary: { photos, parts: parts.length, posed: parts.reduce((a, p) => a + ((p.summary && p.summary.posed) || 0), 0) },
+      };
+      jobs.unshift(job);
+      changed(job);
+      say(`Merged ${parts.length} captures into one job. It waits until you press Process.`, job);
+      return sendJson(res, { ok: true, id });
     }
     if (path === '/api/upload' && req.method === 'POST') {
       const name = basename(url.searchParams.get('name') || 'upload.zip').replace(/[^\w.\- ()]/g, '_');

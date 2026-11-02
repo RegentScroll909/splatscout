@@ -1,7 +1,7 @@
 // One job = one capture → one splat. Stages: import → features → matching → mapping →
 // (undistort) → train → finish. Progress and messages go through `ctx.update`.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, copyFileSync, cpSync, symlinkSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, copyFileSync, cpSync, symlinkSync, linkSync, rmSync, statSync } from 'node:fs';
 import { join, basename, extname } from 'node:path';
 import { extractZip } from './zipread.mjs';
 import { reconstruct, viewHint, countImages } from './colmap.mjs';
@@ -9,7 +9,7 @@ import { trainBrush } from './trainer.mjs';
 import { selectFrames, extractFrames, probeVideo, isEquirect, extract360, viewSize, rigConfig, VIEWS_360 } from './video.mjs';
 import { run } from './run.mjs';
 import { cropPly } from './crop.mjs';
-import { walkInputs, walkMapFor } from './walkmap.mjs';
+import { walkInputs, walkMapFor, readCameras } from './walkmap.mjs';
 import { PRESETS, saveConfig } from './config.mjs';
 
 export const STAGES = [
@@ -41,7 +41,6 @@ export async function processJob(job, ctx) {
   const dir = job.dir;
   const log = join(dir, 'job.log');
   const dataset = join(dir, 'dataset');
-  const imagesDir = join(dataset, 'images');
   const t0 = Date.now();
 
   if (!T.colmap) throw new Error('COLMAP was not found. Set tools.colmap in station.config.json.');
@@ -49,44 +48,15 @@ export async function processJob(job, ctx) {
 
   // ---------------------------------------------------------------- import
   ctx.stage('import', 0);
-  let manifest = null;
-  let camera = null;
-  let rig = null; // views cut from 360 video, solved together per frame
-  if (job.source.kind === 'zip') {
-    ctx.say('Unpacking capture…');
-    if (existsSync(dataset)) rmSync(dataset, { recursive: true, force: true });
-    await extractZip(job.source.file, dataset, { onProgress: (f) => ctx.stage('import', f * 0.9) });
-    const mf = join(dataset, 'splatscout.json');
-    if (existsSync(mf)) manifest = JSON.parse(readFileSync(mf, 'utf8'));
-    if (!existsSync(imagesDir)) {
-      // A plain zip of photos: find the folder that holds the images.
-      const found = findImageFolder(dataset);
-      if (!found) throw new Error('No photos found in the ZIP.');
-      if (found !== imagesDir) ctx.update({ imagesDirOverride: found });
-    }
-  } else if (job.source.kind === 'video') {
-    if (!T.ffmpeg || !T.ffprobe) throw new Error('ffmpeg/ffprobe are needed for video input.');
-    const pano = isEquirect(await probeVideo(T.ffprobe, job.source.file));
-    ctx.update({ pano });
-    ctx.say(pano ? 'Analysing 360° video for sharp frames…' : 'Analysing video for sharp, well-spaced frames…');
-    const sel = await selectFrames({ ffmpeg: T.ffmpeg, ffprobe: T.ffprobe, file: job.source.file, maxFrames: pano ? MAX_360_FRAMES : 450,
-      every: pano ? 0.5 : 0, progress: (f) => ctx.stage('import', f * 0.6), token, log });
-    if (existsSync(dataset)) rmSync(dataset, { recursive: true, force: true });
-    const hdr = sel.info.hdr ? ' (HDR video tone-mapped)' : '';
-    if (pano) {
-      const size = viewSize(sel.info);
-      ctx.say(`360° video: selected ${sel.selected.length} of ${sel.total} frames${hdr}. Cutting each into ${VIEWS_360.length} views of ${size}×${size} px…`);
-      await extract360({ ffmpeg: T.ffmpeg, file: job.source.file, frames: sel.selected, info: sel.info, outDir: imagesDir, size, token, log });
-      const f = (size / 2).toFixed(4); // 90° view: focal length is half the width
-      camera = { model: 'PINHOLE', params: [f, f, f, f].join(','), single: false };
-      rig = { config: rigConfig(VIEWS_360) };
-    } else {
-      ctx.say(`Selected ${sel.selected.length} of ${sel.total} frames${hdr}. Extracting…`);
-      await extractFrames({ ffmpeg: T.ffmpeg, file: job.source.file, frames: sel.selected, info: sel.info, outDir: imagesDir, token, log });
-    }
+  if (existsSync(dataset)) rmSync(dataset, { recursive: true, force: true });
+  let src;
+  if (job.source.kind === 'merge') {
+    src = await prepareMerge(job, dataset, ctx, log);
+  } else {
+    src = await prepareSource(job.source, dataset, ctx, { log, usePoses: cfg.usePoses && job.usePoses !== false, progress: (f) => ctx.stage('import', f) });
+    ctx.update({ pano: src.pano });
   }
-  const photos = job.imagesDirOverride || imagesDir;
-  const nImages = countImages(photos);
+  const { photos, nImages, manifest, camera, rig, posed, arFrames } = src;
   if (manifest) {
     const c = manifest.capture || {};
     ctx.update({
@@ -97,35 +67,6 @@ export async function processJob(job, ctx) {
   }
   ctx.update({ nImages });
   ctx.stage('import', 1, `${nImages} photos`);
-
-  // ---------------------------------------------------------------- camera hint & AR poses
-  let posed = null;
-  let arFrames = null; // AR camera poses, also used to put an SfM solve into the AR frame
-  if (manifest && manifest.frames && manifest.frames.length) {
-    const intrs = manifest.frames.map((f) => f.intrinsics).filter(Boolean);
-    const key = (i) => [i.w, i.h, i.fx.toFixed(1), i.fy.toFixed(1), i.cx.toFixed(1), i.cy.toFixed(1)].join('|');
-    const uniform = intrs.length === manifest.frames.length && intrs.every((i) => key(i) === key(intrs[0]));
-    const tracking = manifest.capture && manifest.capture.tracking;
-    if (uniform && tracking === '6dof') {
-      const i = intrs[0];
-      camera = { model: 'PINHOLE', params: [i.fx, i.fy, i.cx, i.cy].map((v) => v.toFixed(4)).join(','), single: true };
-    } else if (uniform) {
-      // Camera mode: focal length is only an estimate, so let COLMAP refine it (and lens distortion).
-      const i = intrs[0];
-      camera = { model: 'SIMPLE_RADIAL', params: [i.fx, i.cx, i.cy, 0].map((v) => v.toFixed(4)).join(','), single: true };
-    } else {
-      camera = { model: 'SIMPLE_RADIAL', params: null, single: false };
-    }
-    const sparseIn = join(dataset, 'poses', 'colmap', 'sparse', '0');
-    if (tracking === '6dof' && existsSync(join(sparseIn, 'images.txt'))) {
-      const names = new Set(
-        readFileSync(join(sparseIn, 'images.txt'), 'utf8').split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.trim().split(/\s+/)).filter((p) => p.length >= 10).map((p) => p[9]),
-      );
-      const frames = manifest.frames.filter((f) => f.pose && names.has(basename(f.file))).map((f) => ({ name: basename(f.file), pose: f.pose }));
-      if (frames.length >= 10) arFrames = frames;
-      if (cfg.usePoses && job.usePoses !== false && frames.length >= 20) posed = { modelDir: sparseIn, frames };
-    }
-  }
   if (posed) ctx.say(`Using AR poses for ${posed.frames.length} of ${nImages} photos as a starting point.`);
 
   // ---------------------------------------------------------------- reconstruction
@@ -136,6 +77,7 @@ export async function processJob(job, ctx) {
     camera,
     posed,
     rig,
+    parts: src.parts || null,
     align: arFrames,
     matcher: cfg.matcher || 'auto',
     progress: (stage, f, note) => ctx.stage(stage, f, note),
@@ -191,11 +133,18 @@ export async function processJob(job, ctx) {
   const finalPly = join(lib, 'scene.ply');
   // Crop to the scan area marked on the phone (only possible when the splat is in the AR frame).
   let crop = null;
-  const bounds = manifest && manifest.bounds;
+  // Scan areas in the splat's coordinates: the capture's own, or every merged phone's, moved into
+  // the main phone's AR frame.
+  let areas = [];
+  if (/^(ar-poses|sfm-ar)$/.test(rec.mode)) {
+    if (src.parts) areas = partAreas(src.parts, readCameras(rec.modelDir));
+    else if (manifest && manifest.bounds && manifest.bounds.poly && manifest.bounds.poly.length >= 3) areas = [manifest.bounds];
+  }
+  if (src.parts) writeFileSync(join(dataset, 'merge.json'), JSON.stringify({ areas }, null, 1));
   const cropOn = job.crop != null ? job.crop : cfg.cropToBounds !== false;
-  if (cropOn && bounds && bounds.poly && bounds.poly.length >= 3 && /^(ar-poses|sfm-ar)$/.test(rec.mode)) {
+  if (cropOn && areas.length) {
     try {
-      crop = cropPly(tr.ply, finalPly, bounds);
+      crop = cropPly(tr.ply, finalPly, areas);
       ctx.say(`Cropped to the scan area: removed ${crop.removed.toLocaleString()} of ${(crop.kept + crop.removed).toLocaleString()} splats outside it.`);
     } catch (e) {
       ctx.say('Could not crop to the scan area: ' + e.message);
@@ -223,7 +172,9 @@ export async function processJob(job, ctx) {
     photos: nImages, placed: rec.stats.images, colmap: { ...rec.stats, mode: rec.mode },
     training: { preset: job.preset || cfg.preset, steps: tr.iter, seconds: Math.round(tr.seconds), splats: crop ? crop.kept : tr.splats },
     crop: crop ? { removed: crop.removed, uncropped: tr.ply } : null,
-    capture: job.capture || null, source: basename(job.source.file), pano: !!job.pano,
+    capture: job.capture || null, pano: !!job.pano,
+    source: job.source.kind === 'merge' ? job.source.name : basename(job.source.file),
+    merged: src.parts ? src.parts.map((p) => ({ name: p.name, photos: p.names.length, ar: !!(p.frames && p.frames.length) })) : undefined,
     sizeMB: +(statSync(finalPly).size / 1048576).toFixed(1),
   };
   writeFileSync(join(lib, 'info.json'), JSON.stringify(info, null, 2));
@@ -235,6 +186,166 @@ export async function processJob(job, ctx) {
   }
   ctx.stage('finish', 1);
   return { ply: finalPly, folder: lib, thumb: existsSync(thumb) ? thumb : null, info, totalSec: Math.round((Date.now() - t0) / 1000) };
+}
+
+/**
+ * Unpack one capture (SplatScout ZIP, ZIP of photos, phone or 360° video) into `outDir` and work
+ * out what's known about it: lens, AR poses, scan area.
+ * @returns {Promise<{photos, nImages, manifest, camera, rig, pano, posed, arFrames}>}
+ */
+async function prepareSource(source, outDir, ctx, { log, usePoses = true, progress = () => {} }) {
+  const T = ctx.cfg.tools, token = ctx.token;
+  const imagesDir = join(outDir, 'images');
+  let manifest = null, camera = null, rig = null, pano = false, photos = imagesDir;
+  if (source.kind === 'zip') {
+    ctx.say('Unpacking capture…');
+    await extractZip(source.file, outDir, { onProgress: (f) => progress(f * 0.9) });
+    const mf = join(outDir, 'splatscout.json');
+    if (existsSync(mf)) manifest = JSON.parse(readFileSync(mf, 'utf8'));
+    if (!existsSync(imagesDir)) {
+      // A plain zip of photos: find the folder that holds the images.
+      photos = findImageFolder(outDir);
+      if (!photos) throw new Error('No photos found in the ZIP.');
+    }
+  } else if (source.kind === 'video') {
+    if (!T.ffmpeg || !T.ffprobe) throw new Error('ffmpeg/ffprobe are needed for video input.');
+    pano = isEquirect(await probeVideo(T.ffprobe, source.file));
+    ctx.say(pano ? 'Analysing 360° video for sharp frames…' : 'Analysing video for sharp, well-spaced frames…');
+    const sel = await selectFrames({ ffmpeg: T.ffmpeg, ffprobe: T.ffprobe, file: source.file, maxFrames: pano ? MAX_360_FRAMES : 450,
+      every: pano ? 0.5 : 0, progress: (f) => progress(f * 0.6), token, log });
+    const hdr = sel.info.hdr ? ' (HDR video tone-mapped)' : '';
+    if (pano) {
+      const size = viewSize(sel.info);
+      ctx.say(`360° video: selected ${sel.selected.length} of ${sel.total} frames${hdr}. Cutting each into ${VIEWS_360.length} views of ${size}×${size} px…`);
+      await extract360({ ffmpeg: T.ffmpeg, file: source.file, frames: sel.selected, info: sel.info, outDir: imagesDir, size, token, log });
+      const f = (size / 2).toFixed(4); // 90° view: focal length is half the width
+      camera = { model: 'PINHOLE', params: [f, f, f, f].join(','), single: false };
+      rig = { config: rigConfig(VIEWS_360) };
+    } else {
+      ctx.say(`Selected ${sel.selected.length} of ${sel.total} frames${hdr}. Extracting…`);
+      await extractFrames({ ffmpeg: T.ffmpeg, file: source.file, frames: sel.selected, info: sel.info, outDir: imagesDir, token, log });
+    }
+  }
+  const nImages = countImages(photos);
+
+  // Camera hint & AR poses
+  let posed = null;
+  let arFrames = null; // AR camera poses, also used to put an SfM solve into the AR frame
+  if (manifest && manifest.frames && manifest.frames.length) {
+    const intrs = manifest.frames.map((f) => f.intrinsics).filter(Boolean);
+    const key = (i) => [i.w, i.h, i.fx.toFixed(1), i.fy.toFixed(1), i.cx.toFixed(1), i.cy.toFixed(1)].join('|');
+    const uniform = intrs.length === manifest.frames.length && intrs.every((i) => key(i) === key(intrs[0]));
+    const tracking = manifest.capture && manifest.capture.tracking;
+    if (uniform && tracking === '6dof') {
+      const i = intrs[0];
+      camera = { model: 'PINHOLE', params: [i.fx, i.fy, i.cx, i.cy].map((v) => v.toFixed(4)).join(','), single: true };
+    } else if (uniform) {
+      // Camera mode: focal length is only an estimate, so let COLMAP refine it (and lens distortion).
+      const i = intrs[0];
+      camera = { model: 'SIMPLE_RADIAL', params: [i.fx, i.cx, i.cy, 0].map((v) => v.toFixed(4)).join(','), single: true };
+    } else {
+      camera = { model: 'SIMPLE_RADIAL', params: null, single: false };
+    }
+    const sparseIn = join(outDir, 'poses', 'colmap', 'sparse', '0');
+    if (tracking === '6dof' && existsSync(join(sparseIn, 'images.txt'))) {
+      const names = new Set(
+        readFileSync(join(sparseIn, 'images.txt'), 'utf8').split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.trim().split(/\s+/)).filter((p) => p.length >= 10).map((p) => p[9]),
+      );
+      const frames = manifest.frames.filter((f) => f.pose && names.has(basename(f.file))).map((f) => ({ name: basename(f.file), pose: f.pose }));
+      if (frames.length >= 10) arFrames = frames;
+      if (usePoses && frames.length >= 20) posed = { modelDir: sparseIn, frames };
+    }
+  }
+  return { photos, nImages, manifest, camera, rig, pano, posed, arFrames };
+}
+
+/**
+ * Captures of the same place from several phones, merged into one splat. Each is unpacked on its
+ * own, then its photos go into images/p1/, images/p2/ … (hard links, no copying). COLMAP solves
+ * them all together; the result is put into the AR frame of the capture with the most AR poses
+ * (real size, level floor), so captures without AR (an iPhone in camera mode, a video) gain both.
+ */
+async function prepareMerge(job, dataset, ctx, log) {
+  const parts = [];
+  const all = job.source.parts;
+  const imagesDir = join(dataset, 'images');
+  for (const [i, part] of all.entries()) {
+    const tag = `p${i + 1}`;
+    ctx.say(`Capture ${i + 1} of ${all.length}: ${part.name}`);
+    const s = await prepareSource(part, join(dataset, 'parts', tag), ctx, {
+      log, usePoses: false, progress: (f) => ctx.stage('import', ((i + f) / all.length) * 0.95),
+    });
+    if (s.rig) throw new Error(`${part.name} is a 360° video: those can't be merged with other captures yet.`);
+    // Photo names as COLMAP will know them: images/<tag>/<name>, no spaces (they'd break pair lists).
+    const rename = new Map();
+    mkdirSync(join(imagesDir, tag), { recursive: true });
+    for (const f of readdirSync(s.photos).filter((x) => /\.(jpe?g|png)$/i.test(x)).sort()) {
+      const name = `${tag}/${f.replace(/\s+/g, '_')}`;
+      rename.set(f, name);
+      try {
+        linkSync(join(s.photos, f), join(dataset, 'images', name));
+      } catch {
+        copyFileSync(join(s.photos, f), join(dataset, 'images', name));
+      }
+    }
+    const frames = s.arFrames ? s.arFrames.filter((f) => rename.has(f.name)).map((f) => ({ name: rename.get(f.name), pose: f.pose })) : null;
+    parts.push({
+      tag, name: part.name, names: [...rename.values()], camera: s.camera, frames,
+      bounds: s.manifest && s.manifest.bounds && s.manifest.bounds.poly && s.manifest.bounds.poly.length >= 3 ? s.manifest.bounds : null,
+    });
+    if (i === 0 && s.manifest && s.manifest.capture) ctx.update({ building: s.manifest.capture.building || job.building });
+  }
+  // The capture with the most AR poses sets the coordinates.
+  const ref = parts.filter((p) => p.frames && p.frames.length >= 10).sort((a, b) => b.frames.length - a.frames.length)[0];
+  ctx.say(ref
+    ? `Merging ${parts.length} captures in the AR coordinates of ${ref.name} (${ref.frames.length} AR poses).`
+    : `Merging ${parts.length} captures. None has AR poses, so the splat's size and level will be estimated.`);
+  const nImages = parts.reduce((a, p) => a + p.names.length, 0);
+  return { photos: imagesDir, nImages, manifest: null, camera: null, rig: null, pano: false, posed: null, arFrames: ref ? ref.frames : null, parts };
+}
+
+/**
+ * Each merged capture's scan area, moved into the splat's coordinates: its AR camera positions
+ * against where the solve put the same photos give a level turn, a scale and a shift (both frames
+ * are AR frames, so gravity already agrees).
+ */
+export function partAreas(parts, cams) {
+  const byName = new Map(cams.map((c) => [c.name, c.C]));
+  const out = [];
+  for (const part of parts) {
+    if (!part.bounds || !part.frames) continue;
+    const pairs = part.frames.filter((f) => byName.has(f.name)).map((f) => [[f.pose[12], f.pose[13], f.pose[14]], byName.get(f.name)]);
+    if (pairs.length < 5) continue;
+    const xf = levelSimilarity(pairs);
+    const b = part.bounds;
+    out.push({ ...b, poly: b.poly.map(([x, z]) => xf.apply2(x, z)), floorY: xf.y(b.floorY), top: b.top == null ? null : xf.y(b.top), skips: [] });
+  }
+  return out;
+}
+
+/** Best turn about the vertical, scale and shift taking points a to points b ([[a, b], …]). */
+export function levelSimilarity(pairs) {
+  const n = pairs.length;
+  let ax = 0, az = 0, bx = 0, bz = 0, ay = 0, by = 0;
+  for (const [a, b] of pairs) {
+    ax += a[0] / n; az += a[2] / n; ay += a[1] / n;
+    bx += b[0] / n; bz += b[2] / n; by += b[1] / n;
+  }
+  // Complex least squares on the floor plane: (b - b̄) ≈ k (a - ā), k = s·e^{iθ}.
+  let re = 0, im = 0, aa = 0;
+  for (const [a, b] of pairs) {
+    const px = a[0] - ax, pz = a[2] - az, qx = b[0] - bx, qz = b[2] - bz;
+    re += px * qx + pz * qz;
+    im += px * qz - pz * qx;
+    aa += px * px + pz * pz;
+  }
+  const kr = aa ? re / aa : 1, ki = aa ? im / aa : 0;
+  const s = Math.hypot(kr, ki) || 1;
+  return {
+    s, theta: Math.atan2(ki, kr),
+    apply2: (x, z) => [bx + kr * (x - ax) - ki * (z - az), bz + ki * (x - ax) + kr * (z - az)],
+    y: (y) => by + s * (y - ay),
+  };
 }
 
 function findImageFolder(root) {
