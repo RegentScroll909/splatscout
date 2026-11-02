@@ -23,6 +23,15 @@
     body.walking #dot { display: block; }
     #stick { position: fixed; width: 110px; height: 110px; margin: -55px 0 0 -55px; border-radius: 50%; border: 2px solid #fff6; background: #0003; display: none; pointer-events: none; z-index: 9; }
     #knob { position: absolute; left: 50%; top: 50%; width: 46px; height: 46px; margin: -23px 0 0 -23px; border-radius: 50%; background: #fff6; }
+    #crop { position: fixed; top: 56px; right: 12px; width: min(330px, calc(100vw - 24px)); max-height: calc(100vh - 70px); overflow: auto; scrollbar-gutter: stable; background: #0b0d10ee; border: 1px solid #3a3040; border-radius: 10px; padding: 12px; z-index: 12; display: none; box-sizing: border-box; }
+    #crop.shown { display: block; }
+    #crop .head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    #crop .head b { margin-right: auto; }
+    #cropMap { display: block; width: 100%; background: #000; border-radius: 6px; touch-action: none; cursor: crosshair; }
+    #crop .row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+    #crop .row input[type=range] { flex: 1; }
+    #crop .hint { font-size: 12px; color: #9aa; margin: 8px 0 0; line-height: 1.4; }
+    #crop .grow { flex: 1; }
   </style>
   <script type="importmap">
     {
@@ -40,6 +49,7 @@
     <button id="walk" title="Walk through the splat at eye height; walls and furniture stop you">🚶 Walk</button>
     <button id="flip" title="Turn the scene upside down if it loads inverted">⇅ Flip up</button>
     <button id="home" title="Back to the first photo's viewpoint">⌂ Start view</button>
+    <button id="cropBtn" title="See or change how the splat is cropped to the scan area" hidden>⬚ Crop</button>
     <a class="b" id="dl" download>⬇ .ply</a>
     <a class="b" href="https://superspl.at/editor" target="_blank" rel="noopener" title="Open SuperSplat, then drag the .ply onto it to clean up floaters">✂ Edit in SuperSplat</a>
   </div>
@@ -49,6 +59,15 @@
   <div id="toast"></div>
   <div id="dot"></div>
   <div id="stick"><div id="knob"></div></div>
+  <div id="crop">
+    <div class="head"><b>Crop to the scan area</b><button id="cropClose" title="Close">✕</button></div>
+    <canvas id="cropMap" title="Seen from above. Drag a corner of the outline to move it."></canvas>
+    <label class="row"><input type="checkbox" id="cropOn"> Remove small splats outside the outline</label>
+    <label class="row">Margin <input type="range" id="cropMargin" min="0" max="3" step="0.1"> <span id="cropMarginV"></span></label>
+    <p class="hint">Drag the corners to move the outline; everything in the lighter area stays. Big, faint splats always stay wherever they are: plain walls get their colour from them. Untick to keep everything.</p>
+    <div class="row"><button id="cropReset" title="Back to the outline marked on the phone">Reset outline</button><span class="grow"></span><button id="cropApply" class="on">Apply</button></div>
+    <p class="hint" id="cropMsg"></p>
+  </div>
   <script type="module">
     import * as THREE from 'three';
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -90,8 +109,11 @@
       leaveWalk();
       if (viewer) {
         orbit.dispose();
+        const root = viewer.rootElement, canvas = viewer.renderer && viewer.renderer.domElement;
         await viewer.dispose();
-        document.querySelectorAll('canvas:not(#mini)').forEach((c) => c.remove());
+        // Only the splat viewer's own canvas (and the box it made for it), not the map canvases.
+        if (canvas) canvas.remove();
+        if (root && root !== document.body && root.parentNode === document.body) root.remove();
       }
       const pos = view ? view.position : [0, 0, 0];
       const look = view ? view.lookAt : [0, 0, -1];
@@ -408,6 +430,170 @@
     addEventListener('keyup', (e) => keys.delete(e.code));
     addEventListener('blur', () => keys.clear());
     addEventListener('resize', () => walk.map && (drawMiniBase(), drawMini()));
+
+    // ------------------------------------------------------------------ crop editor
+    // A top-down map of the whole splat with the scan outline on it: move its corners, change the
+    // margin, or switch the crop off; Apply re-crops on the station (nothing is trained again).
+    const crop = { st: null, areas: null, drag: null, img: null, busy: false };
+    const cropMap = $('cropMap'), cctx = cropMap.getContext('2d');
+    const clone = (a) => JSON.parse(JSON.stringify(a));
+    const inPoly = (poly, x, z) => {
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, zi] = poly[i], [xj, zj] = poly[j];
+        if (zi > z !== zj > z && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) inside = !inside;
+      }
+      return inside;
+    };
+    const polyDist = (poly, x, z) => {
+      let best = Infinity;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [ax, az] = poly[j], [bx, bz] = poly[i], dx = bx - ax, dz = bz - az;
+        const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz || 1)));
+        best = Math.min(best, Math.hypot(x - ax - t * dx, z - az - t * dz));
+      }
+      return best;
+    };
+
+    async function openCrop() {
+      $('crop').classList.add('shown');
+      $('cropMsg').textContent = 'Loading…';
+      let j;
+      try {
+        const r = await fetch(`/api/crop?ply=${encodeURIComponent(ply)}`);
+        if (!(r.headers.get('content-type') || '').includes('json')) throw new Error('Restart SplatStation to change crops (it was started before this existed).');
+        j = await r.json();
+        if (j.error) throw new Error(j.error);
+      } catch (e) {
+        $('cropMsg').textContent = e.message;
+        return;
+      }
+      crop.st = j;
+      crop.areas = clone(j.areas);
+      $('cropOn').checked = j.on;
+      $('cropMargin').value = j.margin;
+      // The map as an image: brighter where there's more surface at wall height.
+      const m = j.map, raw = atob(m.data);
+      const c = document.createElement('canvas');
+      c.width = m.W;
+      c.height = m.H;
+      const g = c.getContext('2d'), img = g.createImageData(m.W, m.H);
+      for (let k = 0; k < raw.length; k++) {
+        const v = raw.charCodeAt(k);
+        img.data.set([v, v, v, 255], k * 4);
+      }
+      g.putImageData(img, 0, 0);
+      crop.img = c;
+      $('cropMsg').textContent = j.whole ? '' : 'What an earlier crop removed is no longer on this PC (its job was deleted), so this splat can only be cropped further.';
+      drawCrop();
+    }
+
+    function drawCrop() {
+      const st = crop.st;
+      if (!st) return;
+      const m = st.map, dpr = devicePixelRatio || 1;
+      const w = cropMap.clientWidth || 300, h = Math.round((w * m.H) / m.W);
+      cropMap.style.height = h + 'px';
+      cropMap.width = Math.round(w * dpr);
+      cropMap.height = Math.round(h * dpr);
+      const s = cropMap.width / (m.W * m.cell); // pixels per metre
+      const px = (x) => (x - m.x0) * s, py = (z) => (z - m.z0) * s;
+      cctx.imageSmoothingEnabled = false;
+      cctx.drawImage(crop.img, 0, 0, cropMap.width, cropMap.height);
+      const margin = +$('cropMargin').value, on = $('cropOn').checked;
+      $('cropMarginV').textContent = `${margin.toFixed(1)} m`;
+      if (on) {
+        // Darken what the crop would remove (small splats only; the big background stays).
+        const step = Math.max(2, Math.round(cropMap.width / 150));
+        cctx.fillStyle = '#000a';
+        for (let y = 0; y < cropMap.height; y += step) {
+          for (let x = 0; x < cropMap.width; x += step) {
+            const wx = m.x0 + (x + step / 2) / s, wz = m.z0 + (y + step / 2) / s;
+            if (!crop.areas.some((a) => inPoly(a.poly, wx, wz) || polyDist(a.poly, wx, wz) <= margin)) cctx.fillRect(x, y, step, step);
+          }
+        }
+      }
+      cctx.lineWidth = 2 * dpr;
+      for (const a of crop.areas) {
+        cctx.strokeStyle = on ? '#5fe3f0' : '#5fe3f080';
+        cctx.beginPath();
+        a.poly.forEach(([x, z], i) => (i ? cctx.lineTo(px(x), py(z)) : cctx.moveTo(px(x), py(z))));
+        cctx.closePath();
+        cctx.stroke();
+        cctx.fillStyle = '#fff';
+        for (const [x, z] of a.poly) {
+          cctx.beginPath();
+          cctx.arc(px(x), py(z), 5 * dpr, 0, Math.PI * 2);
+          cctx.fill();
+        }
+      }
+    }
+
+    const mapPoint = (e) => {
+      const m = crop.st.map, r = cropMap.getBoundingClientRect();
+      return [m.x0 + ((e.clientX - r.left) / r.width) * m.W * m.cell, m.z0 + ((e.clientY - r.top) / r.height) * m.H * m.cell];
+    };
+    cropMap.addEventListener('pointerdown', (e) => {
+      if (!crop.st) return;
+      const [x, z] = mapPoint(e), m = crop.st.map;
+      const reach = (12 / cropMap.getBoundingClientRect().width) * m.W * m.cell; // 12 px, in metres
+      let best = null;
+      crop.areas.forEach((a, ai) => a.poly.forEach(([cx, cz], ci) => {
+        const d = Math.hypot(cx - x, cz - z);
+        if (d < reach && (!best || d < best.d)) best = { ai, ci, d };
+      }));
+      if (!best) return;
+      crop.drag = best;
+      try {
+        cropMap.setPointerCapture(e.pointerId);
+      } catch {}
+    });
+    cropMap.addEventListener('pointermove', (e) => {
+      if (!crop.drag) return;
+      crop.areas[crop.drag.ai].poly[crop.drag.ci] = mapPoint(e);
+      drawCrop();
+    });
+    const drop = () => (crop.drag = null);
+    cropMap.addEventListener('pointerup', drop);
+    cropMap.addEventListener('pointercancel', drop);
+    $('cropMargin').addEventListener('input', drawCrop);
+    $('cropOn').addEventListener('change', drawCrop);
+    $('cropReset').onclick = () => {
+      if (!crop.st || !crop.st.original.length) return;
+      crop.areas = clone(crop.st.original);
+      drawCrop();
+    };
+    $('cropClose').onclick = () => $('crop').classList.remove('shown');
+    $('cropBtn').onclick = () => ($('crop').classList.contains('shown') ? $('crop').classList.remove('shown') : openCrop());
+    $('cropApply').onclick = async () => {
+      if (!crop.st || crop.busy) return;
+      crop.busy = true;
+      $('cropApply').disabled = true;
+      $('cropMsg').textContent = 'Cropping…';
+      try {
+        const r = await fetch('/api/crop', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ply, on: $('cropOn').checked, areas: crop.areas, margin: +$('cropMargin').value }),
+        }).then((x) => x.json());
+        if (r.error) throw new Error(r.error);
+        $('cropMsg').textContent = r.removed ? `Kept ${r.kept.toLocaleString()} splats, removed ${r.removed.toLocaleString()} small ones outside. Reloading…` : `Kept all ${r.kept.toLocaleString()} splats. Reloading…`;
+        // The splat changed: load it again, and the walk map with it.
+        walk.map = null;
+        mapReq = null;
+        await load();
+        fetchMap();
+        const fresh = await fetch(`/api/crop?ply=${encodeURIComponent(ply)}`).then((x) => x.json());
+        if (!fresh.error) crop.st = { ...fresh, map: crop.st.map };
+        $('cropMsg').textContent = 'Done.';
+      } catch (e) {
+        $('cropMsg').textContent = 'Could not crop: ' + e.message;
+      } finally {
+        crop.busy = false;
+        $('cropApply').disabled = false;
+      }
+    };
+    // Only splats in the library can be re-cropped (job previews are still training).
+    $('cropBtn').hidden = !(ply && ply.startsWith('/files/library/'));
 
     // ------------------------------------------------------------------ loop & buttons
     let last = performance.now();

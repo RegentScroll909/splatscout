@@ -1,6 +1,6 @@
 // Self-checks for the platform-independent core (run: node tools/check.mjs).
 import assert from 'node:assert/strict';
-import { writeFileSync, mkdtempSync, readFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -721,6 +721,36 @@ test('station crops a splat to the scan area', () => {
   assert.match(txt, /element vertex 3\n/);
   const start = txt.indexOf('end_header\n') + 11;
   assert.deepEqual([0, 1, 2].map((i) => out.readFloatLE(start + i * 16 + 12)), [0, 3, 4]);
+});
+
+test('station crop keeps the big background splats and can be changed or undone later', () => {
+  // x, y, z, opacity, log-scales; the id rides in opacity. Outside the 3 m square: a small floater
+  // (id 1), a big faint blob 6 m out that paints a plain wall (id 2), and one under the floor (id 3).
+  const props = ['x', 'y', 'z', 'opacity', 'scale_0', 'scale_1', 'scale_2'];
+  const pts = [[1, 1, 1, 0.05], [5, 1, 1, 0.05], [9, 1, 1, 0.8], [1, -2, 1, 0.05], [2, 0.5, 2, 0.05]];
+  const header = `ply\nformat binary_little_endian 1.0\nelement vertex ${pts.length}\n${props.map((p) => `property float ${p}\n`).join('')}end_header\n`;
+  const body = Buffer.alloc(pts.length * 28);
+  pts.forEach(([x, y, z, s], i) => [x, y, z, i, Math.log(s), Math.log(s / 2), Math.log(s / 4)].forEach((v, k) => body.writeFloatLE(v, i * 28 + k * 4)));
+  const dir = mkdtempSync(join(tmpdir(), 'ssc-'));
+  const scene = join(dir, 'scene.ply'), outside = join(dir, 'scene.outside.ply');
+  writeFileSync(join(dir, 'trained.ply'), Buffer.concat([Buffer.from(header, 'latin1'), body]));
+  const ids = (f) => {
+    const b = readFileSync(f), s = b.toString('latin1').indexOf('end_header\n') + 11;
+    return Array.from({ length: (b.length - s) / 28 }, (_, i) => b.readFloatLE(s + i * 28 + 12)).sort();
+  };
+  const area = { poly: [[0, 0], [3, 0], [3, 3], [0, 3]], floorY: 0 };
+  assert.deepEqual(cropPly(join(dir, 'trained.ply'), scene, area, 0.5, { outside }), { kept: 3, removed: 2 });
+  assert.deepEqual(ids(scene), [0, 2, 4], 'the big blob stays');
+  assert.deepEqual(ids(outside), [1, 3], 'what was removed is kept beside it');
+  // Undo it (keep everything), then crop again: the same result, nothing lost on the way.
+  assert.deepEqual(cropPly([scene, outside], scene, null, 0, { outside }), { kept: 5, removed: 0 });
+  assert.deepEqual(ids(scene), [0, 1, 2, 3, 4]);
+  assert.ok(!existsSync(outside), 'nothing left outside');
+  cropPly(scene, scene, area, 0.5, { outside });
+  assert.deepEqual(ids(scene), [0, 2, 4]);
+  // A wider outline brings the floater back.
+  cropPly([scene, outside], scene, { ...area, poly: [[0, 0], [6, 0], [6, 3], [0, 3]] }, 0.5, { outside });
+  assert.deepEqual(ids(scene), [0, 1, 2, 4]);
 });
 
 // ---- walk mode: a made-up splat of two rooms joined by a doorway, in the AR frame (phone at y≈0).

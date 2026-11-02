@@ -8,7 +8,7 @@ import { reconstruct, viewHint, countImages } from './colmap.mjs';
 import { trainBrush } from './trainer.mjs';
 import { selectFrames, extractFrames, probeVideo, isEquirect, extract360, viewSize, rigConfig, VIEWS_360 } from './video.mjs';
 import { run } from './run.mjs';
-import { cropPly } from './crop.mjs';
+import { cropPly, CROP_MARGIN } from './crop.mjs';
 import { walkInputs, walkMapFor, readCameras } from './walkmap.mjs';
 import { PRESETS, saveConfig } from './config.mjs';
 
@@ -144,8 +144,8 @@ export async function processJob(job, ctx) {
   const cropOn = job.crop != null ? job.crop : cfg.cropToBounds !== false;
   if (cropOn && areas.length) {
     try {
-      crop = cropPly(tr.ply, finalPly, areas);
-      ctx.say(`Cropped to the scan area: removed ${crop.removed.toLocaleString()} of ${(crop.kept + crop.removed).toLocaleString()} splats outside it.`);
+      crop = cropPly(tr.ply, finalPly, areas, CROP_MARGIN, { outside: join(lib, 'scene.outside.ply') });
+      ctx.say(`Cropped to the scan area: removed ${crop.removed.toLocaleString()} of ${(crop.kept + crop.removed).toLocaleString()} small splats outside it (kept beside it, so the crop can be changed in the viewer).`);
     } catch (e) {
       ctx.say('Could not crop to the scan area: ' + e.message);
       crop = null;
@@ -171,7 +171,8 @@ export async function processJob(job, ctx) {
     building: job.building, room: job.room, created: new Date().toISOString(), jobId: job.id, view,
     photos: nImages, placed: rec.stats.images, colmap: { ...rec.stats, mode: rec.mode },
     training: { preset: job.preset || cfg.preset, steps: tr.iter, seconds: Math.round(tr.seconds), splats: crop ? crop.kept : tr.splats },
-    crop: crop ? { removed: crop.removed, uncropped: tr.ply } : null,
+    // The outline the crop used (in splat coordinates), so the viewer can show and change it.
+    crop: crop ? { removed: crop.removed, margin: CROP_MARGIN, areas: areas.map((a) => ({ poly: a.poly, floorY: a.floorY, top: a.top ?? null })), uncropped: tr.ply } : areas.length ? { off: true, margin: CROP_MARGIN, areas: areas.map((a) => ({ poly: a.poly, floorY: a.floorY, top: a.top ?? null })) } : null,
     capture: job.capture || null, pano: !!job.pano,
     source: job.source.kind === 'merge' ? job.source.name : basename(job.source.file),
     merged: src.parts ? src.parts.map((p) => ({ name: p.name, photos: p.names.length, ar: !!(p.frames && p.frames.length) })) : undefined,
@@ -180,7 +181,7 @@ export async function processJob(job, ctx) {
   writeFileSync(join(lib, 'info.json'), JSON.stringify(info, null, 2));
   // Map of where you can walk, so the viewer's walk mode opens straight away.
   try {
-    await walkMapFor(finalPly, walkInputs({ jobDir: dir, mode: rec.mode, view, pano: !!job.pano }));
+    await walkMapFor(finalPly, walkInputs({ jobDir: dir, mode: rec.mode, view, pano: !!job.pano, areas: info.crop && info.crop.areas }));
   } catch (e) {
     ctx.say('No walk map: ' + e.message);
   }

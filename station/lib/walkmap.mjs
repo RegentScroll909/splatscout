@@ -394,10 +394,11 @@ export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric 
 /**
  * What a walk map needs for one splat: the phone's path, up direction, scale and scan outline,
  * from the job folder when it still exists (else just the viewer's start view).
- * @param {object} o {jobDir, mode, view, up, pano} — `up` is the viewer's current up (it can be
- *   flipped); `pano` marks 360 video, filmed with the camera on a stick above head height
+ * @param {object} o {jobDir, mode, view, up, pano, areas} — `up` is the viewer's current up (it can be
+ *   flipped); `pano` marks 360 video, filmed with the camera on a stick above head height; `areas` is
+ *   the outline the splat was last cropped to, when someone changed it in the viewer
  */
-export function walkInputs({ jobDir = null, mode = null, view = null, up = null, pano = false }) {
+export function walkInputs({ jobDir = null, mode = null, view = null, up = null, pano = false, areas = null }) {
   const ar = /^(ar-poses|sfm-ar)$/.test(mode || '');
   let cams = [];
   for (const d of jobDir ? [join(jobDir, 'colmap', 'final_txt'), join(jobDir, 'train', 'sparse', '0')] : []) {
@@ -413,7 +414,8 @@ export function walkInputs({ jobDir = null, mode = null, view = null, up = null,
   let polys = [];
   const mf = jobDir && join(jobDir, 'dataset', 'splatscout.json'), mm = jobDir && join(jobDir, 'dataset', 'merge.json');
   try {
-    if (ar && mm && existsSync(mm)) polys = JSON.parse(readFileSync(mm, 'utf8')).areas.map((a) => a.poly);
+    if (ar && areas && areas.length) polys = areas.map((a) => a.poly);
+    else if (ar && mm && existsSync(mm)) polys = JSON.parse(readFileSync(mm, 'utf8')).areas.map((a) => a.poly);
     else if (ar && mf && existsSync(mf)) {
       const b = JSON.parse(readFileSync(mf, 'utf8')).bounds;
       if (b && b.poly) polys = [b.poly];

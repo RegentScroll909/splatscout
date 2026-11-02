@@ -17,6 +17,7 @@ import { killTree, capture } from './lib/run.mjs';
 import { PhoneImporter } from './lib/adb.mjs';
 import { readZipText } from './lib/zipread.mjs';
 import { walkInputs, walkMapFor } from './lib/walkmap.mjs';
+import { cropPly, topDown, CROP_MARGIN } from './lib/crop.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, 'web');
@@ -306,6 +307,64 @@ function library() {
   return out.sort((a, b) => (a.stamp < b.stamp ? 1 : -1));
 }
 
+// ------------------------------------------------------------------------------------ crops
+let cropBusy = false;
+const cropMaps = new Map(); // folder -> {key, map}
+
+/** Where a library splat's crop stands: what to crop from, the outline in use and the capture's own. */
+function cropState(folder) {
+  let info = {};
+  try {
+    info = JSON.parse(readFileSync(join(folder, 'info.json'), 'utf8'));
+  } catch {}
+  const scene = join(folder, 'scene.ply'), outside = join(folder, 'scene.outside.ply');
+  const c = info.crop || null;
+  // Everything the splat had: the scene plus what a crop removed (kept beside it, or still in the job).
+  let sources = [scene];
+  if (existsSync(outside)) sources.push(outside);
+  else if (c && !c.off && c.uncropped && existsSync(c.uncropped)) sources = [c.uncropped];
+  const whole = sources.length > 1 || sources[0] !== scene || !c || !!c.off;
+  // The capture's own outline(s): from its job (merged captures: every phone's, in splat coordinates).
+  let original = [];
+  const job = jobs.find((j) => j.id === info.jobId);
+  const ar = /^(ar-poses|sfm-ar)$/.test((info.colmap && info.colmap.mode) || '');
+  if (job && ar) {
+    try {
+      const mm = join(job.dir, 'dataset', 'merge.json'), mf = join(job.dir, 'dataset', 'splatscout.json');
+      if (existsSync(mm)) original = JSON.parse(readFileSync(mm, 'utf8')).areas;
+      else if (existsSync(mf)) {
+        const bd = JSON.parse(readFileSync(mf, 'utf8')).bounds;
+        if (bd && bd.poly && bd.poly.length >= 3) original = [bd];
+      }
+    } catch {}
+  }
+  original = original.map((a) => ({ poly: a.poly, floorY: a.floorY, top: a.top ?? null }));
+  const areas = c && c.areas && c.areas.length ? c.areas : original;
+  const margin = c && c.margin != null ? c.margin : CROP_MARGIN;
+  return {
+    info, sources, areas,
+    public: { on: !!(c && !c.off), margin, areas, original, whole, removed: c && c.removed, splats: info.training && info.training.splats },
+  };
+}
+
+/** Top-down picture of the whole splat around its outline(s), cached until the files change. */
+function cropMap(st) {
+  const key = st.sources.map((f) => `${f}:${statSync(f).size}:${statSync(f).mtimeMs}`).join('|');
+  const folder = dirname(st.sources[0]);
+  const hit = cropMaps.get(folder);
+  if (hit && hit.key === key) return hit.map;
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (const a of st.areas) for (const [x, z] of a.poly) {
+    x0 = Math.min(x0, x); x1 = Math.max(x1, x);
+    z0 = Math.min(z0, z); z1 = Math.max(z1, z);
+  }
+  const pad = 2; // room to drag the outline outwards
+  const m = topDown(st.sources, Math.min(...st.areas.map((a) => a.floorY)), [x0 - pad, x1 + pad, z0 - pad, z1 + pad]);
+  const map = { ...m, data: Buffer.from(m.data).toString('base64') };
+  cropMaps.set(folder, { key, map });
+  return map;
+}
+
 function safeDirs(d) {
   try {
     return readdirSync(d, { withFileTypes: true }).filter((x) => x.isDirectory()).map((x) => x.name);
@@ -344,6 +403,38 @@ const server = createServer(async (req, res) => {
     }
     if (path === '/api/jobs') return sendJson(res, jobs.map(publicJob));
     if (path === '/api/library') return sendJson(res, library());
+    if (path === '/api/crop') {
+      // A library splat's crop: GET shows it (outline, margin, a top-down map to draw on), POST
+      // changes or undoes it. ?ply=<the viewer's /files/library/… URL>
+      const b = req.method === 'POST' ? await readBody(req) : null;
+      const ply = (b ? b.ply : url.searchParams.get('ply')) || '';
+      const file = ply.startsWith('/files/library/') && under(cfg.dirs.library, ply.slice('/files/library/'.length));
+      if (!file || basename(file) !== 'scene.ply' || !existsSync(file)) return sendJson(res, { error: 'Only splats in the library can be cropped here.' }, 404);
+      const st = cropState(dirname(file));
+      if (!b) {
+        if (!st.areas.length) return sendJson(res, { error: 'This splat has no scan area to crop to (it was made without AR positions, or from a video).' }, 422);
+        return sendJson(res, { ...st.public, map: cropMap(st) });
+      }
+      if (cropBusy) return sendJson(res, { error: 'Another crop is still running.' }, 409);
+      const areas = Array.isArray(b.areas) ? b.areas.filter((a) => a && Array.isArray(a.poly) && a.poly.length >= 3 && a.poly.every((p) => p.length === 2 && p.every(Number.isFinite)) && Number.isFinite(a.floorY)) : [];
+      const margin = Math.max(0, Math.min(5, +b.margin || 0));
+      if (b.on && !areas.length) return sendJson(res, { error: 'No outline to crop to.' }, 400);
+      cropBusy = true;
+      try {
+        const r = cropPly(st.sources, file, b.on ? areas : null, margin, { outside: join(dirname(file), 'scene.outside.ply') });
+        const info = st.info;
+        const keep = areas.map((a) => ({ poly: a.poly.map(([x, z]) => [+x.toFixed(3), +z.toFixed(3)]), floorY: a.floorY, top: a.top ?? null }));
+        info.crop = { ...(b.on ? { removed: r.removed } : { off: true }), margin, areas: keep, uncropped: info.crop && info.crop.uncropped };
+        if (info.training) info.training.splats = r.kept;
+        info.sizeMB = +(statSync(file).size / 1048576).toFixed(1);
+        writeFileSync(join(dirname(file), 'info.json'), JSON.stringify(info, null, 2));
+        return sendJson(res, { ok: true, kept: r.kept, removed: r.removed });
+      } catch (e) {
+        return sendJson(res, { error: String(e.message || e) }, 500);
+      } finally {
+        cropBusy = false;
+      }
+    }
     if (path === '/api/walkmap') {
       // Where you can walk in a splat (viewer's walk mode). ?ply=<the viewer's /files/… URL>&up=x,y,z
       const ply = url.searchParams.get('ply') || '';
@@ -362,7 +453,7 @@ const server = createServer(async (req, res) => {
       if (!file || !/\.ply$/i.test(file) || !existsSync(file)) return sendJson(res, { error: 'Splat not found' }, 404);
       const mode = (info && info.colmap && info.colmap.mode) || (job && job.colmap && job.colmap.mode) || null;
       const pano = !!((info && info.pano) || (job && job.pano));
-      const inputs = walkInputs({ jobDir: job && job.dir, mode, view: info && info.view, up: up.length === 3 && up.every(Number.isFinite) ? up : null, pano });
+      const inputs = walkInputs({ jobDir: job && job.dir, mode, view: info && info.view, up: up.length === 3 && up.every(Number.isFinite) ? up : null, pano, areas: info && info.crop && info.crop.areas });
       try {
         return sendJson(res, await walkMapFor(file, inputs));
       } catch (e) {

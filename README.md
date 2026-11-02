@@ -156,8 +156,12 @@ phone/360 video ─┼─► inbox / upload / USB ─┤   • AR poses → tria
 ```
 
 With a SplatScout 2.0 capture that has a scan area, the finished splat is **cropped to that outline** (plus 0.5 m),
-which removes floaters seen through windows or past the area. The uncropped splat stays in the job folder.
-Turn it off on the dashboard (*Crop splats to the scan area*).
+which removes small floaters seen through windows or past the area. Big, faint splats stay wherever they are:
+seen only from inside a room, a plain wall can be painted by large blobs metres behind it, and cropping those
+away left walls dark and see-through. What the crop removes is kept beside the splat (`scene.outside.ply`).
+Turn cropping off on the dashboard (*Crop splats to the scan area*), or change it afterwards in the viewer:
+**⬚ Crop** shows the splat from above with the outline on it. Drag its corners, change the margin, or untick it
+to keep everything, then press Apply. It takes a few seconds and nothing is trained again.
 
 **Start it:** double-click **`start-station.cmd`** (or run `node station/station.mjs`), then open
 **http://localhost:8787**. The dashboard shows captures ready to process, the queue, a progress bar for each stage,
@@ -239,7 +243,7 @@ The original captures stay as they are. 360° videos can't be merged yet.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (42 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (43 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
@@ -248,7 +252,7 @@ Tested on this PC:
   the height you hold the phone, a skipped spot never coming back, everywhere you've walked counting as
   reachable), lined-up sessions sharing one map, photos while walking, coaching priority/hysteresis (slower
   turns at plain walls, slipping tracking first), scoring, COLMAP/transforms export, ZIP validity,
-  splat cropping, and walk mode (floor, walls, a plain wall of big flat splats, a table, a doorway, floor holes,
+  splat cropping (big background splats kept, a crop changed and undone without losing anything), and walk mode (floor, walls, a plain wall of big flat splats, a table, a doorway, floor holes,
   floaters, sliding along walls, an upside-down splat of unknown size, COLMAP text and binary camera files), and the
   360° camera rig (each cut view turned the way ffmpeg cuts it), and merging phones (pairs within and across
   captures; each phone's scan area moved into the main phone's coordinates).
@@ -258,6 +262,12 @@ Tested on this PC:
   2.2 it could even crash on reaching that pass, leaving the guide silent. In some runs it also gave up at once
   with the room 54–75% covered, because a gap in the depth map cut the user's spot off from the rest of the
   floor. After: 40–110 s in the room, 3–3½ minutes in the hallway, both ending at 93%, over 7 runs each.
+- **Cropping** on the Schwada "Snall" splat (2.2 million splats), whose plain white walls came out dark and
+  see-through. The walls sat right on the outline and the crop removed only 0.1% of the solid splats at wall
+  height, but cropping at 0.5, 1 or 2 m all left them dark: 73,000 large faint splats 7–28 m away outweighed
+  everything inside the room about 300 to 1 and were painting the walls. Keeping splats 25 cm and bigger
+  brought the walls back, bright and sharp, still cropping 84,000 small ones. Re-cropping took about 2 s; keep
+  everything, a moved corner with a 1 m margin and back to the phone's outline gave exactly the first result.
 - **Merging (2.3)** on the real Ggg capture split into pretend phones (odd photos with AR; even photos
   either with AR in a frame turned 70° and moved 6 m, or with no AR like an iPhone in camera mode). Both merges
   placed 535–536 of 537 photos at 0.8 px error in about 5 minutes on Quick. The camera-mode photos landed a
