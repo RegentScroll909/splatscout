@@ -23,6 +23,8 @@
     body.walking #dot { display: block; }
     #stick { position: fixed; width: 110px; height: 110px; margin: -55px 0 0 -55px; border-radius: 50%; border: 2px solid #fff6; background: #0003; display: none; pointer-events: none; z-index: 9; }
     #knob { position: absolute; left: 50%; top: 50%; width: 46px; height: 46px; margin: -23px 0 0 -23px; border-radius: 50%; background: #fff6; }
+    #jump { position: fixed; right: 18px; top: 50%; width: 64px; height: 64px; margin-top: -32px; border-radius: 50%; font-size: 24px; background: #0006; border: 2px solid #fff6; display: none; z-index: 10; touch-action: none; }
+    body.walking.touch #jump { display: block; }
     #crop { position: fixed; top: 56px; right: 12px; width: min(330px, calc(100vw - 24px)); max-height: calc(100vh - 70px); overflow: auto; scrollbar-gutter: stable; background: #0b0d10ee; border: 1px solid #3a3040; border-radius: 10px; padding: 12px; z-index: 12; display: none; box-sizing: border-box; }
     #crop.shown { display: block; }
     #crop .head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -59,6 +61,7 @@
   <div id="toast"></div>
   <div id="dot"></div>
   <div id="stick"><div id="knob"></div></div>
+  <button id="jump" title="Jump (in ghost mode: hold to rise)">⤒</button>
   <div id="crop">
     <div class="head"><b>Crop to the scan area</b><button id="cropClose" title="Close">✕</button></div>
     <canvas id="cropMap" title="Seen from above. Drag a corner of the outline to move it."></canvas>
@@ -67,6 +70,7 @@
     <p class="hint">Drag the corners to move the outline; everything in the lighter area stays. Big, faint splats always stay wherever they are: plain walls get their colour from them. Untick to keep everything.</p>
     <div class="row"><button id="cropReset" title="Back to the outline marked on the phone">Reset outline</button><span class="grow"></span><button id="cropApply" class="on">Apply</button></div>
     <p class="hint" id="cropMsg"></p>
+    <div class="row"><button id="cropPeek" class="grow" title="See exactly what the crop took out (put back by unticking the crop)" hidden>Show only what’s removed</button></div>
   </div>
   <script type="module">
     import * as THREE from 'three';
@@ -83,17 +87,22 @@
     $('dl').href = ply;
 
     const touchFirst = matchMedia('(pointer: coarse)').matches;
+    document.body.classList.toggle('touch', touchFirst);
     const HELP = {
       orbit: 'Drag to orbit · right-drag to pan · scroll to zoom',
       walk: touchFirst
-        ? 'Left thumb walks · right thumb looks · tap the map to jump'
-        : 'W A S D to walk · click, then move the mouse to look (Esc frees it) · ← → turn · Shift hurry · G ghost · M map',
-      ghost: touchFirst ? 'Ghost: no walls · walk to fly where you look' : 'Ghost: fly through walls · Space/E up · C/Q down · G to land',
+        ? 'Left thumb walks · right thumb looks · ⤒ jumps · tap the map to go there'
+        : 'W A S D to walk · Space jump · click, then move the mouse to look (Esc frees it) · ← → turn · Shift hurry · G ghost · M map',
+      ghost: touchFirst ? 'Ghost: no walls · walk to fly where you look · hold ⤒ to rise' : 'Ghost: fly through walls · Space/E up · C/Q down · G to land',
     };
     const WALK_SPEED = 1.4, RUN_SPEED = 3, LOOK = 0.0025, TOUCH_LOOK = 0.005;
+    const JUMP_SPEED = 3.1, GRAVITY = 9.8; // m/s, m/s²: about half a metre up
 
     let up = view && view.up ? view.up : [0, -1, 0];
     let viewer = null, orbit = null, baseFov = 50;
+    // What the viewer shows: the splat, or (from the crop panel) only what its crop removed.
+    const outsidePly = ply && ply.replace(/scene\.ply$/, 'scene.outside.ply');
+    let shown = ply;
 
     // ------------------------------------------------------------------ toast
     let toastTimer = 0;
@@ -105,7 +114,8 @@
     }
 
     // ------------------------------------------------------------------ splat
-    async function load() {
+    /** @param {{position:number[], lookAt:number[]}} [at] camera to start with (default: the start view) */
+    async function load(at = null) {
       leaveWalk();
       if (viewer) {
         orbit.dispose();
@@ -115,8 +125,8 @@
         if (canvas) canvas.remove();
         if (root && root !== document.body && root.parentNode === document.body) root.remove();
       }
-      const pos = view ? view.position : [0, 0, 0];
-      const look = view ? view.lookAt : [0, 0, -1];
+      const pos = at ? at.position : view ? view.position : [0, 0, 0];
+      const look = at ? at.lookAt : view ? view.lookAt : [0, 0, -1];
       viewer = new GaussianSplats3D.Viewer({
         cameraUp: up,
         initialCameraPosition: pos,
@@ -133,12 +143,25 @@
       orbit.update();
       hookPointer(viewer.renderer.domElement);
       try {
-        await viewer.addSplatScene(ply, { splatAlphaRemovalThreshold: 5, showLoadingUI: true, progressiveLoad: true, format: GaussianSplats3D.SceneFormat.Ply });
+        await viewer.addSplatScene(shown, { splatAlphaRemovalThreshold: 5, showLoadingUI: true, progressiveLoad: true, format: GaussianSplats3D.SceneFormat.Ply });
         viewer.start();
         $('msg').textContent = '';
       } catch (e) {
         $('msg').textContent = 'Could not load the splat: ' + (e.message || e);
       }
+    }
+
+    /** Load again without moving the camera (back to walking if you were), e.g. after a crop. */
+    async function reload(splatChanged) {
+      const walking = walk.on;
+      leaveWalk(); // still needs the old walk map
+      await load({ position: viewer.camera.position.toArray(), lookAt: orbit.target.toArray() });
+      if (splatChanged) {
+        walk.map = null;
+        mapReq = null;
+        fetchMap();
+      }
+      if (walking) await enterWalk();
     }
 
     // ------------------------------------------------------------------ walk map
@@ -160,7 +183,7 @@
     }
 
     // ------------------------------------------------------------------ walking
-    const walk = { on: false, ghost: false, map: null, walker: null, yaw: 0, pitch: 0, y: 0, vx: 0, vy: 0, vz: 0 };
+    const walk = { on: false, ghost: false, air: false, map: null, walker: null, yaw: 0, pitch: 0, y: 0, vx: 0, vy: 0, vz: 0 };
     const keys = new Set();
     const stick = { id: null, x0: 0, y0: 0, x: 0, y: 0 };
     const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -207,7 +230,7 @@
         return;
       }
       [w.x, w.z] = spot;
-      Object.assign(walk, { on: true, ghost: false, y: m.floorY + m.eye, vx: 0, vy: 0, vz: 0 });
+      Object.assign(walk, { on: true, ghost: false, air: false, y: m.floorY + m.eye, vx: 0, vy: 0, vz: 0 });
       orbit.enabled = false;
       cam.up.copy(sceneDir(m, [0, 1, 0]));
       cam.fov = 70;
@@ -250,8 +273,15 @@
         if (p) [w.x, w.z] = p;
       }
       walk.ghost = on;
+      walk.air = false;
       $('help').textContent = on ? HELP.ghost : HELP.walk;
       toast(on ? 'Ghost mode: walls don’t stop you' : 'Back on the floor');
+    }
+
+    function jump() {
+      if (!walk.on || walk.ghost || walk.air) return;
+      walk.vy = JUMP_SPEED;
+      walk.air = true;
     }
 
     function turn(dx, dy, k = LOOK) {
@@ -288,7 +318,13 @@
         walk.y += walk.vy * dt;
       } else {
         w.move(walk.vx * dt, walk.vz * dt);
-        walk.y += (m.floorY + m.eye - walk.y) * Math.min(1, dt * 6);
+        const ground = m.floorY + m.eye;
+        if (walk.air) {
+          // Jumping: up, and gravity brings you back to eye height (walls still stop you).
+          walk.y += (walk.vy - (GRAVITY * dt) / 2) * dt; // exact, so slow frames jump as high
+          walk.vy -= GRAVITY * dt;
+          if (walk.y <= ground) Object.assign(walk, { y: ground, vy: 0, air: false });
+        } else walk.y += (ground - walk.y) * Math.min(1, dt * 6);
       }
       const cam = viewer.camera, cp = Math.cos(walk.pitch);
       const eye = toScene(m, [w.x, walk.y, w.z]);
@@ -420,7 +456,10 @@
       if (!walk.on || e.ctrlKey || e.metaKey || e.altKey) return;
       keys.add(e.code);
       if (MOVE_KEYS.includes(e.code)) e.preventDefault();
+      // Space would also press whatever button or checkbox was clicked last.
+      if (e.code === 'Space' && document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
       if (e.repeat) return;
+      if (e.code === 'Space') jump();
       if (e.code === 'KeyG') setGhost(!walk.ghost);
       if (e.code === 'KeyM') {
         mini.classList.toggle('shown');
@@ -428,6 +467,13 @@
       }
     });
     addEventListener('keyup', (e) => keys.delete(e.code));
+    // Touch: the ⤒ button jumps, or in ghost mode rises while held (like Space).
+    $('jump').addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      keys.add('Space');
+      jump();
+    });
+    for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) $('jump').addEventListener(ev, () => keys.delete('Space'));
     addEventListener('blur', () => keys.clear());
     addEventListener('resize', () => walk.map && (drawMiniBase(), drawMini()));
 
@@ -486,6 +532,36 @@
       crop.img = c;
       $('cropMsg').textContent = j.whole ? '' : 'What an earlier crop removed is no longer on this PC (its job was deleted), so this splat can only be cropped further.';
       drawCrop();
+      checkPeek();
+    }
+
+    /** The "show only what's removed" button: there when a crop removed something (kept beside the splat). */
+    async function checkPeek() {
+      let ok = false;
+      try {
+        ok = (await fetch(outsidePly, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' })).ok;
+      } catch {}
+      $('cropPeek').hidden = !ok;
+      if (!ok && shown !== ply) await peek(false);
+    }
+
+    async function peek(on) {
+      if (on === (shown !== ply)) return;
+      shown = on ? outsidePly : ply;
+      $('cropPeek').textContent = on ? 'Show the cropped splat' : 'Show only what’s removed';
+      $('cropPeek').classList.toggle('on', on);
+      $('cropPeek').disabled = true;
+      try {
+        await reload(false);
+      } finally {
+        $('cropPeek').disabled = false;
+      }
+      if (on) toast('Showing only the splats the crop removed', 4000);
+    }
+
+    function closeCrop() {
+      $('crop').classList.remove('shown');
+      peek(false); // back to the splat itself
     }
 
     function drawCrop() {
@@ -563,8 +639,9 @@
       crop.areas = clone(crop.st.original);
       drawCrop();
     };
-    $('cropClose').onclick = () => $('crop').classList.remove('shown');
-    $('cropBtn').onclick = () => ($('crop').classList.contains('shown') ? $('crop').classList.remove('shown') : openCrop());
+    $('cropClose').onclick = closeCrop;
+    $('cropBtn').onclick = () => ($('crop').classList.contains('shown') ? closeCrop() : openCrop());
+    $('cropPeek').onclick = () => peek(shown === ply);
     $('cropApply').onclick = async () => {
       if (!crop.st || crop.busy) return;
       crop.busy = true;
@@ -576,16 +653,19 @@
           body: JSON.stringify({ ply, on: $('cropOn').checked, areas: crop.areas, margin: +$('cropMargin').value }),
         }).then((x) => x.json());
         if (r.error) throw new Error(r.error);
-        $('cropMsg').textContent = r.removed ? `Kept ${r.kept.toLocaleString()} splats, removed ${r.removed.toLocaleString()} small ones outside. Reloading…` : `Kept all ${r.kept.toLocaleString()} splats. Reloading…`;
-        // The splat changed: load it again, and the walk map with it (after load: leaving walk
-        // mode still needs the old map).
-        await load();
-        walk.map = null;
-        mapReq = null;
-        fetchMap();
+        $('cropMsg').textContent = 'Loading the new splat…';
+        // The splat changed: load it again where you are, and the walk map with it.
+        shown = ply;
+        $('cropPeek').textContent = 'Show only what’s removed';
+        $('cropPeek').classList.remove('on');
+        await reload(true);
         const fresh = await fetch(`/api/crop?ply=${encodeURIComponent(ply)}`).then((x) => x.json());
         if (!fresh.error) crop.st = { ...fresh, map: crop.st.map };
-        $('cropMsg').textContent = 'Done.';
+        await checkPeek();
+        // What's removed is mostly faint specks beyond the walls: say so, or it looks like nothing happened.
+        $('cropMsg').textContent = r.removed
+          ? `Removed ${r.removed.toLocaleString()} small splats outside the outline (${r.kept.toLocaleString()} stay). They’re mostly faint specks beyond the walls, so from inside the room little changes: zoom out, or show only what’s removed.`
+          : `Crop off: all ${r.kept.toLocaleString()} splats are in.`;
       } catch (e) {
         $('cropMsg').textContent = 'Could not crop: ' + e.message;
       } finally {
@@ -610,6 +690,7 @@
 
     $('walk').onclick = () => (walk.on ? leaveWalk() : enterWalk());
     $('flip').onclick = () => {
+      leaveWalk(); // before the walk map goes
       up = up.map((v) => -v);
       walk.map = null;
       load();

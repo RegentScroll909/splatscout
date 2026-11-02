@@ -161,7 +161,9 @@ seen only from inside a room, a plain wall can be painted by large blobs metres 
 away left walls dark and see-through. What the crop removes is kept beside the splat (`scene.outside.ply`).
 Turn cropping off on the dashboard (*Crop splats to the scan area*), or change it afterwards in the viewer:
 **⬚ Crop** shows the splat from above with the outline on it. Drag its corners, change the margin, or untick it
-to keep everything, then press Apply. It takes a few seconds and nothing is trained again.
+to keep everything, then press Apply. It takes a few seconds, nothing is trained again, and the camera stays
+where it was. What's removed is mostly faint specks beyond the walls, so from inside the room a crop can look like
+it did nothing: zoom out, or press *Show only what's removed* to see exactly what it took out.
 
 **Start it:** double-click **`start-station.cmd`** (or run `node station/station.mjs`), then open
 **http://localhost:8787**. The dashboard shows captures ready to process, the queue, a progress bar for each stage,
@@ -201,8 +203,9 @@ SuperSplat** to crop and clean floaters.
 
 **Walk through it.** In the viewer, press **🚶 Walk** to explore the splat in first person, at the height the phone
 was held. Use W A S D (or ↑ ↓, with ← → to turn), click the scene and move the mouse to look around, hold Shift to
-hurry, press G for ghost mode (fly through walls; G again lands you on the floor) and M to hide the mini-map; click
-the mini-map to jump somewhere. On a phone or tablet the left thumb walks and the right thumb looks. Walls,
+hurry, Space to jump, press G for ghost mode (fly through walls; G again lands you on the floor) and M to hide the
+mini-map; click the mini-map to go somewhere. On a phone or tablet the left thumb walks, the right thumb looks and
+the ⤒ button jumps. Walls,
 furniture and the edge of the scanned floor stop you, and you slide along them instead of sticking. SplatStation
 works this out from the splat itself: it finds the floor below where the phone went, treats solid splats between
 knee and head height as walls and furniture, and keeps you where it saw floor and inside the scan area. Plain
