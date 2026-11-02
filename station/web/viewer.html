@@ -577,10 +577,11 @@
         }).then((x) => x.json());
         if (r.error) throw new Error(r.error);
         $('cropMsg').textContent = r.removed ? `Kept ${r.kept.toLocaleString()} splats, removed ${r.removed.toLocaleString()} small ones outside. Reloading…` : `Kept all ${r.kept.toLocaleString()} splats. Reloading…`;
-        // The splat changed: load it again, and the walk map with it.
+        // The splat changed: load it again, and the walk map with it (after load: leaving walk
+        // mode still needs the old map).
+        await load();
         walk.map = null;
         mapReq = null;
-        await load();
         fetchMap();
         const fresh = await fetch(`/api/crop?ply=${encodeURIComponent(ply)}`).then((x) => x.json());
         if (!fresh.error) crop.st = { ...fresh, map: crop.st.map };
