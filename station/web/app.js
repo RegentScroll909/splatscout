@@ -406,6 +406,72 @@ function viewerFromPath(it) {
   return '/viewer.html?' + q;
 }
 
+// ------------------------------------------------------------------ club uploads
+// Captures phones uploaded to the club database, grouped by building. Import brings one into
+// "Ready to process" (nothing runs until you press Process there).
+const CROWD_STATUS = { uploading: ['Still uploading', 'run'], new: ['New', 'new'], approved: ['Imported', ''], processed: ['Processed', ''] };
+
+async function loadCrowd() {
+  const el = $('#crowd');
+  let r;
+  try {
+    r = await api('/api/crowd');
+  } catch {
+    return put(el, empty('Restart SplatStation to see club uploads (it was started before they existed).'));
+  }
+  if (!r.configured || r.error) {
+    $('#crowdCount').textContent = '';
+    return put(el, h('p', { class: r.configured ? 'err small' : 'muted small' }, r.error));
+  }
+  const ups = r.uploads, busy = new Set(r.importing);
+  $('#crowdCount').textContent = String(ups.filter((u) => u.status === 'new').length).padStart(2, '0') + ' new';
+  if (!ups.length) return put(el, empty('Nothing uploaded yet. Captures sent from SplatScout (Upload on the review screen) appear here, by building.'));
+  const byB = new Map();
+  for (const u of ups) {
+    if (!byB.has(u.building_name)) byB.set(u.building_name, []);
+    byB.get(u.building_name).push(u);
+  }
+  put(el, [...byB.keys()].sort().map((b) => h('div', { class: 'crowd-building' },
+    h('h3', {}, b, h('span', { class: 'muted small' }, ` · ${byB.get(b).length}`)),
+    byB.get(b).sort((x, y) => `${x.floor}|${x.room}`.localeCompare(`${y.floor}|${y.room}`) || (y.created_at > x.created_at ? 1 : -1)).map((u) => crowdCard(u, busy.has(u.id))))));
+}
+
+function crowdCard(u, busy) {
+  const [label, cls] = CROWD_STATUS[u.status] || [u.status, ''];
+  const where = [u.floor && `Floor ${u.floor}`, u.room].filter(Boolean).join(' · ') || 'No room given';
+  const note = h('span', { class: 'muted small' });
+  const imp = h('button', {
+    class: 'btn small ' + (u.status === 'new' ? 'primary' : 'ghost'), disabled: busy || u.status === 'uploading',
+    onclick: async () => {
+      imp.disabled = true;
+      note.textContent = 'Downloading… (see the activity log)';
+      const res = await api('/api/crowd/import', { id: u.id });
+      note.textContent = res.ok ? `In Ready to process as ${res.file}` : res.error;
+      if (res.ok) setTimeout(loadCrowd, 3000);
+      else imp.disabled = false;
+    },
+  }, icon('download'), u.status === 'new' ? 'Import' : 'Import again');
+  return h('div', { class: 'job' },
+    h('div', { class: 'job-head' }, h('div', { class: 'job-title' }, h('span', {}, where)), h('span', { class: 'badge ' + cls }, busy ? 'Importing…' : label)),
+    h('div', { class: 'meta' },
+      u.grade ? h('span', { class: 'grade g-' + u.grade.toLowerCase() }, u.grade) : null,
+      h('span', {}, [`${u.photo_count} photos`, { xr: 'AR tracked', camera: 'camera mode', demo6: 'practice', demo3: 'practice' }[u.mode] || u.mode, u.contributor && `by ${u.contributor}`, u.gps_accuracy_m != null && `GPS ±${Math.round(u.gps_accuracy_m)} m`].filter(Boolean).join(' · ')),
+      h('span', { class: 'muted' }, ` · uploaded ${fmtTime(u.created_at)}`)),
+    h('div', { class: 'actions' }, imp,
+      h('button', {
+        class: 'btn small ghost danger', disabled: busy,
+        onclick: async () => {
+          if (!confirm('Delete this upload from the club database for good? (Frees its storage. Anything already imported stays here.)')) return;
+          const res = await api('/api/crowd/delete', { id: u.id });
+          if (res.error) alert(res.error);
+          loadCrowd();
+        },
+      }, icon('trash'), 'Delete'),
+      note),
+  );
+}
+$('#crowdRefresh').addEventListener('click', loadCrowd);
+
 // ------------------------------------------------------------------ live updates
 function connect() {
   const es = new EventSource('/api/events');
@@ -455,6 +521,8 @@ function appendLog(entry) {
   for (const j of await api('/api/jobs')) jobs.set(j.id, j);
   renderJobs();
   loadLibrary();
+  loadCrowd();
+  setInterval(loadCrowd, 60000);
   for (const e of await api('/api/log')) appendLog(e);
   connect();
   setInterval(() => [...jobs.values()].some((j) => j.status === 'running') && scheduleRender(), 1000);

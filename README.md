@@ -114,10 +114,33 @@ mode automatically.
    If it takes a while, tap **Show me on the map** and tap where you're standing. To continue another time:
    **Capture more → Continue in AR**.
 6. **Done** grades the capture on the spot: *Keep capturing* or *Finish & review*.
-7. In Review: check the fixes, then **Export**, choose what to include, and **Save ZIP**.
+7. In Review: check the fixes, then **Export**, choose what to include, and **Save ZIP**. Or **Upload** it to
+   the club database (below).
 
 The in-app **Capture guide** is the full field manual: golden rules, technique for each type of space,
 lighting, tricky surfaces, and a "splat symptom → capture fix" table.
+
+### Club uploads (crowdsourcing)
+
+Anyone with the app can add captures to one shared dataset, filed by building, floor and room, for
+SplatStation to turn into splats (and merge, when several people scanned the same room).
+
+- **Which building:** *Find my building* on the New capture screen uses GPS to pick from ASU's buildings
+  (outlines from OpenStreetMap, all four campuses). It only picks by itself when the fix is good to 40 m and
+  inside one building; indoors GPS is often off by 10–50 m, so it offers the nearby buildings to tap instead.
+  Typed names are matched to the same list ("Schwada Building" → Schwada Classroom Office Building), so
+  everyone's uploads of a building land together. Floor and room come from you (the sign by the door).
+- **Upload** on the review screen: choose the photos (as for Export), confirm building, floor and room, and
+  agree to how the photos are used. Photos go one by one, so a dropped connection resumes with
+  **Resume upload** instead of starting over. **Remove from club database** deletes your upload again.
+  Photos carry no GPS or camera metadata (they come from the canvas); the GPS reading is stored with the
+  capture's details instead.
+- **Where it goes:** a Supabase project (free plan: about 1 GB, so roughly 3–6 captures of 300–1,000
+  photos). Files land in the private `captures` bucket as `<building>/<floor-room>/<capture id>/` (the
+  same files as the export ZIP), with one row per capture in the `captures` table. Each phone signs in
+  anonymously; the database rules let it add, finish and delete only its own uploads, never see or change
+  anyone else's. Set up a project once with [`crowd/supabase-setup.sql`](crowd/supabase-setup.sql) (turn on
+  anonymous sign-ins first); the project URL and publishable key are in `app/js/data/crowd.js`.
 
 ## 3. Use the export in your pipeline
 
@@ -184,6 +207,11 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   upload. Put that address in SplatScout → Settings → *SplatStation address* to get an "Open SplatStation" button
   after each export. Campus Wi-Fi often blocks phone-to-PC traffic; use USB there.
 - **Copy files** into `%USERPROFILE%\SplatStation\inbox`.
+- **Club uploads:** put the Supabase project's secret key in `%USERPROFILE%\SplatStation\crowd.json`
+  (`{"url": "https://….supabase.co", "secretKey": "sb_secret_…"}`; it never leaves this PC). *Club uploads*
+  on the dashboard then lists what phones sent, by building. **Import** downloads one into *Ready to process*
+  as a normal SplatScout ZIP filed under the shared building name; **Delete** removes it from the club
+  database for good (frees its storage).
 
 **Quality presets** (choose on the dashboard; you can re-train any finished job with a different preset):
 
@@ -246,7 +274,7 @@ The original captures stay as they are. 360° videos can't be merged yet.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (43 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (45 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
@@ -258,7 +286,9 @@ Tested on this PC:
   splat cropping (big background splats kept, a crop changed and undone without losing anything), and walk mode (floor, walls, a plain wall of big flat splats, a table, a doorway, floor holes,
   floaters, sliding along walls, an upside-down splat of unknown size, COLMAP text and binary camera files), and the
   360° camera rig (each cut view turned the way ffmpeg cuts it), and merging phones (pairs within and across
-  captures; each phone's scan area moved into the main phone's coordinates).
+  captures; each phone's scan area moved into the main phone's coordinates), and club uploads (GPS picking a
+  building only when sure, typed names matched to the ASU list, an upload resuming after a dropped connection
+  without sending anything twice, SplatStation turning it back into a normal ZIP filed under the shared name).
 - **The guide loop (2.3)**, with a simulated person following every pass of the Practice hallway and room
   (walking, turning, taking the photos the app asks for, pressing Skip when it offers). Before: the last pass
   never ended (in the hallway, still going after 15 minutes with 83 turn reversals and 96 trips back), and since
@@ -336,10 +366,12 @@ app/js/core/      platform-independent logic (analysis, coverage, depth filter, 
                   plan, re-alignment + photo matching, keyframes, coaching, plans, scoring, export formats)
 app/js/sources/   xrSource (WebXR/ARCore), cameraSource (getUserMedia + orientation), demoSource/demoScene (practice room, hallway)
 app/js/capture/   session engine, 3D overlay (+ guide geometry), minimap, audio
-app/js/data/      IndexedDB storage, settings, ZIP export
+app/js/data/      IndexedDB storage, settings, ZIP export, campus (ASU buildings + GPS), crowd (club uploads)
 app/js/ui/        screens
-tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs
-station/          SplatStation: station.mjs (server, queue, inbox, merges), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb),
+app/data/         asu-buildings.json (from OpenStreetMap: node tools/asu-buildings.mjs refreshes it)
+crowd/            supabase-setup.sql (the club database: table, private bucket, rules)
+tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs, asu-buildings.mjs
+station/          SplatStation: station.mjs (server, queue, inbox, merges), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb, crowd),
                   web/ (dashboard, viewer, walk.js: walk-mode collision shared with the self-checks)
 ```
 
@@ -348,3 +380,4 @@ station/          SplatStation: station.mjs (server, queue, inbox, merges), lib/
 - `npm run icons`: regenerate the PNG icons
 
 No dependencies, no build step. Photos are stored on the phone in IndexedDB until you delete them.
+Building outlines © OpenStreetMap contributors, available under the Open Database License.

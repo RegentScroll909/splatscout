@@ -13,7 +13,7 @@ import { analyzeCapture } from '../core/score.js';
 import { drawTopDown, drawPanorama } from '../capture/minimap.js';
 import { mainSpace, spaceOf, spaceCount } from '../core/spaces.js';
 
-export const APP_VERSION = '2.3.0';
+export const APP_VERSION = '2.4.0';
 
 export function slugify(s) {
   return (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'capture';
@@ -26,24 +26,36 @@ export function exportName(capture) {
 }
 
 /**
+ * Build the export ZIP.
  * @param capture capture record
  * @param frames full frame records (with jpeg blobs) in order: the photos chosen for export
  * @param o.includePoses write the AR poses
  * @param o.selection what was left out, recorded in the manifest ({total, left: {reason: count}})
  * @param onProgress (fraction, label)
  */
-export async function buildExport(capture, frames, { includePoses = true, selection = null } = {}, onProgress = () => {}) {
-  const base = exportName(capture);
+export async function buildExport(capture, frames, o = {}, onProgress = () => {}) {
+  const { base, files } = await exportFiles(capture, frames, o, (p, l) => onProgress(p * 0.3, l));
   const zip = new ZipWriter();
-  const names = frames.map((_, i) => `${String(i + 1).padStart(4, '0')}.jpg`);
-
-  for (let i = 0; i < frames.length; i++) {
-    const f = frames[i];
-    await zip.add(`${base}/images/${names[i]}`, f.jpeg, f.crc);
-    if (i % 10 === 0) onProgress((i / frames.length) * 0.85, `Adding photos ${i + 1}/${frames.length}`);
+  for (let i = 0; i < files.length; i++) {
+    await zip.add(`${base}/${files[i].name}`, files[i].data, files[i].crc);
+    if (i % 10 === 0) onProgress(0.3 + (i / files.length) * 0.7, `Adding files ${i + 1}/${files.length}`);
   }
+  onProgress(1, 'Done');
+  return { blob: zip.finish(), filename: `${base}.zip` };
+}
 
-  onProgress(0.86, 'Writing metadata');
+/**
+ * What goes into an export, as files (the ZIP's contents, also what a club upload sends).
+ * Same arguments as buildExport.
+ * @returns {Promise<{base: string, files: {name: string, data: Blob|Uint8Array|string, crc?: number, type: string}[]}>}
+ */
+export async function exportFiles(capture, frames, { includePoses = true, selection = null } = {}, onProgress = () => {}) {
+  const base = exportName(capture);
+  const names = frames.map((_, i) => `${String(i + 1).padStart(4, '0')}.jpg`);
+  const files = frames.map((f, i) => ({ name: `images/${names[i]}`, data: f.jpeg, crc: f.crc, type: 'image/jpeg' }));
+  const add = (name, data, type) => files.push({ name, data, type });
+
+  onProgress(0.1, 'Writing metadata');
   const analysis = analyzeCapture(frames, capture);
   const manifest = {
     app: 'SplatScout',
@@ -52,8 +64,10 @@ export async function buildExport(capture, frames, { includePoses = true, select
     capture: {
       id: capture.id,
       building: capture.building,
+      buildingCode: capture.buildingCode || null, // from the ASU building list (app/data/asu-buildings.json)
       room: capture.room,
       floor: capture.floor,
+      geo: capture.geo || null, // GPS where the capture was set up: {lat, lon, acc (m), t}
       notes: capture.notes,
       author: capture.author,
       template: capture.template,
@@ -90,7 +104,7 @@ export async function buildExport(capture, frames, { includePoses = true, select
       baselineM: f.baseline,
     })),
   };
-  await zip.add(`${base}/splatscout.json`, JSON.stringify(manifest, null, 1));
+  add('splatscout.json', JSON.stringify(manifest, null, 1), 'application/json');
 
   // Poses from the main space: AR sessions that were lined up with each other share coordinates.
   let posedNote = 'No AR poses (camera mode or tracking unavailable).';
@@ -100,32 +114,27 @@ export async function buildExport(capture, frames, { includePoses = true, select
     const main = ms ? frames.map((f, i) => ({ ...f, name: names[i] })).filter((f) => posed(f) && spaceOf(f, capture) === ms.space) : [];
     const others = spaceCount(frames, capture) - 1;
     if (main.length >= 3) {
-      onProgress(0.9, 'Writing poses');
+      onProgress(0.4, 'Writing poses');
       // Keep only points on confirmed surfaces (seen by several depth frames, never seen through)
       // and inside the scan area: no floaters to seed the splat with.
       const vm = analysis.voxels, b = analysis.bounds;
       const pts = mergePoints(main, 0.03, (x, y, z) => vm.isSolidAt(x, y, z) && (!b || b.contains(x, y, z)));
       const hasPts = pts.xyz.length > 0;
-      await zip.add(`${base}/poses/transforms.json`, transformsJson(main.map((f) => ({ name: `images/${f.name}`, pose: f.pose, intr: f.intr })), hasPts ? 'points.ply' : null));
+      add('poses/transforms.json', transformsJson(main.map((f) => ({ name: `images/${f.name}`, pose: f.pose, intr: f.intr })), hasPts ? 'points.ply' : null), 'application/json');
       const col = colmapText(main.map((f) => ({ name: f.name, pose: f.pose, intr: f.intr })), hasPts ? pts : null);
-      await zip.add(`${base}/poses/colmap/sparse/0/cameras.txt`, col.cameras);
-      await zip.add(`${base}/poses/colmap/sparse/0/images.txt`, col.images);
-      await zip.add(`${base}/poses/colmap/sparse/0/points3D.txt`, col.points3D);
-      await zip.add(`${base}/poses/colmap/sparse/0/rigs.txt`, col.rigs);
-      await zip.add(`${base}/poses/colmap/sparse/0/frames.txt`, col.frames);
-      if (hasPts) await zip.add(`${base}/poses/points.ply`, new Uint8Array(await plyBlob(pts).arrayBuffer()));
+      for (const k of ['cameras', 'images', 'points3D', 'rigs', 'frames']) add(`poses/colmap/sparse/0/${k}.txt`, col[k], 'text/plain');
+      if (hasPts) add('poses/points.ply', new Uint8Array(await plyBlob(pts).arrayBuffer()), 'application/octet-stream');
       const sessions = new Set(main.map((f) => f.segment)).size;
       posedNote = `AR poses for ${main.length} of ${frames.length} photos` + (sessions > 1 ? ` (${sessions} AR sessions lined up into one map)` : '') + (others > 0 ? `; ${others} other map(s) not included because they weren't lined up with this one.` : '.');
     }
   }
 
-  onProgress(0.95, 'Rendering coverage map');
+  onProgress(0.8, 'Rendering coverage map');
   const png = await coveragePng(analysis, frames, capture);
-  if (png) await zip.add(`${base}/coverage.png`, new Uint8Array(await png.arrayBuffer()));
-  await zip.add(`${base}/README.txt`, readme(capture, frames.length, analysis, posedNote));
-
-  onProgress(1, 'Done');
-  return { blob: zip.finish(), filename: `${base}.zip` };
+  if (png) add('coverage.png', new Uint8Array(await png.arrayBuffer()), 'image/png');
+  add('README.txt', readme(capture, frames.length, analysis, posedNote), 'text/plain');
+  onProgress(1, 'Metadata ready');
+  return { base, files };
 }
 
 async function coveragePng(analysis, frames, capture) {

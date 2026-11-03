@@ -18,6 +18,7 @@ import { PhoneImporter } from './lib/adb.mjs';
 import { readZipText } from './lib/zipread.mjs';
 import { walkInputs, walkMapFor } from './lib/walkmap.mjs';
 import { cropPly, topDown, CROP_MARGIN } from './lib/crop.mjs';
+import * as crowd from './lib/crowd.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, 'web');
@@ -307,6 +308,8 @@ function library() {
   return out.sort((a, b) => (a.stamp < b.stamp ? 1 : -1));
 }
 
+const crowdBusy = new Set(); // club uploads being imported or deleted
+
 // ------------------------------------------------------------------------------------ crops
 let cropBusy = false;
 const cropMaps = new Map(); // folder -> {key, map}
@@ -403,6 +406,42 @@ const server = createServer(async (req, res) => {
     }
     if (path === '/api/jobs') return sendJson(res, jobs.map(publicJob));
     if (path === '/api/library') return sendJson(res, library());
+    if (path === '/api/crowd') {
+      // Club uploads from phones (Supabase): list, import into the inbox, or delete.
+      const c = crowd.crowdConfig(cfg.workDir);
+      if (c.error) return sendJson(res, { configured: false, error: c.error });
+      try {
+        return sendJson(res, { configured: true, uploads: await crowd.listUploads(c), importing: [...crowdBusy] });
+      } catch (e) {
+        return sendJson(res, { configured: true, error: 'Could not reach the club database: ' + e.message });
+      }
+    }
+    if ((path === '/api/crowd/import' || path === '/api/crowd/delete') && req.method === 'POST') {
+      const c = crowd.crowdConfig(cfg.workDir);
+      if (c.error) return sendJson(res, { error: c.error }, 400);
+      const { id } = await readBody(req);
+      if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/.test(id)) return sendJson(res, { error: 'Bad upload id' }, 400);
+      if (crowdBusy.has(id)) return sendJson(res, { error: 'Already working on that upload' }, 409);
+      crowdBusy.add(id);
+      try {
+        if (path.endsWith('/delete')) {
+          await crowd.deleteUpload(c, id);
+          say('Deleted a club upload from the database.');
+          return sendJson(res, { ok: true });
+        }
+        let last = 0;
+        const file = await crowd.importUpload(c, id, cfg.dirs.inbox, (p) => {
+          if (p - last >= 0.25) say(`Club upload: downloading ${Math.round((last = p) * 100)}%`);
+        });
+        say(`Club upload imported: ${basename(file)}`);
+        setTimeout(scanInbox, 100);
+        return sendJson(res, { ok: true, file: basename(file) });
+      } catch (e) {
+        return sendJson(res, { error: e.message }, 500);
+      } finally {
+        crowdBusy.delete(id);
+      }
+    }
     if (path === '/api/crop') {
       // A library splat's crop: GET shows it (outline, margin, a top-down map to draw on), POST
       // changes or undoes it. ?ply=<the viewer's /files/library/… URL>

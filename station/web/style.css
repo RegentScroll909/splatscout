@@ -123,6 +123,11 @@ input[type=checkbox]:disabled { opacity: 0.4; }
 .badge.waiting { color: var(--text); }
 .badge.done { color: var(--good); border-color: rgba(52, 211, 153, 0.4); }
 .badge.failed { color: var(--bad); border-color: rgba(242, 109, 109, 0.4); }
+.badge.new { color: var(--accent); border-color: rgba(61, 220, 255, 0.45); }
+.badge.run { color: var(--warn); border-color: rgba(245, 185, 66, 0.4); }
+.crowd-building + .crowd-building { margin-top: 14px; }
+.crowd-building h3 { margin: 0 0 8px; }
+.crowd-building .list, .crowd-building .job + .job { margin-top: 8px; }
 .opts { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; padding: 10px 12px; background: var(--surface-2); border-radius: 8px; border: 1px solid var(--line); }
 .stages { display: flex; gap: 6px; flex-wrap: wrap; }
 .stage { flex: 1 1 80px; min-width: 80px; }

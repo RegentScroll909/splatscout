@@ -6,9 +6,11 @@ import { analyzeCapture } from '../core/score.js';
 import { getTemplate } from '../core/plans.js';
 import { spaceOf } from '../core/spaces.js';
 import { drawTopDown, drawPanorama } from '../capture/minimap.js';
-import { buildExport, deliver } from '../data/exporter.js';
+import { buildExport, exportFiles, deliver } from '../data/exporter.js';
 import * as store from '../data/store.js';
-import { getSettings } from '../data/settings.js';
+import * as campus from '../data/campus.js';
+import { uploadCapture, deleteUpload } from '../data/crowd.js';
+import { getSettings, setSettings } from '../data/settings.js';
 
 const FLAG_LABEL = {
   blurry: 'blurry', rushed: 'rushed', dark: 'dark', highlights: 'glare', lowtex: 'blank', untracked: 'no pose', rotonly: 'turned only',
@@ -66,7 +68,10 @@ export async function reviewScreen(root, { captureId, navigate }) {
           h('div.row',
             h('button.btn.primary', { onclick: () => navigate(`#/capture/${captureId}`) }, icon('camera'), 'Capture more'),
             h('button.btn', { onclick: () => openExport(a) }, icon('download'), 'Export'),
+            h('button.btn', { onclick: () => startUpload(a) }, icon('upload'), uploading() ? 'Resume upload' : 'Upload'),
             capture.exportedAt ? h('span.tag', `Exported ${fmtDate(capture.exportedAt)}`) : null,
+            capture.upload && capture.upload.status === 'done' ? h('span.tag.good', `Uploaded ${fmtDate(capture.upload.finished)}`) : null,
+            uploading() ? h('span.tag.warn', `Upload paused · ${(capture.upload.sent || []).length} files sent`) : null,
           ),
         ),
 
@@ -115,9 +120,15 @@ export async function reviewScreen(root, { captureId, navigate }) {
         ),
 
         h('section.danger-zone',
+          capture.upload
+            ? h('button.btn.small.danger', { onclick: removeUpload }, icon('trash'), uploading() ? 'Cancel upload' : 'Remove from club database')
+            : null,
           h('button.btn.small.danger', {
             onclick: async () => {
-              if (await confirmDialog('Delete this capture and all its photos? This cannot be undone.', 'Delete', true)) {
+              const msg = capture.upload
+                ? 'Delete this capture and all its photos from this phone? Your upload stays in the club database (remove it first if you want it gone). This cannot be undone.'
+                : 'Delete this capture and all its photos? This cannot be undone.';
+              if (await confirmDialog(msg, 'Delete', true)) {
                 await store.deleteCapture(captureId);
                 navigate('#/');
               }
@@ -195,8 +206,8 @@ export async function reviewScreen(root, { captureId, navigate }) {
   }
 
   // ---------------------------------------------------------------- export
-  /** Choose what goes into the ZIP before building it. */
-  function openExport(a) {
+  /** Choose what goes into the ZIP (or the club upload) before building it. */
+  function openExport(a, mode = 'zip') {
     const sel = { blurry: false, untracked: false, passes: new Set(), spaces: new Set() };
     const passes = [...new Set(frames.map((f) => f.pass))];
     const spaces = [...new Set(frames.filter((f) => f.tracked && f.pose).map((f) => spaceOf(f, capture)))];
@@ -224,11 +235,15 @@ export async function reviewScreen(root, { captureId, navigate }) {
         count != null ? h('span.mono.muted', String(count)) : null);
     const blurryN = frames.filter(isBlurry).length;
     const untrackedN = capture.tracking === '6dof' ? frames.filter((f) => !f.tracked).length : 0;
-    const go = h('button.btn.primary', { onclick: () => { const c = chosen(); back.remove(); doExport(c, a); } }, icon('download'), 'Build ZIP');
+    const go = mode === 'upload'
+      ? h('button.btn.primary', { onclick: () => { const c = chosen(); back.remove(); openUpload(c); } }, icon('upload'), 'Next')
+      : h('button.btn.primary', { onclick: () => { const c = chosen(); back.remove(); doExport(c, a); } }, icon('download'), 'Build ZIP');
     const back = h('div.modal-back', { onclick: (e) => e.target === back && back.remove() },
       h('div.modal.wide',
-        h('h3', 'Export'),
-        h('p.small.muted', 'Choose which photos go to SplatStation. Everything stays on the phone either way.'),
+        h('h3', mode === 'upload' ? 'Upload to the club' : 'Export'),
+        h('p.small.muted', mode === 'upload'
+          ? 'Choose which photos to send to the club database, where SplatStation picks them up. Everything stays on the phone either way.'
+          : 'Choose which photos go to SplatStation. Everything stays on the phone either way.'),
         h('h4', 'Leave out'),
         check('Blurry or rushed photos', blurryN, false, (v) => (sel.blurry = v)),
         untrackedN ? check('Photos without an AR position', untrackedN, false, (v) => (sel.untracked = v)) : null,
@@ -243,6 +258,148 @@ export async function reviewScreen(root, { captureId, navigate }) {
     );
     document.body.appendChild(back);
     update();
+  }
+
+  // ---------------------------------------------------------------- club upload
+  const uploading = () => !!(capture.upload && capture.upload.status === 'uploading');
+  const practice = () => /^demo/.test(capture.engine || '');
+
+  async function startUpload(a) {
+    if (uploading()) return doUpload(null, null);
+    if (capture.upload) {
+      // Uploaded before (e.g. then captured more): the new upload replaces it.
+      if (!(await confirmDialog('This capture is already in the club database. Replace that upload with a new one?', 'Replace'))) return;
+      try {
+        await deleteUpload(capture);
+      } catch (e) {
+        return toast(e.message);
+      }
+      delete capture.upload;
+      await store.putCapture(capture);
+    }
+    openExport(a, 'upload');
+  }
+
+  /** Where it's filed (building from the ASU list, floor, room), who took it, and consent. */
+  async function openUpload(chosenFrames) {
+    const asu = await campus.buildings();
+    const guess = practice()
+      ? null
+      : (capture.buildingCode && (await campus.byCode(capture.buildingCode))) ||
+        (await campus.matchName(capture.building)) ||
+        (capture.geo && (await campus.near(capture.geo, 1)).map((x) => x.b)[0]) ||
+        null;
+    const settings = getSettings();
+    const st = { building: guess ? guess.name : '', floor: capture.floor || '', room: capture.room || '', name: settings.author || '', ok: !!settings.crowdConsent };
+    const size = chosenFrames.reduce((s, f) => s + (f.size || 0), 0);
+    const msg = h('p.small.warn-text');
+    const near = capture.geo && !practice() ? await campus.near(capture.geo) : [];
+    const bInput = h('input', { list: 'ublist', value: st.building, placeholder: 'Start typing an ASU building', oninput: (e) => (st.building = e.target.value) });
+    const back = h('div.modal-back', { onclick: (e) => e.target === back && back.remove() },
+      h('div.modal.wide',
+        h('h3', 'Upload to the club'),
+        practice()
+          ? h('p.small.muted', 'Practice captures are filed under “Practice”, apart from real buildings.')
+          : h('label.field', h('span', 'Building'), bInput, h('datalist#ublist', asu.map((b) => h('option', { value: b.name })))),
+        near.length
+          ? h('div.chips', near.map(({ b, dist }) => h('button.btn.small', { onclick: () => { st.building = bInput.value = b.name; } }, b.name + (dist > 0 ? ` · ${Math.round(dist)} m` : ''))))
+          : null,
+        h('div.row.two',
+          h('label.field', h('span', 'Room or section'), h('input', { value: st.room, placeholder: 'e.g. 214, Main lobby', oninput: (e) => (st.room = e.target.value) })),
+          h('label.field.narrow', h('span', 'Floor'), h('input', { value: st.floor, placeholder: '2', oninput: (e) => (st.floor = e.target.value) }))),
+        h('label.field', h('span', 'Your name (optional, shown to the club)'), h('input', { value: st.name, maxlength: 60, oninput: (e) => (st.name = e.target.value) })),
+        h('label.check-row',
+          h('input', { type: 'checkbox', checked: st.ok, onchange: (e) => (st.ok = e.target.checked) }),
+          h('span.check-label.small', 'I took these photos. The club may keep them and use them to make 3D models of campus that may be shown publicly. Nobody is in them who didn’t agree to be photographed.')),
+        h('p.small.muted.upload-note', `${chosenFrames.length} photos · ${fmtBytes(size)}. Keep this screen open while it uploads; if it stops, press Resume upload to carry on. You can remove your upload from this phone at any time.`),
+        msg,
+        h('div.row.end',
+          h('button.btn.ghost', { onclick: () => back.remove() }, 'Cancel'),
+          h('button.btn.primary', {
+            onclick: async () => {
+              const b = practice() ? { code: 'practice', name: 'Practice' } : asu.find((x) => x.name.toLowerCase() === st.building.trim().toLowerCase()) || (await campus.matchName(st.building));
+              if (!b) return (msg.textContent = 'Pick the building from the list, so everyone’s uploads of it end up together.');
+              if (!st.room.trim()) return (msg.textContent = 'Say which room or part of the building this is.');
+              if (!st.ok) return (msg.textContent = 'Tick the box to agree to how the photos are used.');
+              setSettings({ crowdConsent: Date.now(), author: st.name.trim() });
+              back.remove();
+              doUpload(chosenFrames.map((f) => f.id), { buildingCode: b.code, buildingName: b.name, floor: st.floor.trim(), room: st.room.trim(), contributor: st.name.trim() });
+            },
+          }, icon('upload'), 'Upload'),
+        ),
+      ),
+    );
+    document.body.appendChild(back);
+  }
+
+  /** Send it (or carry on with an unfinished upload: same photos, same place). */
+  async function doUpload(frameIds, tags) {
+    const up = capture.upload;
+    if (uploading()) {
+      frameIds = frameIds || up.frameIds;
+      tags = tags || up.tags;
+    }
+    if (!frameIds || !tags) return toast('Start the upload again from Upload');
+    const bar = h('div.bar-fill.good', { style: { width: '0%' } });
+    const label = h('div.small.mono', 'Preparing…');
+    const stop = new AbortController();
+    const pause = h('button.btn.ghost', { onclick: () => { stop.abort(); pause.disabled = true; label.textContent = 'Pausing…'; } }, 'Pause');
+    const back = h('div.modal-back', h('div.modal', h('h3', 'Uploading'), h('div.bar', bar), label, h('div.row.end', pause)));
+    document.body.appendChild(back);
+    let lock = null;
+    try {
+      lock = await navigator.wakeLock.request('screen');
+    } catch {}
+    try {
+      const ids = new Set(frameIds);
+      const full = (await store.getFrames(captureId)).filter((f) => ids.has(f.id));
+      if (!full.length) throw new Error('The photos chosen for this upload were deleted. Cancel it and upload again.');
+      const left = frames.length - full.length;
+      const { files } = await exportFiles(capture, full, { includePoses: true, selection: { total: frames.length, left: left ? { chosen: left } : {} } }, (p, l) => {
+        bar.style.width = Math.round(p * 5) + '%';
+        label.textContent = l;
+      });
+      const done = await uploadCapture(capture, files, tags, {
+        save: (c) => store.putCapture(c),
+        frameIds,
+        signal: stop.signal,
+        onProgress: (p, l) => {
+          bar.style.width = Math.round(5 + p * 95) + '%';
+          label.textContent = l;
+        },
+      });
+      const where = [done.tags.buildingName, done.tags.floor && `floor ${done.tags.floor}`, done.tags.room].filter(Boolean).join(' · ');
+      mount(back.firstChild,
+        h('h3', 'Uploaded'),
+        h('p', `Filed under ${where}.`),
+        h('p.small.muted', 'The club reviews uploads in SplatStation before turning them into splats.'),
+        h('div.row.end', h('button.btn.primary', { onclick: () => { back.remove(); render(); } }, 'Done')));
+    } catch (e) {
+      console.error(e);
+      const paused = stop.signal.aborted;
+      mount(back.firstChild,
+        h('h3', paused ? 'Upload paused' : 'Upload stopped'),
+        h('p', paused ? 'Press Resume upload to carry on where it stopped.' : e.message || String(e)),
+        h('div.row.end',
+          h('button.btn.ghost', { onclick: () => { back.remove(); render(); } }, 'Close'),
+          uploading() ? h('button.btn.primary', { onclick: () => { back.remove(); doUpload(null, null); } }, 'Resume') : null));
+    } finally {
+      if (lock) lock.release().catch(() => {});
+    }
+  }
+
+  async function removeUpload() {
+    const ask = uploading() ? 'Cancel this upload and remove what was sent so far?' : 'Remove this capture from the club database? It stays on this phone.';
+    if (!(await confirmDialog(ask, 'Remove', true))) return;
+    try {
+      await deleteUpload(capture);
+      delete capture.upload;
+      await store.putCapture(capture);
+      toast('Removed from the club database');
+    } catch (e) {
+      toast(e.message);
+    }
+    render();
   }
 
   async function doExport(chosenFrames, a) {

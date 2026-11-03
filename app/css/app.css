@@ -130,6 +130,9 @@ button { font: inherit; color: inherit; }
 .link { background: none; border: none; color: var(--accent); cursor: pointer; padding: 6px 0; }
 .field { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; font-size: 0.82rem; color: var(--muted); }
 .field.narrow { flex: 0 0 90px; }
+.geo-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: -2px 0 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
+.upload-note { margin: 10px 0; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
 input:not([type]), input[type=text], select, textarea {
   font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px; width: 100%; outline: none;
 }

@@ -949,4 +949,109 @@ test('360 video: views cut from each frame make a rig that turns the right way',
   });
 });
 
+// ---------------------------------------------------------------- club uploads
+// The app reads the building list with fetch (a file: URL here), and both ends talk to Supabase:
+// a small in-memory stand-in answers the few calls they make.
+const realFetch = globalThis.fetch;
+const fakeDb = { rows: new Map(), files: new Map(), posts: new Map(), failOnce: new Set() };
+const json = (v, status = 200) => new Response(v == null ? null : JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
+globalThis.fetch = async (u, o = {}) => {
+  const url = new URL(String(u));
+  if (url.protocol === 'file:') return new Response(readFileSync(url));
+  if (url.host !== 'fake.supabase.co') return realFetch(u, o);
+  const m = o.method || 'GET', p = url.pathname, eq = (url.searchParams.get('id') || '').replace(/^eq\./, '');
+  if (p === '/auth/v1/signup') return json({ access_token: 'phone-token', refresh_token: 'r', expires_in: 3600, user: { id: 'phone-1' } });
+  if (p === '/rest/v1/captures') {
+    if (m === 'POST') {
+      const row = JSON.parse(o.body);
+      if (fakeDb.rows.has(row.id)) return json({ message: 'duplicate key' }, 409);
+      fakeDb.rows.set(row.id, { ...row, created_at: '2026-11-02T20:00:00Z' });
+      return json(null, 201);
+    }
+    if (m === 'PATCH') return Object.assign(fakeDb.rows.get(eq), JSON.parse(o.body)) && json(null, 204);
+    if (m === 'DELETE') return fakeDb.rows.delete(eq) && json(null, 204);
+    return json([...fakeDb.rows.values()].filter((r) => !eq || r.id === eq));
+  }
+  const obj = p.match(/^\/storage\/v1\/object\/captures\/(.+)$/);
+  if (obj && m === 'POST') {
+    const key = decodeURIComponent(obj[1]);
+    fakeDb.posts.set(key, (fakeDb.posts.get(key) || 0) + 1);
+    const fail = [...fakeDb.failOnce].find((s) => key.endsWith(s));
+    if (fail && fakeDb.failOnce.delete(fail)) return json({ message: 'simulated: connection dropped' }, 400);
+    if (fakeDb.files.has(key)) return json({ statusCode: '409', error: 'Duplicate', message: 'The resource already exists' }, 400);
+    const body = typeof o.body === 'string' ? Buffer.from(o.body) : o.body instanceof Uint8Array ? Buffer.from(o.body) : Buffer.from(await o.body.arrayBuffer());
+    fakeDb.files.set(key, body);
+    return json({ Key: 'captures/' + key });
+  }
+  if (obj && m === 'GET') return fakeDb.files.has(decodeURIComponent(obj[1])) ? new Response(fakeDb.files.get(decodeURIComponent(obj[1]))) : json({ message: 'not found' }, 404);
+  return json({ message: `fake Supabase doesn't know ${m} ${p}` }, 500);
+};
+
+const campus = await import('../app/js/data/campus.js');
+const asuList = await campus.buildings();
+await (async () => {
+  const mu = asuList.find((b) => b.code === 'memorial-union');
+  assert.ok(asuList.length > 150 && mu, 'ASU building list with the Memorial Union');
+  const inside = { lat: mu.c[0], lon: mu.c[1], acc: 8 };
+  assert.equal(campus.distanceTo(mu, inside.lat, inside.lon), 0);
+  assert.equal((await campus.sureBuilding(inside)).code, 'memorial-union', 'a good fix inside picks the building');
+  assert.equal(await campus.sureBuilding({ ...inside, acc: 45 }), null, 'a poor indoor fix only suggests');
+  assert.equal((await campus.near({ ...inside, acc: 45 }))[0].b.code, 'memorial-union');
+  // 0.001° of latitude is about 110 m: well outside, and too far for a 10 m fix to offer it.
+  assert.ok(!(await campus.near({ lat: mu.c[0] + 0.004, lon: mu.c[1], acc: 10 })).some((x) => x.b.code === 'memorial-union'));
+  assert.equal((await campus.matchName('Schwada Building')).name, 'Schwada Classroom Office Building');
+  assert.equal((await campus.matchName('MU')).code, 'memorial-union', 'by its building code');
+  assert.equal(await campus.matchName('Snall'), null);
+  assert.equal(campus.placeSlug('2', 'Room 214 (east)'), 'floor-2-room-214-east');
+  assert.equal(campus.placeSlug('', ''), 'unsorted');
+  passed++;
+  console.log('  ok campus: GPS picks the building only when sure, typed names match the ASU list');
+})();
+
+const crowdApp = await import('../app/js/data/crowd.js');
+const crowdStation = await import('../station/lib/crowd.mjs');
+await (async () => {
+  crowdApp.CROWD.url = 'https://fake.supabase.co';
+  const photo = (n) => new Blob([new Uint8Array([0xff, 0xd8, n, 0xff, 0xd9])], { type: 'image/jpeg' });
+  const files = [
+    ...[1, 2, 3, 4, 5, 6].map((n) => ({ name: `images/000${n}.jpg`, data: photo(n), type: 'image/jpeg' })),
+    { name: 'splatscout.json', data: JSON.stringify({ capture: { building: 'Schwada Building', room: 'snall' }, frames: [] }), type: 'application/json' },
+    { name: 'poses/colmap/sparse/0/cameras.txt', data: '# cameras\n', type: 'text/plain' },
+  ];
+  const capture = { id: 'c1', engine: 'xr', score: { grade: 'B' }, geo: { lat: 33.42, lon: -111.93, acc: 9 } };
+  const tags = { buildingCode: 'schwada-classroom-office-building', buildingName: 'Schwada Classroom Office Building', floor: '1', room: 'Snall', contributor: 'Test' };
+  const save = async () => {};
+  // The connection drops part way: the upload stops, and a second try sends only what's missing.
+  fakeDb.failOnce.add('/images/0005.jpg');
+  await assert.rejects(crowdApp.uploadCapture(capture, files, tags, { save }), /0005\.jpg.*simulated/);
+  const firstId = capture.upload.id;
+  assert.equal(capture.upload.status, 'uploading');
+  assert.ok(capture.upload.prefix.startsWith('schwada-classroom-office-building/floor-1-snall/'), capture.upload.prefix);
+  const up = await crowdApp.uploadCapture(capture, files, tags, { save });
+  assert.equal(up.id, firstId, 'resumed, not started again');
+  assert.equal(up.status, 'done');
+  const row = fakeDb.rows.get(up.id);
+  assert.equal(row.status, 'new');
+  assert.equal(row.photo_count, 6);
+  assert.equal(row.building_name, 'Schwada Classroom Office Building');
+  for (const [k, n] of fakeDb.posts) assert.equal(n, k.endsWith('0005.jpg') ? 2 : 1, `${k} sent ${n} times`);
+  assert.ok(fakeDb.files.has(`${up.prefix}/upload.json`), 'file list sent last');
+
+  // SplatStation brings it in as a normal SplatScout ZIP, filed under the shared building name.
+  const dir = mkdtempSync(join(tmpdir(), 'crowd-'));
+  const c = { url: 'https://fake.supabase.co', key: 'sb_secret_test' };
+  const zip = await crowdStation.importUpload(c, up.id, dir);
+  assert.match(zip, /Schwada_Classroom_Office_Building_Snall_20261102_club-/);
+  assert.equal((await listZip(zip)).length, files.length);
+  const m = JSON.parse(await readZipText(zip, 'splatscout.json'));
+  assert.equal(m.capture.building, 'Schwada Classroom Office Building');
+  assert.equal(m.capture.typedBuilding, 'Schwada Building');
+  assert.equal(m.club.buildingCode, 'schwada-classroom-office-building');
+  assert.equal(fakeDb.rows.get(up.id).status, 'approved');
+  assert.match(crowdStation.crowdConfig(dir).error, /crowd\.json/);
+  passed++;
+  console.log('  ok club uploads: resume after a dropped connection, then SplatStation imports a normal ZIP');
+})();
+globalThis.fetch = realFetch;
+
 console.log(`\n${passed} checks passed`);

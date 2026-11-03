@@ -6,15 +6,22 @@ import { TEMPLATES, PREFLIGHT, getTemplate } from '../core/plans.js';
 import { xrSupport } from '../sources/xrSource.js';
 import { listCameras, RESOLUTIONS, LENS_FOV } from '../sources/cameraSource.js';
 import * as store from '../data/store.js';
+import * as campus from '../data/campus.js';
 import { getSettings, setSettings } from '../data/settings.js';
 
 export async function setupScreen(root, { navigate, query }) {
   const settings = getSettings();
   const practice = query.get('practice') === '1';
-  const buildings = await store.listBuildings();
+  const [buildings, asu] = await Promise.all([store.listBuildings(), campus.buildings()]);
+  const names = [...new Set([...buildings.map((b) => b.name), ...asu.map((b) => b.name)])];
   const xr = await xrSupport();
 
   const st = {
+    buildingCode: practice ? null : settings.lastBuildingCode || null,
+    geo: null,
+    near: null, // [{b, dist}] from the last GPS fix
+    locating: false,
+    geoMsg: '',
     building: practice ? 'Practice' : settings.lastBuilding || '',
     room: practice ? 'Demo classroom' : '',
     floor: '',
@@ -46,8 +53,15 @@ export async function setupScreen(root, { navigate, query }) {
         : h('section.card',
             h('h2', 'Where'),
             h('label.field', h('span', 'Building'),
-              h('input', { list: 'blist', value: st.building, placeholder: 'e.g. Hayden Library', oninput: (e) => (st.building = e.target.value) }),
-              h('datalist#blist', buildings.map((b) => h('option', { value: b.name })))),
+              h('input', { list: 'blist', value: st.building, placeholder: 'e.g. Hayden Library', oninput: (e) => { st.building = e.target.value; st.buildingCode = null; } }),
+              h('datalist#blist', names.map((n) => h('option', { value: n })))),
+            h('div.geo-row',
+              h('button.btn.small', { onclick: findBuilding, disabled: st.locating }, icon('pin'), st.locating ? 'Finding you…' : 'Find my building'),
+              st.geoMsg ? h('span.small.muted', st.geoMsg) : null),
+            st.near && st.near.length
+              ? h('div.chips', st.near.map(({ b, dist }) => h('button.btn.small' + (b.code === st.buildingCode ? '.primary' : ''), { onclick: () => pick(b) },
+                  b.name + (dist > 0 ? ` · ${Math.round(dist)} m` : ''))))
+              : null,
             h('div.row.two',
               h('label.field', h('span', 'Room / area'), h('input', { value: st.room, placeholder: 'e.g. Room 214, Main lobby', oninput: (e) => (st.room = e.target.value) })),
               h('label.field.narrow', h('span', 'Floor'), h('input', { value: st.floor, placeholder: '2', oninput: (e) => (st.floor = e.target.value) })),
@@ -93,6 +107,31 @@ export async function setupScreen(root, { navigate, query }) {
     );
     updateCount();
   };
+
+  // GPS suggests the building (good to a few metres outside, often 10–50 m indoors); you confirm it.
+  async function findBuilding(quiet = false) {
+    st.locating = true;
+    st.geoMsg = '';
+    render();
+    try {
+      const fix = await campus.locate();
+      st.geo = fix;
+      st.near = await campus.near(fix);
+      const sure = await campus.sureBuilding(fix);
+      if (sure && (!st.building || quiet !== true)) pick(sure, false);
+      st.geoMsg = !st.near.length ? `No ASU building within reach (GPS good to ${fix.acc} m)` : sure ? `GPS good to ${fix.acc} m` : `GPS good to ${fix.acc} m: pick your building`;
+    } catch (e) {
+      if (quiet !== true) st.geoMsg = e.message;
+    }
+    st.locating = false;
+    render();
+  }
+
+  function pick(b, draw = true) {
+    st.building = b.name;
+    st.buildingCode = b.code;
+    if (draw) render();
+  }
 
   function segBtn(key, value, label, disabled) {
     return h('button.seg-btn' + (st[key] === value ? '.active' : ''), { disabled, onclick: () => { st[key] = value; render(); } }, label);
@@ -140,10 +179,15 @@ export async function setupScreen(root, { navigate, query }) {
       return;
     }
     const b = await store.findOrCreateBuilding(st.building || 'Unnamed building');
-    if (!practice) setSettings({ lastBuilding: b.name, lastTemplate: st.template, cameraId: st.cameraId, resolution: st.resolution });
+    // One fixed name per ASU building, so uploads from different phones land together.
+    const asuB = practice ? null : st.buildingCode ? await campus.byCode(st.buildingCode) : await campus.matchName(st.building);
+    const code = asuB && asuB.name.toLowerCase() === b.name.toLowerCase() ? asuB.code : st.buildingCode;
+    if (!practice) setSettings({ lastBuilding: b.name, lastBuildingCode: code || null, lastTemplate: st.template, cameraId: st.cameraId, resolution: st.resolution });
     const capture = {
       id: store.uid(),
       buildingId: b.id,
+      buildingCode: code || null,
+      geo: st.geo,
       building: b.name,
       room: st.room.trim() || 'Untitled',
       floor: st.floor.trim(),
@@ -168,4 +212,6 @@ export async function setupScreen(root, { navigate, query }) {
 
   mount(root, h('div.page', h('header.page-head', h('button.icon-btn', { onclick: () => navigate('#/'), 'aria-label': 'Back' }, icon('back')), h('h1', practice ? 'Practice' : 'New capture')), body));
   render();
+  // Location already allowed: look it up without asking (keeps a building you typed).
+  if (!practice && (await campus.locationAllowed())) findBuilding(true);
 }
