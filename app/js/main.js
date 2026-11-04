@@ -6,6 +6,8 @@ import { captureScreen } from './ui/captureScreen.js';
 import { reviewScreen } from './ui/review.js';
 import { learnScreen } from './ui/learn.js';
 import { settingsScreen } from './ui/settingsScreen.js';
+import { clubScreen } from './ui/clubScreen.js';
+import { snapScreen } from './ui/snapScreen.js';
 import { h, mount } from './ui/dom.js';
 
 const root = document.getElementById('app');
@@ -35,6 +37,8 @@ async function route() {
     else if (parts[0] === 'review') cleanup = await reviewScreen(root, { ...ctx, captureId: parts[1] });
     else if (parts[0] === 'learn') cleanup = learnScreen(root, ctx);
     else if (parts[0] === 'settings') cleanup = settingsScreen(root, ctx);
+    else if (parts[0] === 'club') cleanup = await clubScreen(root, ctx);
+    else if (parts[0] === 'snap') cleanup = await snapScreen(root, ctx);
     else navigate('#/');
   } catch (e) {
     console.error(e);

@@ -104,6 +104,19 @@ function simplify(ring, tol = 1) {
   return ring.filter((_, i) => keep[i]);
 }
 
+// Places the club does not photograph (the app and the club database both refuse them). Judged from what
+// OpenStreetMap says the building is: where people live, health, police and courts, children's centres.
+// The station's Club page can add or remove any building by hand.
+const RESIDENCE = /^(dormitory|residential|apartments|house|hotel|convent|bungalow|terrace|semidetached_house)$/;
+function restrictedReason(t) {
+  if (RESIDENCE.test(t.building)) return "residence";
+  const name = t.name || "";
+  if (t.building === "hospital" || /student health|health services|health center|clinic|counsel/i.test(name)) return "health";
+  if (/police|courthouse|municipal court|jail|detention/i.test(name) || /^(police|courthouse|prison)$/.test(t.amenity || "")) return "safety";
+  if (/children.?s (center|centre)|child ?care|daycare|kindergarten|preschool/i.test(name) || /^(kindergarten|childcare)$/.test(t.amenity || "")) return "children";
+  return null;
+}
+
 const slug = (s) => s.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40).replace(/-$/, '');
 const r6 = (v) => Math.round(v * 1e6) / 1e6;
 
@@ -130,10 +143,12 @@ for (const e of osm.elements) {
   if (codes.has(code)) code = slug(`${e.tags.name} ${e.tags.ref || CAMPUSES[k].id}`);
   for (let n = 2; codes.has(code); n++) code = slug(e.tags.name).slice(0, 36) + '-' + n;
   codes.add(code);
+  const why = restrictedReason(e.tags);
   buildings.push({
     code,
     name: e.tags.name,
     ...(e.tags.ref ? { ref: e.tags.ref } : {}),
+    ...(why ? { restricted: why } : {}),
     campus: CAMPUSES[k].id,
     c: c.map(r6),
     poly: simplify(ring.slice(0, -1).concat([ring[0]])).slice(0, -1).map((p) => p.map(r6)),
@@ -148,5 +163,5 @@ writeFileSync(OUT, JSON.stringify({
   buildings,
 }));
 const by = Object.groupBy(buildings, (b) => b.campus);
-console.log(`${buildings.length} buildings → ${OUT}`);
+console.log(`${buildings.length} buildings → ${OUT} (${buildings.filter((b) => b.restricted).length} restricted)`);
 for (const [k, v] of Object.entries(by)) console.log(`  ${k}: ${v.length}`);

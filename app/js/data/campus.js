@@ -108,6 +108,33 @@ export function locate({ timeout = 12000, good = 12 } = {}) {
   });
 }
 
+/**
+ * Keeps following GPS (for taking many photos): calls onFix({lat, lon, acc, t}) with each reading.
+ * @returns {() => void} stop
+ */
+export function watchLocation(onFix, onError = () => {}) {
+  if (!navigator.geolocation) {
+    onError(new Error('This browser can’t share your location'));
+    return () => {};
+  }
+  const id = navigator.geolocation.watchPosition(
+    (p) => onFix({ lat: +p.coords.latitude.toFixed(7), lon: +p.coords.longitude.toFixed(7), acc: Math.round(p.coords.accuracy), t: Date.now() }),
+    (e) => onError(new Error(e.code === 1 ? 'Location is blocked for this site' : 'No GPS fix')),
+    { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 },
+  );
+  return () => navigator.geolocation.clearWatch(id);
+}
+
+/** Why a building is off limits for photos ('residence', 'health', ...), or null. */
+export const restrictedReason = (b) => (b && b.restricted) || null;
+
+export const RESTRICTED_TEXT = {
+  residence: 'a residence hall or housing',
+  health: 'a health or counseling building',
+  safety: 'a police or courts building',
+  children: 'a children’s center',
+};
+
 /** Whether the site may already use location without asking (so it can be read without a prompt). */
 export async function locationAllowed() {
   try {

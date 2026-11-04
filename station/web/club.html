@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090b0e">
+  <title>SplatStation · Club</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .stats { display: flex; gap: 10px; flex-wrap: wrap; }
+    .stat { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; min-width: 96px; }
+    .stat b { display: block; font-size: 1.3rem; font-family: var(--mono); }
+    .stat span { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.1em; }
+    .stat.hot b { color: var(--accent); }
+    .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+    .tab { font: inherit; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+    .tab.on { color: var(--text); background: var(--surface-2); border-color: var(--line-2); }
+    .place { margin-bottom: 18px; }
+    .place-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 8px; }
+    .place-head b { font-size: 0.95rem; }
+    .pgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+    .ptile { position: relative; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; }
+    .ptile.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+    .ptile img, .ptile .noimg { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; display: block; background: #000; }
+    .ptile .noimg { display: grid; place-items: center; color: var(--dim); font-size: 0.78rem; }
+    .ptile input { position: absolute; top: 8px; left: 8px; margin: 0; z-index: 1; }
+    .pbody { padding: 6px 8px 8px; display: flex; flex-direction: column; gap: 3px; font-size: 0.78rem; }
+    .pbody .why { color: var(--muted); font-size: 0.72rem; line-height: 1.3; }
+    .lv { position: absolute; top: 8px; right: 8px; font-family: var(--mono); font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 6px; border-radius: 4px; background: rgba(9, 11, 14, 0.85); }
+    .lv.accept { color: var(--good); } .lv.review { color: var(--warn); } .lv.reject { color: var(--bad); }
+    .bulk { position: sticky; bottom: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; background: rgba(16, 20, 25, 0.96); border: 1px solid var(--line-2); border-radius: 12px; padding: 10px 14px; margin-top: 12px; backdrop-filter: blur(8px); z-index: 4; }
+    .form { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }
+    input[type=text], input[type=number], textarea { font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--line-2); border-radius: 8px; padding: 7px 10px; width: 100%; }
+    table.rows { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+    table.rows td, table.rows th { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+    table.rows th { color: var(--dim); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.12em; font-weight: 600; }
+    table.rows tr.off td { color: var(--dim); }
+    .code { font-family: var(--mono); font-size: 1rem; color: var(--accent); letter-spacing: 0.08em; }
+    #lightbox { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.88); z-index: 20; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 16px; }
+    #lightbox.on { display: flex; }
+    #lightbox img { max-width: 94vw; max-height: 74vh; border-radius: 8px; }
+    .note-ok { color: var(--good); }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <img src="icon.svg" alt="" class="logo">
+      <div>
+        <h1>Club <span class="tag new">Beta</span></h1>
+        <div class="sub">Photos from phones, points, missions and members</div>
+      </div>
+    </div>
+    <a class="btn small ghost" href="/">← Dashboard</a>
+  </header>
+
+  <main>
+    <div id="notice"></div>
+
+    <section id="overview">
+      <div class="section-head">
+        <h2>Overview</h2>
+        <span class="grow"></span>
+        <span id="syncText" class="muted small mono"></span>
+        <button class="btn small primary" id="sync" title="Download new photos from the club database and check them">Sync photos</button>
+        <button class="btn small ghost" id="free" title="Delete the cloud copies of accepted photos that are safe here, to free the free plan's storage">Free cloud space</button>
+        <button class="btn small ghost" id="refresh">Refresh</button>
+      </div>
+      <div class="stats" id="stats"></div>
+    </section>
+
+    <section id="review">
+      <div class="section-head"><h2>Photos</h2><span class="count mono" id="reviewCount"></span></div>
+      <div class="tabs" id="tabs"></div>
+      <div id="places"></div>
+      <div class="bulk hidden" id="bulk"></div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Missions</h2><span class="count mono" id="missionCount"></span></div>
+      <div class="panel">
+        <div class="form" id="missionForm"></div>
+        <div id="missions" class="list"></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Members and invites</h2><span class="count mono" id="memberCount"></span></div>
+      <div class="grid">
+        <div class="panel"><h3>Invite codes</h3><div class="form" id="inviteForm"></div><div id="invites"></div></div>
+        <div class="panel"><h3>Members</h3><div id="members"></div></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Places that can't be photographed</h2><span class="count mono" id="restrictedCount"></span></div>
+      <div class="panel">
+        <p class="muted small" style="margin:0">Enforced by the club database: phones can't add photos or scans for these buildings. The ASU list marks residence halls, health, police and children's centers; add or remove any building by hand.</p>
+        <div class="form" id="restrictedForm"></div>
+        <div id="restricted"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="lightbox"></div>
+  <script type="module" src="club.js"></script>
+</body>
+</html>

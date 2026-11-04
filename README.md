@@ -120,27 +120,47 @@ mode automatically.
 The in-app **Capture guide** is the full field manual: golden rules, technique for each type of space,
 lighting, tricky surfaces, and a "splat symptom → capture fix" table.
 
-### Club uploads (crowdsourcing)
+### The club (beta): photos and scans from many people
 
-Anyone with the app can add captures to one shared dataset, filed by building, floor and room, for
-SplatStation to turn into splats (and merge, when several people scanned the same room).
+Anyone invited can add to one shared dataset, filed by building, floor and room, for SplatStation to turn into
+splats (and merge, when several people covered the same room). It is a **closed beta**: you join with an invite
+code, a handle (shown on the leaderboard) and by agreeing to the rules, and the club database accepts nothing
+from anyone else. **[crowd/ADVISOR-BRIEF.md](crowd/ADVISOR-BRIEF.md)** explains what it does, the safeguards, and
+what is still open (permission, consent wording, faces); it also has a five-minute demo script.
 
-- **Which building:** *Find my building* on the New capture screen uses GPS to pick from ASU's buildings
-  (outlines from OpenStreetMap, all four campuses). It only picks by itself when the fix is good to 40 m and
-  inside one building; indoors GPS is often off by 10–50 m, so it offers the nearby buildings to tap instead.
-  Typed names are matched to the same list ("Schwada Building" → Schwada Classroom Office Building), so
-  everyone's uploads of a building land together. Floor and room come from you (the sign by the door).
-- **Upload** on the review screen: choose the photos (as for Export), confirm building, floor and room, and
-  agree to how the photos are used. Photos go one by one, so a dropped connection resumes with
-  **Resume upload** instead of starting over. **Remove from club database** deletes your upload again.
-  Photos carry no GPS or camera metadata (they come from the canvas); the GPS reading is stored with the
-  capture's details instead.
-- **Where it goes:** a Supabase project (free plan: about 1 GB, so roughly 3–6 captures of 300–1,000
-  photos). Files land in the private `captures` bucket as `<building>/<floor-room>/<capture id>/` (the
-  same files as the export ZIP), with one row per capture in the `captures` table. Each phone signs in
-  anonymously; the database rules let it add, finish and delete only its own uploads, never see or change
-  anyone else's. Set up a project once with [`crowd/supabase-setup.sql`](crowd/supabase-setup.sql) (turn on
-  anonymous sign-ins first); the project URL and publishable key are in `app/js/data/crowd.js`.
+- **Club** (home screen): join, your points and rank, missions, the leaderboard (this week / all time) and the
+  photos you sent with what the club made of each. *Leave the club* deletes everything you sent.
+- **Take photos** (single photos, no full scan needed): pick the building, floor and room, then shoot. Each photo
+  is checked on the spot and a bad one isn't kept: motion blur (compared with what the camera just saw), too dark
+  or washed out, or almost the same view as a photo you just took. The shutter ring turns green when the camera is
+  steady. Photos are saved on the phone first and sent in the background, so it works without a signal; once
+  sent, only a thumbnail stays on the phone. Camera only: there is no gallery upload.
+- **Which building:** *Find my building* uses GPS to pick from ASU's buildings (outlines from OpenStreetMap, all
+  four campuses). It only picks by itself when the fix is good to 40 m and inside one building; indoors GPS is
+  often off by 10–50 m, so it offers the nearby buildings to tap instead. Typed names are matched to the same
+  list ("Schwada Building" → Schwada Classroom Office Building), so everyone's photos of a building land together.
+  Floor and room come from you (the sign by the door).
+- **Off limits:** residence halls and housing, health, police and courts, and children's centers can't be picked,
+  and the club database refuses photos and scans for them (the list is from OpenStreetMap's building types, and
+  SplatStation's Club page can add or remove any building).
+- **Points** (decided by SplatStation after a person has looked at the photo): 1 per accepted photo (up to 100 a
+  day), +5 for the first photo of a room, +3 for the first photo of a room in morning, afternoon, evening or night
+  light, a mission's bonus on top, and 30–130 for a full scan. Light slots are what the dataset needs most: a
+  splat built from one lighting condition is much cleaner than one built from a mix.
+- **Missions:** the club asks for a view in a kind of light ("Hayden lobby in evening light, +3 each"). A mission
+  asking for evening light only scores in the evening.
+- **Scans** work as before (Upload on the review screen), but now need membership and upload as your handle.
+  Photos go one by one, so a dropped connection resumes with **Resume upload**. *Remove from club database*
+  deletes your upload again. Photos carry no GPS or camera metadata (they come from the canvas); the GPS reading
+  is stored with the capture's details instead.
+- **Where it goes:** a Supabase project (free plan: about 1 GB, roughly 3–6 scans or 1,500–2,500 single photos;
+  SplatStation's *Free cloud space* moves accepted photos off it). Single photos land in the private
+  `club-photos` bucket as `<building>/<floor-room>/<photo id>.jpg`, scans in `captures`, with one row per
+  photo or scan. Each phone signs in anonymously and the database rules let it add, finish and delete only its
+  own uploads (at most 400 photos a day), never see anyone else's, and never set its own points.
+- **Set up** (once, in the Supabase SQL Editor, each in a *new* query): turn on anonymous sign-ins, run
+  [`crowd/supabase-setup.sql`](crowd/supabase-setup.sql), then [`crowd/supabase-beta.sql`](crowd/supabase-beta.sql).
+  The project URL and publishable key are in `app/js/data/crowd.js`; make invite codes on SplatStation's Club page.
 
 ## 3. Use the export in your pipeline
 
@@ -208,10 +228,19 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   after each export. Campus Wi-Fi often blocks phone-to-PC traffic; use USB there.
 - **Copy files** into `%USERPROFILE%\SplatStation\inbox`.
 - **Club uploads:** put the Supabase project's secret key in `%USERPROFILE%\SplatStation\crowd.json`
-  (`{"url": "https://….supabase.co", "secretKey": "sb_secret_…"}`; it never leaves this PC). *Club uploads*
-  on the dashboard then lists what phones sent, by building. **Import** downloads one into *Ready to process*
-  as a normal SplatScout ZIP filed under the shared building name; **Delete** removes it from the club
-  database for good (frees its storage).
+  (`{"url": "https://….supabase.co", "secretKey": "sb_secret_…"}`; it never leaves this PC, and the club tools only
+  answer requests from this PC, not from the Wi-Fi). *Club uploads* on the dashboard then lists the scans phones
+  sent, by building. **Import** downloads one into *Ready to process* as a normal SplatScout ZIP filed under the
+  shared building name and awards the member their points; **Delete** removes it from the club database for good.
+- **Club photos & members** (the button on that section, or `/club.html`): **Sync photos** downloads new photos and
+  checks each one (size, sharpness against the rest of the outing, light, near-duplicates of the same member's
+  photos, GPS far from the building, a wrong phone clock). Each gets a first opinion (*ok*, *review*, *reject*) and
+  you look through the thumbnails and **Accept** or **Reject**. Accepting awards the points. **Rejecting deletes
+  the photo** here and in the cloud (it may show a person), with the reason shown to the member. Accepted photos
+  stay on this PC; *Free cloud space* removes their cloud copies. For a room with 10 or more accepted photos,
+  **Build a capture** puts them into *Ready to process* like a camera-mode capture, so they become a splat the
+  usual way. The page also makes **missions**, **invite codes** (who can join and how many times), pauses, renames
+  or removes members (removing deletes everything they sent), and edits the list of off-limits buildings.
 
 **Quality presets** (choose on the dashboard; you can re-train any finished job with a different preset):
 
@@ -274,7 +303,7 @@ The original captures stay as they are. 360° videos can't be merged yet.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (45 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (50 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
@@ -286,9 +315,17 @@ Tested on this PC:
   splat cropping (big background splats kept, a crop changed and undone without losing anything), and walk mode (floor, walls, a plain wall of big flat splats, a table, a doorway, floor holes,
   floaters, sliding along walls, an upside-down splat of unknown size, COLMAP text and binary camera files), and the
   360° camera rig (each cut view turned the way ffmpeg cuts it), and merging phones (pairs within and across
-  captures; each phone's scan area moved into the main phone's coordinates), and club uploads (GPS picking a
-  building only when sure, typed names matched to the ASU list, an upload resuming after a dropped connection
-  without sending anything twice, SplatStation turning it back into a normal ZIP filed under the shared name).
+  captures; each phone's scan area moved into the main phone's coordinates), and the club (GPS picking a
+  building only when sure, typed names matched to the ASU list, housing and health off limits; joining with an
+  invite code; the on-phone photo queue sending in the background, waiting out a busy server, stopping on a
+  refusal and resuming; leaving deleting everything; scan uploads resuming without sending anything twice;
+  SplatStation's first opinions on photos, points for the first photo of a room, a new light and missions with
+  the daily limit, a rejected photo deleted everywhere, a capture built from accepted photos, members, invites,
+  and refusing requests from the Wi-Fi). They run against an in-memory stand-in for Supabase
+  (`tools/fake-supabase.mjs`; `tools/fake-supabase-server.mjs` serves it so the phone app and SplatStation can be
+  tried together). The database rules themselves are tested on a real Postgres with `tools/sql-test.mjs`
+  (needs `npm install --no-save @electric-sql/pglite`): who can add what, that points only come from
+  SplatStation, members-only views, the daily limit, bans, and leaving.
 - **The guide loop (2.3)**, with a simulated person following every pass of the Practice hallway and room
   (walking, turning, taking the photos the app asks for, pressing Skip when it offers). Before: the last pass
   never ended (in the hallway, still going after 15 minutes with 83 turn reversals and 96 trips back), and since
@@ -366,11 +403,14 @@ app/js/core/      platform-independent logic (analysis, coverage, depth filter, 
                   plan, re-alignment + photo matching, keyframes, coaching, plans, scoring, export formats)
 app/js/sources/   xrSource (WebXR/ARCore), cameraSource (getUserMedia + orientation), demoSource/demoScene (practice room, hallway)
 app/js/capture/   session engine, 3D overlay (+ guide geometry), minimap, audio
-app/js/data/      IndexedDB storage, settings, ZIP export, campus (ASU buildings + GPS), crowd (club uploads)
+app/js/data/      IndexedDB storage, settings, ZIP export, campus (ASU buildings + GPS), crowd (club uploads),
+                  club (membership, leaderboard, missions), snaps (the on-phone photo queue)
 app/js/ui/        screens
 app/data/         asu-buildings.json (from OpenStreetMap: node tools/asu-buildings.mjs refreshes it)
-crowd/            supabase-setup.sql (the club database: table, private bucket, rules)
-tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs, asu-buildings.mjs
+crowd/            supabase-setup.sql + supabase-beta.sql (the club database: tables, private buckets, rules, views),
+                  ADVISOR-BRIEF.md
+tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs, asu-buildings.mjs,
+                  fake-supabase.mjs / fake-supabase-server.mjs (stand-in database), sql-test.mjs (database rules on Postgres)
 station/          SplatStation: station.mjs (server, queue, inbox, merges), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb, crowd),
                   web/ (dashboard, viewer, walk.js: walk-mode collision shared with the self-checks)
 ```

@@ -25,13 +25,14 @@ export function crowdConfig(workDir) {
     return { error: `${file} isn't valid JSON: ${e.message}`, file };
   }
   const url = (c.url || '').replace(/\/+$/, ''), key = (c.secretKey || '').trim();
-  if (!/^https:\/\/[\w.-]+$/.test(url)) return { error: `Put the project URL ("url") in ${file}.`, file };
+  // https only, except a server on this PC (tools/fake-supabase-server.mjs, for trying things out).
+  if (!/^(https:\/\/[\w.-]+|http:\/\/(localhost|127\.0\.0\.1):\d+)$/.test(url)) return { error: `Put the project URL ("url") in ${file}.`, file };
   if (!key) return { error: `Paste the project's secret key ("secretKey", from Supabase → Project Settings → API Keys) into ${file}.`, file };
   if (key.startsWith('sb_publishable_')) return { error: `${file} has the publishable key; SplatStation needs the secret key (sb_secret_…).`, file };
   return { url, key };
 }
 
-async function call(c, path, { method = 'GET', body, headers = {}, raw = false } = {}) {
+export async function call(c, path, { method = 'GET', body, headers = {}, raw = false } = {}) {
   // New secret keys go in the apikey header only; an old service_role key (a JWT) also as the bearer.
   const auth = c.key.startsWith('sb_secret_') ? {} : { Authorization: `Bearer ${c.key}` };
   const r = await fetch(c.url + path, {
@@ -47,6 +48,16 @@ async function call(c, path, { method = 'GET', body, headers = {}, raw = false }
   } catch {}
   if (!r.ok) throw new Error((j && (j.message || j.error || j.msg)) || text || `error ${r.status}`);
   return j;
+}
+
+/** Every row of a REST query (the server returns at most 1000 at a time). */
+export async function listAll(c, path) {
+  const out = [];
+  for (let offset = 0; ; offset += 1000) {
+    const page = await call(c, `${path}${path.includes('?') ? '&' : '?'}limit=1000&offset=${offset}`);
+    out.push(...page);
+    if (page.length < 1000) return out;
+  }
 }
 
 /** Uploads, newest first (not the ones rejected). */
@@ -65,7 +76,7 @@ const slug = (s) => (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_
  * it was uploaded as) and mark it approved. Returns the ZIP's path.
  * @param onProgress (fraction, text)
  */
-export async function importUpload(c, id, inbox, onProgress = () => {}) {
+export async function importUpload(c, id, inbox, onProgress = () => {}, award = null) {
   const [row] = await call(c, `/rest/v1/captures?select=${COLUMNS}&id=eq.${encodeURIComponent(id)}`);
   if (!row) throw new Error('That upload is no longer in the club database');
   if (row.status === 'uploading') throw new Error('That upload hasn’t finished yet (the phone is still sending it, or stopped part way)');
@@ -110,7 +121,10 @@ export async function importUpload(c, id, inbox, onProgress = () => {}) {
     rmSync(tmp, { force: true });
     throw e;
   }
-  await setStatus(c, row.id, 'approved');
+  // Imported scans earn points (SplatStation decides how many from the capture's photos and grade).
+  const patch = { status: 'approved', reviewed_at: new Date().toISOString() };
+  if (award) patch.points = award({ photos: row.photo_count, grade: row.grade || '' });
+  await call(c, `/rest/v1/captures?id=eq.${encodeURIComponent(row.id)}`, { method: 'PATCH', body: patch, headers: { Prefer: 'return=minimal' } });
   return dest;
 }
 

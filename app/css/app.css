@@ -427,3 +427,64 @@ input[type=checkbox]:checked::after { content: ''; width: 9px; height: 5px; bord
   .align-pad-hint { bottom: calc(24px + var(--safe-bottom)); }
   .cap.aligning .map-wrap { display: none; }
 }
+
+/* ---------- club (beta) ---------- */
+.club-card { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; background: linear-gradient(135deg, rgba(61, 220, 255, 0.1), rgba(61, 220, 255, 0.02)); border: 1px solid rgba(61, 220, 255, 0.28); border-radius: var(--radius); padding: 12px 14px; cursor: pointer; color: var(--text); font: inherit; }
+.club-card > .ic:first-child { color: var(--accent); width: 26px; height: 26px; }
+.club-card-body { flex: 1; min-width: 0; }
+.club-card-title { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.club { display: flex; flex-direction: column; gap: 14px; }
+.club-head .handle { margin: 0; font-size: 1.3rem; letter-spacing: -0.01em; text-transform: none; color: var(--text); font-weight: 650; }
+.club-points { text-align: right; }
+.club-points .pts { font-size: 2rem; line-height: 1; color: var(--accent); }
+.club-head > * + * { margin-top: 10px; }
+.rules { margin: 6px 0; padding-left: 20px; color: var(--muted); }
+.rules li { margin: 4px 0; }
+.board { list-style: none; margin: 0; padding: 0; }
+.board-row { display: flex; align-items: center; gap: 10px; padding: 9px 4px; border-bottom: 1px solid var(--line); }
+.board-row:last-child { border-bottom: none; }
+.board-row .rank { width: 24px; color: var(--dim); }
+.board-row .who { flex: 1; min-width: 0; font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.board-row .pts { font-weight: 650; }
+.board-row.me { background: var(--accent-soft); border-radius: 8px; }
+.board-row.me .who { color: var(--accent); }
+.mission { display: flex; flex-direction: column; gap: 6px; padding: 12px 0; border-top: 1px solid var(--line); }
+.card > .mission:first-of-type, .card-head + .mission { border-top: none; padding-top: 0; }
+.mission.card { border: 1px solid var(--line); padding: 14px 16px; }
+.snap-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 6px; }
+.snap-cell { position: relative; aspect-ratio: 1; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; padding: 0; background: var(--surface-2); cursor: pointer; }
+.snap-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.snap-blank { width: 100%; height: 100%; }
+.cell-tag { position: absolute; left: 4px; bottom: 4px; font-family: var(--mono); font-size: 0.62rem; font-weight: 600; letter-spacing: 0.04em; padding: 2px 6px; border-radius: 4px; background: rgba(9, 11, 14, 0.82); color: var(--muted); }
+.cell-tag.good { color: var(--good); }
+.cell-tag.warn { color: var(--warn); }
+.cell-tag.bad { color: var(--bad); }
+.sheet-img { width: 100%; max-height: 38vh; object-fit: contain; border-radius: 8px; background: #000; margin-bottom: 8px; }
+
+/* ---------- snap (single photos) ---------- */
+.snap { position: fixed; inset: 0; background: #000; z-index: 20; overflow: hidden; touch-action: manipulation; }
+.snap-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+.snap-top { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 8px; padding: calc(10px + var(--safe-top)) 12px 10px; background: linear-gradient(#000a, transparent); }
+.icon-btn.glass { background: var(--glass); border: 1px solid var(--glass-line); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.snap-chip { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 0.82rem; color: var(--text); background: var(--glass); border: 1px solid var(--glass-line); border-radius: 999px; padding: 6px 11px; min-height: 34px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); white-space: nowrap; }
+.snap-chip.place { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; justify-content: flex-start; }
+.snap-chip .ic { width: 15px; height: 15px; }
+.snap-chip:disabled { opacity: 0.6; }
+.snap-mission { position: absolute; top: calc(58px + var(--safe-top)); left: 12px; right: 12px; display: flex; align-items: center; gap: 8px; font-size: 0.82rem; color: var(--warn); background: var(--glass); border: 1px solid rgba(245, 185, 66, 0.35); border-radius: 10px; padding: 6px 10px; }
+.snap-mission .ic { width: 16px; height: 16px; }
+.snap-hint { position: absolute; left: 0; right: 0; bottom: calc(150px + var(--safe-bottom)); text-align: center; font-size: 0.95rem; text-shadow: 0 1px 6px #000; pointer-events: none; }
+.snap-bottom { position: absolute; left: 0; right: 0; bottom: calc(44px + var(--safe-bottom)); display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 0 22px; }
+.snap-thumb { justify-self: start; width: 54px; height: 54px; border-radius: 10px; border: 2px solid var(--glass-line); background: var(--surface-2) center / cover no-repeat; cursor: pointer; padding: 0; }
+.snap-bottom .snap-chip { justify-self: end; }
+.snap-shutter { width: 78px; height: 78px; border-radius: 50%; border: 4px solid #fff9; background: transparent; padding: 0; cursor: pointer; display: grid; place-items: center; transition: border-color 0.15s, transform 0.08s; }
+.snap-shutter span { width: 58px; height: 58px; border-radius: 50%; background: #fff; transition: background 0.15s; }
+.snap-shutter:active { transform: scale(0.94); }
+.snap-shutter.ok { border-color: var(--good); }
+.snap-shutter.moving { border-color: var(--warn); }
+.snap-shutter.moving span { background: #ffe3a8; }
+.snap-shutter.dark, .snap-shutter.bright { border-color: var(--bad); }
+.snap-shutter.dark span, .snap-shutter.bright span { background: #f5b3b3; }
+.snap-rules { position: absolute; left: 0; right: 0; bottom: calc(14px + var(--safe-bottom)); text-align: center; font-size: 0.72rem; color: #fffa; text-shadow: 0 1px 4px #000; pointer-events: none; }
+.snap-flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+.snap-flash.go { animation: snapflash 0.25s ease-out; }
+@keyframes snapflash { from { opacity: 0.7; } to { opacity: 0; } }

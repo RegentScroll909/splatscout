@@ -1,7 +1,7 @@
 // Self-checks for the platform-independent core (run: node tools/check.mjs).
 import assert from 'node:assert/strict';
 import { writeFileSync, mkdtempSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, networkInterfaces } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -949,43 +949,62 @@ test('360 video: views cut from each frame make a rig that turns the right way',
   });
 });
 
-// ---------------------------------------------------------------- club uploads
-// The app reads the building list with fetch (a file: URL here), and both ends talk to Supabase:
-// a small in-memory stand-in answers the few calls they make.
+// ---------------------------------------------------------------- club (beta)
+// An in-memory stand-in for the club's Supabase project (tools/fake-supabase.mjs) answers for both the
+// phone code and the station code; the ASU building list is read from disk instead of over HTTP.
 const realFetch = globalThis.fetch;
-const fakeDb = { rows: new Map(), files: new Map(), posts: new Map(), failOnce: new Set() };
-const json = (v, status = 200) => new Response(v == null ? null : JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
-globalThis.fetch = async (u, o = {}) => {
+const fileFetch = async (u, o) => {
   const url = new URL(String(u));
-  if (url.protocol === 'file:') return new Response(readFileSync(url));
-  if (url.host !== 'fake.supabase.co') return realFetch(u, o);
-  const m = o.method || 'GET', p = url.pathname, eq = (url.searchParams.get('id') || '').replace(/^eq\./, '');
-  if (p === '/auth/v1/signup') return json({ access_token: 'phone-token', refresh_token: 'r', expires_in: 3600, user: { id: 'phone-1' } });
-  if (p === '/rest/v1/captures') {
-    if (m === 'POST') {
-      const row = JSON.parse(o.body);
-      if (fakeDb.rows.has(row.id)) return json({ message: 'duplicate key' }, 409);
-      fakeDb.rows.set(row.id, { ...row, created_at: '2026-11-02T20:00:00Z' });
-      return json(null, 201);
-    }
-    if (m === 'PATCH') return Object.assign(fakeDb.rows.get(eq), JSON.parse(o.body)) && json(null, 204);
-    if (m === 'DELETE') return fakeDb.rows.delete(eq) && json(null, 204);
-    return json([...fakeDb.rows.values()].filter((r) => !eq || r.id === eq));
-  }
-  const obj = p.match(/^\/storage\/v1\/object\/captures\/(.+)$/);
-  if (obj && m === 'POST') {
-    const key = decodeURIComponent(obj[1]);
-    fakeDb.posts.set(key, (fakeDb.posts.get(key) || 0) + 1);
-    const fail = [...fakeDb.failOnce].find((s) => key.endsWith(s));
-    if (fail && fakeDb.failOnce.delete(fail)) return json({ message: 'simulated: connection dropped' }, 400);
-    if (fakeDb.files.has(key)) return json({ statusCode: '409', error: 'Duplicate', message: 'The resource already exists' }, 400);
-    const body = typeof o.body === 'string' ? Buffer.from(o.body) : o.body instanceof Uint8Array ? Buffer.from(o.body) : Buffer.from(await o.body.arrayBuffer());
-    fakeDb.files.set(key, body);
-    return json({ Key: 'captures/' + key });
-  }
-  if (obj && m === 'GET') return fakeDb.files.has(decodeURIComponent(obj[1])) ? new Response(fakeDb.files.get(decodeURIComponent(obj[1]))) : json({ message: 'not found' }, 404);
-  return json({ message: `fake Supabase doesn't know ${m} ${p}` }, 500);
+  return url.protocol === 'file:' ? new Response(readFileSync(url)) : realFetch(u, o);
 };
+const { createFake, FAKE_URL } = await import('../tools/fake-supabase.mjs');
+const fake = createFake();
+fake.install(globalThis, fileFetch);
+
+const R = await import('../app/js/core/clubrules.js');
+test('club rules: light slots, handles, duplicate hashes, photo checks and points', () => {
+  const at = (hr) => Date.UTC(2026, 10, 3, hr + 7, 30); // Phoenix is UTC-7 all year
+  assert.deepEqual([5, 6, 10, 11, 15, 16, 19, 20, 23].map((hr) => R.lightSlot(at(hr))), ['night', 'morning', 'morning', 'afternoon', 'afternoon', 'evening', 'evening', 'night', 'night']);
+  assert.equal(R.phoenixDay(Date.UTC(2026, 10, 4, 5, 0)), '2026-11-03', '10 pm in Phoenix is still the 3rd');
+
+  assert.ok(R.validHandle('Desert_Fox1') && !R.validHandle('x') && !R.validHandle('has space') && !R.validHandle('a'.repeat(21)) && !R.validHandle(null));
+  const names = R.suggestHandles(40);
+  assert.equal(new Set(names).size, 40);
+  assert.ok(names.every(R.validHandle), 'every suggested handle is allowed');
+
+  const img = (f, w = 90, h = 80) => Uint8Array.from({ length: w * h }, (_, i) => Math.max(0, Math.min(255, f(i % w, Math.floor(i / w)))));
+  const A = img((x, y) => 128 + 100 * Math.sin(x / 7 + y / 11));
+  const A2 = img((x, y) => 128 + 100 * Math.sin(x / 7 + y / 11) + ((x * 7 + y * 13) % 5) - 2); // same view, a little noise
+  const B = img((x, y) => 128 + 100 * Math.sin(x / 3 - y / 5)); // another view
+  const hash = (g) => R.dhash(g, 90, 80);
+  assert.match(hash(A), /^[0-9a-f]{16}$/);
+  assert.ok(R.hamming(hash(A), hash(A2)) <= R.NEAR_DUPLICATE, 'the same view with noise is a near-duplicate');
+  assert.ok(R.hamming(hash(A), hash(B)) > 10, 'another view is not');
+  assert.equal(R.hamming('0000000000000000', 'ffffffffffffffff'), 64);
+
+  const P = (m, t) => R.photoChecks({ w: 1920, h: 1080, mean: 120, clipHi: 0, rel: 1, ...m }, t);
+  assert.equal(P({}).level, 'ok');
+  assert.deepEqual(P({ w: 640, h: 480 }).reasons, ['too small']);
+  assert.equal(P({ mean: 15 }).level, 'reject');
+  assert.equal(P({ mean: 35 }).level, 'review');
+  assert.equal(P({ mean: 245 }).level, 'reject');
+  assert.equal(P({ clipHi: 0.4 }).level, 'review');
+  assert.equal(P({ rel: 0.5 }, { blurReject: 0.6 }).level, 'reject', 'the phone drops a blurry photo');
+  assert.equal(P({ rel: 0.3 }).level, 'review', 'the PC only flags it for a person to look at');
+  assert.equal(P({ rel: 0.7 }).level, 'ok');
+
+  const S = R.scorePhoto;
+  assert.equal(S({}).points, 1);
+  assert.equal(S({ firstInRoom: true, newLight: true }).points, 6, 'the first photo of a room (its light is new too, but counts once)');
+  assert.equal(S({ newLight: true, light: 'evening' }).points, 4);
+  assert.equal(S({ mission: { bonus: 3, light: 'evening' }, light: 'evening' }).points, 4);
+  assert.equal(S({ mission: { bonus: 3, light: 'evening' }, light: 'morning' }).points, 1, 'an evening mission needs evening light');
+  assert.equal(S({ mission: { bonus: 3, light: 'any' }, light: 'morning' }).points, 4);
+  assert.equal(S({ baseLeft: 0 }).points, 0, 'past the daily limit');
+  assert.equal(R.scoreScan({ photos: 412, grade: 'A' }), 30 + 41 + 30);
+  assert.equal(R.scoreScan({ photos: 5000, grade: 'C' }), 30 + 70 + 5);
+  assert.equal(R.scoreScan({ photos: 3 }), 30);
+});
 
 const campus = await import('../app/js/data/campus.js');
 const asuList = await campus.buildings();
@@ -1004,14 +1023,43 @@ await (async () => {
   assert.equal(await campus.matchName('Snall'), null);
   assert.equal(campus.placeSlug('2', 'Room 214 (east)'), 'floor-2-room-214-east');
   assert.equal(campus.placeSlug('', ''), 'unsorted');
+  const restricted = asuList.filter((b) => b.restricted);
+  assert.ok(restricted.length > 20 && restricted.some((b) => b.restricted === 'residence') && restricted.some((b) => b.restricted === 'health'), 'residence halls and health buildings are marked off limits');
+  assert.ok(!restricted.some((b) => ['hayden-library', 'memorial-union'].includes(b.code)), 'libraries and unions are open');
+  assert.ok(!asuList.find((b) => b.name === 'Flower Child')?.restricted, 'a restaurant is not a children’s centre');
   passed++;
-  console.log('  ok campus: GPS picks the building only when sure, typed names match the ASU list');
+  console.log('  ok campus: GPS picks the building only when sure, typed names match the ASU list, housing and health are off limits');
 })();
 
 const crowdApp = await import('../app/js/data/crowd.js');
+const clubApp = await import('../app/js/data/club.js');
+const snapsApp = await import('../app/js/data/snaps.js');
 const crowdStation = await import('../station/lib/crowd.mjs');
+crowdApp.CROWD.url = FAKE_URL;
+fake.db.invites.set('CLUB-TEST', { code: 'CLUB-TEST', label: 'test', max_uses: 5, uses: 0, active: true });
+fake.db.restricted_buildings.set('cereus-hall', { code: 'cereus-hall', reason: 'residence' });
+
 await (async () => {
-  crowdApp.CROWD.url = 'https://fake.supabase.co';
+  // Without joining, nothing can be sent.
+  assert.equal(await clubApp.myProfile(), null, 'not a member yet');
+  assert.deepEqual(await clubApp.leaderboard('all'), [], 'a stranger sees no leaderboard');
+  assert.deepEqual(await clubApp.missions(), [], 'and no missions');
+  await assert.rejects(crowdApp.uploadCapture({ id: 'x', engine: 'xr' }, [{ name: 'images/0001.jpg', data: 'x', type: 'image/jpeg' }, { name: 'splatscout.json', data: '{}', type: 'application/json' }],
+    { buildingCode: 'hayden-library', buildingName: 'Hayden Library', floor: '1', room: 'x' }, { save: async () => {} }), /join the club first/);
+  await assert.rejects(clubApp.join('Test_Fox', 'WRONG'), /invite code/);
+  await assert.rejects(clubApp.join('x', 'CLUB-TEST'), /3 to 20/);
+  const me = await clubApp.join('Test_Fox', ' club-test ');
+  assert.equal(me.handle, 'Test_Fox');
+  assert.equal(me.consent_version, R.CONSENT_VERSION);
+  assert.equal((await clubApp.myProfile({ fresh: true })).handle, 'Test_Fox');
+  assert.equal((await clubApp.restrictedCodes()).get('cereus-hall'), 'residence');
+  assert.deepEqual((await clubApp.leaderboard('all')).map((r) => r.handle), ['Test_Fox']);
+  assert.deepEqual(await clubApp.missions(), []);
+  passed++;
+  console.log('  ok club (phone): nothing is accepted before joining; invite code, handle rules, restricted list, leaderboard');
+})();
+
+await (async () => {
   const photo = (n) => new Blob([new Uint8Array([0xff, 0xd8, n, 0xff, 0xd9])], { type: 'image/jpeg' });
   const files = [
     ...[1, 2, 3, 4, 5, 6].map((n) => ({ name: `images/000${n}.jpg`, data: photo(n), type: 'image/jpeg' })),
@@ -1019,10 +1067,10 @@ await (async () => {
     { name: 'poses/colmap/sparse/0/cameras.txt', data: '# cameras\n', type: 'text/plain' },
   ];
   const capture = { id: 'c1', engine: 'xr', score: { grade: 'B' }, geo: { lat: 33.42, lon: -111.93, acc: 9 } };
-  const tags = { buildingCode: 'schwada-classroom-office-building', buildingName: 'Schwada Classroom Office Building', floor: '1', room: 'Snall', contributor: 'Test' };
+  const tags = { buildingCode: 'schwada-classroom-office-building', buildingName: 'Schwada Classroom Office Building', floor: '1', room: 'Snall', contributor: 'Test_Fox' };
   const save = async () => {};
   // The connection drops part way: the upload stops, and a second try sends only what's missing.
-  fakeDb.failOnce.add('/images/0005.jpg');
+  fake.db.failOnce.add('/images/0005.jpg');
   await assert.rejects(crowdApp.uploadCapture(capture, files, tags, { save }), /0005\.jpg.*simulated/);
   const firstId = capture.upload.id;
   assert.equal(capture.upload.status, 'uploading');
@@ -1030,28 +1078,353 @@ await (async () => {
   const up = await crowdApp.uploadCapture(capture, files, tags, { save });
   assert.equal(up.id, firstId, 'resumed, not started again');
   assert.equal(up.status, 'done');
-  const row = fakeDb.rows.get(up.id);
+  const row = fake.db.captures.get(up.id);
   assert.equal(row.status, 'new');
   assert.equal(row.photo_count, 6);
   assert.equal(row.building_name, 'Schwada Classroom Office Building');
-  for (const [k, n] of fakeDb.posts) assert.equal(n, k.endsWith('0005.jpg') ? 2 : 1, `${k} sent ${n} times`);
-  assert.ok(fakeDb.files.has(`${up.prefix}/upload.json`), 'file list sent last');
+  for (const [k, n] of fake.db.posts) assert.equal(n, k.endsWith('0005.jpg') ? 2 : 1, `${k} sent ${n} times`);
+  assert.ok(fake.db.files.has(`captures/${up.prefix}/upload.json`), 'file list sent last');
+  await assert.rejects(crowdApp.uploadCapture({ id: 'c2', engine: 'xr' }, files, { ...tags, buildingCode: 'cereus-hall', buildingName: 'Cereus Hall' }, { save }), /refused this upload/, 'a restricted building');
 
-  // SplatStation brings it in as a normal SplatScout ZIP, filed under the shared building name.
+  // SplatStation brings it in as a normal SplatScout ZIP, filed under the shared building name, and awards points.
   const dir = mkdtempSync(join(tmpdir(), 'crowd-'));
-  const c = { url: 'https://fake.supabase.co', key: 'sb_secret_test' };
-  const zip = await crowdStation.importUpload(c, up.id, dir);
-  assert.match(zip, /Schwada_Classroom_Office_Building_Snall_20261102_club-/);
+  const c = { url: FAKE_URL, key: 'sb_secret_test' };
+  const zip = await crowdStation.importUpload(c, up.id, dir, () => {}, R.scoreScan);
+  assert.match(zip, /Schwada_Classroom_Office_Building_Snall_20\d{6}_club-/);
   assert.equal((await listZip(zip)).length, files.length);
   const m = JSON.parse(await readZipText(zip, 'splatscout.json'));
   assert.equal(m.capture.building, 'Schwada Classroom Office Building');
   assert.equal(m.capture.typedBuilding, 'Schwada Building');
   assert.equal(m.club.buildingCode, 'schwada-classroom-office-building');
-  assert.equal(fakeDb.rows.get(up.id).status, 'approved');
+  assert.equal(m.club.contributor, 'Test_Fox');
+  assert.equal(fake.db.captures.get(up.id).status, 'approved');
+  assert.equal(fake.db.captures.get(up.id).points, R.scoreScan({ photos: 6, grade: 'B' }));
+  assert.deepEqual((await clubApp.leaderboard('all'))[0], { handle: 'Test_Fox', points: 45, photos: 0, scans: 1 });
   assert.match(crowdStation.crowdConfig(dir).error, /crowd\.json/);
   passed++;
-  console.log('  ok club uploads: resume after a dropped connection, then SplatStation imports a normal ZIP');
+  console.log('  ok club scans: members only, resume after a dropped connection, SplatStation imports a normal ZIP and awards points');
 })();
+
+await (async () => {
+  // The photo queue on the phone, with a plain Map instead of IndexedDB.
+  const mem = new Map();
+  snapsApp.useStore({ putSnap: async (s) => void mem.set(s.id, s), getSnap: async (id) => mem.get(id), listSnaps: async () => [...mem.values()], deleteSnap: async (id) => void mem.delete(id) });
+  const jpg = (n) => new Blob([new Uint8Array([0xff, 0xd8, n, 0xff, 0xd9])], { type: 'image/jpeg' });
+  let seq = 0;
+  const snap = (o = {}) => ({ id: crypto.randomUUID(), session: crypto.randomUUID(), createdAt: Date.now() + ++seq, takenAt: Date.now(), blob: jpg(seq), thumb: jpg(seq), w: 1920, h: 1080, bytes: 5,
+    building: { code: 'hayden-library', name: 'Hayden Library' }, floor: '1', room: 'Lobby', geo: { lat: 33.4189, lon: -111.9346, acc: 9, t: Date.now() }, sharp: 100, brightness: 120, phash: '0123456789abcdef', light: 'afternoon', device: 'Pixel 8', camera: 'camera2 0', ...o });
+  const settle = async () => {
+    await new Promise((r) => setTimeout(r, 40));
+    for (let i = 0; i < 300 && snapsApp.status().running; i++) await new Promise((r) => setTimeout(r, 10));
+  };
+  const got = (s) => mem.get(s.id); // saveSnap stores a copy
+  const rows = () => [...fake.db.photos.values()];
+  const filesOf = () => [...fake.db.files.keys()].filter((k) => k.startsWith('club-photos/'));
+
+  // 1. Photos are sent in the background; once sent, only the thumbnail stays on the phone.
+  const three = [snap(), snap(), snap()];
+  for (const s of three) await snapsApp.saveSnap(s);
+  await settle();
+  assert.ok(three.every((s) => got(s).state === 'done' && got(s).blob === null && got(s).thumb), 'sent; thumbnails kept');
+  assert.equal(rows().filter((p) => p.status === 'new').length, 3);
+  assert.equal(filesOf().length, 3);
+  const r0 = rows()[0];
+  assert.equal(r0.user_id, [...fake.db.profiles.keys()][0]);
+  assert.equal(r0.storage_path, `hayden-library/floor-1-lobby/${r0.id}.jpg`);
+  assert.deepEqual([r0.width, r0.height, r0.device, r0.light, r0.phash], [1920, 1080, 'Pixel 8', 'afternoon', '0123456789abcdef']);
+
+  // 2. A busy server isn't the photo's fault: it waits in line and goes on later.
+  const busy = snap();
+  fake.db.flaky.add(`/${busy.id}.jpg`);
+  await snapsApp.saveSnap(busy);
+  await settle();
+  assert.equal(got(busy).state, 'row', 'the row is in, the file is waiting');
+  assert.match(snapsApp.status().lastError, /server busy/);
+  snapsApp.kick();
+  await settle();
+  assert.equal(got(busy).state, 'done');
+
+  // 3. A refusal is final until someone looks at it; "try again" resumes where it stopped.
+  const refused = snap();
+  fake.db.failOnce.add(`/${refused.id}.jpg`);
+  await snapsApp.saveSnap(refused);
+  await settle();
+  assert.equal(got(refused).state, 'failed');
+  assert.equal(got(refused).resume, 'row');
+  assert.match(got(refused).error, /Could not send the file/);
+  await snapsApp.retry(refused.id);
+  await settle();
+  assert.equal(got(refused).state, 'done');
+  assert.equal(fake.db.posts.get(`club-photos/hayden-library/floor-1-lobby/${refused.id}.jpg`), 2, 'sent twice: the refused try and the retry');
+
+  // 4. A restricted building is refused by the database, and the phone says why.
+  const bad = snap({ building: { code: 'cereus-hall', name: 'Cereus Hall' } });
+  await snapsApp.saveSnap(bad);
+  await settle();
+  assert.equal(got(bad).state, 'failed');
+  assert.match(got(bad).error, /restricted building/);
+  assert.equal(filesOf().length, 5, 'no file was sent for it');
+  await snapsApp.remove(bad.id);
+  assert.ok(!mem.has(bad.id));
+
+  // 5. A paused member sends nothing; resuming sends it.
+  const uid = [...fake.db.profiles.keys()][0];
+  fake.db.profiles.get(uid).banned = true;
+  await clubApp.myProfile({ fresh: true });
+  const held = snap();
+  await snapsApp.saveSnap(held);
+  await settle();
+  assert.equal(got(held).state, 'queued');
+  assert.equal(snapsApp.status().blocked, 'banned');
+  fake.db.profiles.get(uid).banned = false;
+  await clubApp.myProfile({ fresh: true });
+  snapsApp.kick();
+  await settle();
+  assert.equal(got(held).state, 'done');
+
+  // 6. The club's verdicts come back onto the phone.
+  const first = rows()[0];
+  Object.assign(first, { status: 'accepted', points: 6, reviewed_at: new Date().toISOString(), review_note: 'First photo of this room +5' });
+  await snapsApp.refreshStatuses();
+  const c = await snapsApp.counts();
+  assert.deepEqual([c.accepted, c.points, c.sent, c.waiting, c.failed], [1, 6, 5, 0, 0]);
+  assert.equal((await clubApp.leaderboard('all'))[0].points, 51, 'the scan (45) and the photo (6)');
+  assert.equal((await clubApp.leaderboard('week'))[0].points, 6 + 45, 'both counted this week');
+
+  // 7. Leaving the club deletes everything sent: files first, then rows, then the profile.
+  await clubApp.leave();
+  assert.equal(rows().length, 0);
+  assert.equal(fake.db.captures.size, 0);
+  assert.equal([...fake.db.files.keys()].length, 0, 'every file is gone');
+  assert.equal(await clubApp.myProfile({ fresh: true }), null);
+  assert.deepEqual(await clubApp.leaderboard('all'), [], 'having left, the board is closed again');
+  passed++;
+  console.log('  ok club (phone): the photo queue sends in the background, waits out a busy server, stops on a refusal, and leaving deletes it all');
+})();
+
+// ---- SplatStation's side
+const clubSt = await import('../station/lib/club.mjs');
+const clubApi = await import('../station/lib/clubapi.mjs');
+await (async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'clubpc-'));
+  const inbox = join(dir, 'inbox');
+  mkdirSync(inbox);
+  const cfg = { workDir: dir, tools: {}, dirs: { inbox } };
+  const c = { url: FAKE_URL, key: 'sb_secret_test' };
+  const ldir = clubSt.clubDir(dir);
+  const buildings = new Map(asuList.map((b) => [b.code, b]));
+
+  const U1 = '00000000-0000-4000-8000-0000000000a1', U2 = '00000000-0000-4000-8000-0000000000a2';
+  fake.db.profiles.set(U1, { user_id: U1, handle: 'Mesa_Quail', banned: false, created_at: new Date().toISOString() });
+  fake.db.profiles.set(U2, { user_id: U2, handle: 'Solar_Hawk', banned: false, created_at: new Date().toISOString() });
+  const idx = {};
+  const mix = (i) => ((0x9e3779b97f4a7c15n * BigInt(i + 1)) % 2n ** 64n).toString(16).padStart(16, '0'); // well-spread fake hashes
+  const t0 = Date.UTC(2026, 10, 3, 20, 0); // 13:00 in Phoenix: afternoon
+  const session = (n) => `5e55105e-0000-4000-8000-00000000000${n}`;
+  let made = 0;
+  /** A photo row in the club database, its cloud file, and (when `local`) the copy and measurements SplatStation would hold. */
+  const add = (o = {}, m = {}, local = true) => {
+    const i = ++made, id = `cccccccc-cccc-4ccc-8ccc-${String(i).padStart(12, '0')}`;
+    const place = { building_code: 'hayden-library', building_name: 'Hayden Library', floor: '1', room: 'Lobby', ...o };
+    const path = `${place.building_code}/floor-${place.floor}-${place.room.toLowerCase()}/${id}.jpg`;
+    const taken = o.taken || t0 + i * 1000;
+    delete o.taken;
+    fake.db.photos.set(id, { id, user_id: U1, created_at: new Date(taken + 500).toISOString(), taken_at: new Date(taken).toISOString(), floor: '1', room: 'Lobby', storage_path: path, session: session(1), mission_id: null,
+      lat: null, lon: null, gps_accuracy_m: null, device: 'Pixel 8', status: 'new', points: 0, file_removed: false, review_note: null, reviewed_at: null, ...place, ...o });
+    fake.db.files.set('club-photos/' + path, new Uint8Array([0xff, 0xd8, i, 0xff, 0xd9]));
+    if (local) {
+      writeFileSync(clubSt.photoFile(ldir, id), Buffer.from([0xff, 0xd8, i, 0xff, 0xd9]));
+      writeFileSync(clubSt.thumbFile(ldir, id), Buffer.from([0xff, 0xd8, i, 0xff, 0xd9]));
+      idx[id] = { w: 1920, h: 1080, sharp: 100 + (i % 7), mean: 120, clipHi: 0, texture: 0.3, phash: mix(i), bytes: 5, ...m };
+      writeFileSync(join(ldir, 'index.json'), JSON.stringify(idx));
+    }
+    return id;
+  };
+
+  // -- first opinions
+  const ids = Array.from({ length: 12 }, () => add());
+  const dark = add({}, { mean: 10 }), dim = add({}, { mean: 32 }), blurry = add({}, { sharp: 15 });
+  const dupA = ids[0];
+  const dupB = add({}, { phash: idx[dupA].phash }); // same view as the first, same member
+  const copy = add({ user_id: U2, session: session(2) }, { phash: idx[ids[1]].phash }); // another member, same view
+  const far = add({ lat: 33.5, lon: -111.9, gps_accuracy_m: 10 }); // GPS puts it 10 km away
+  const clock = add({ taken_at: new Date(t0 + 86400e3).toISOString() }); // the phone clock says tomorrow
+  const unsynced = add({}, {}, false);
+  let list = await clubSt.reviewList(c, cfg, buildings);
+  const v = (id) => list.find((p) => p.id === id).verdict;
+  assert.equal(v(ids[3]).level, 'accept');
+  assert.equal(v(dark).level, 'reject');
+  assert.deepEqual(v(dark).reasons, ['too dark']);
+  assert.equal(v(dim).level, 'review');
+  assert.equal(v(blurry).level, 'review');
+  assert.match(v(blurry).reasons.join(), /maybe blurry/, 'judged against the rest of the outing');
+  assert.equal(v(dupB).level, 'reject');
+  assert.match(v(dupB).reasons.join(), /near-duplicate/);
+  assert.equal(v(dupA).level, 'accept', 'the first of two identical photos stays');
+  assert.equal(v(copy).level, 'review');
+  assert.match(v(copy).reasons.join(), /another member/);
+  assert.match(v(far).reasons.join(), /GPS puts it \d+ m from the building/);
+  assert.match(v(clock).reasons.join(), /clock/);
+  assert.equal(v(unsynced).level, 'review');
+  assert.equal(list.find((p) => p.id === ids[0]).handle, 'Mesa_Quail');
+  assert.equal(list.find((p) => p.id === ids[0]).lightSlot, 'afternoon');
+
+  // -- accepting awards points: the first photo of a room, then 1 each
+  const first12 = ids;
+  let r = await clubSt.review(c, cfg, { ids: first12, action: 'accept' });
+  assert.equal(r.changed, 12);
+  assert.equal(r.points, 6 + 11, '5 extra for the first photo of the room');
+  const p = (id) => fake.db.photos.get(id);
+  assert.deepEqual([p(ids[0]).status, p(ids[0]).points, p(ids[1]).points], ['accepted', 6, 1]);
+  assert.match(p(ids[0]).review_note, /First photo of this room \+5/);
+  assert.equal((await clubSt.review(c, cfg, { ids: first12, action: 'accept' })).changed, 0, 'accepting twice awards nothing');
+
+  // -- a mission's bonus needs its light; a new light in a covered room earns a little
+  const mid = crypto.randomUUID();
+  fake.db.missions.set(mid, { id: mid, title: 'Evening lobby', bonus: 3, light: 'evening', wanted: 10, active: true });
+  const evening = t0 + 4 * 3600e3; // 17:00 Phoenix
+  const eve = add({ mission_id: mid, taken: evening }), eve2 = add({ mission_id: mid, taken: evening + 5000 }), noon = add({ mission_id: mid, taken: t0 + 60e3 });
+  r = await clubSt.review(c, cfg, { ids: [eve, eve2, noon], action: 'accept' });
+  assert.equal(p(eve).points, 1 + 3 + 3, 'photo, first evening light here, mission bonus');
+  assert.equal(p(eve2).points, 1 + 3, 'photo, mission bonus');
+  assert.equal(p(noon).points, 1, 'a mission asking for evening light gives nothing at noon');
+
+  // -- the daily limit on base points
+  const many = Array.from({ length: 4 }, () => add({ user_id: U2, session: session(2), taken: t0 + 3600e3 }));
+  const prior = Array.from({ length: 100 }, (_, i) => ({ id: 'p' + i, user_id: U2, created_at: new Date(t0).toISOString(), taken_at: new Date(t0).toISOString(), building_code: 'hayden-library', floor: '1', room: 'Lobby' }));
+  const plan = clubSt.planAwards(many.map((id) => fake.db.photos.get(id)), prior);
+  assert.ok(plan.every((x) => x.points === 0), 'photos past 100 points a day are welcome but score nothing');
+
+  // -- rejecting deletes the photo here and in the cloud
+  const [x1, x2] = [add(), add()];
+  const cloud = `club-photos/${p(x1).storage_path}`;
+  assert.ok(fake.db.files.has(cloud) && existsSync(clubSt.photoFile(ldir, x1)));
+  r = await clubSt.review(c, cfg, { ids: [x1, x2], action: 'reject', note: 'A person is in the frame' });
+  assert.equal(r.changed, 2);
+  assert.deepEqual([p(x1).status, p(x1).review_note, p(x1).file_removed], ['rejected', 'A person is in the frame', true]);
+  assert.ok(!fake.db.files.has(cloud) && !existsSync(clubSt.photoFile(ldir, x1)) && !existsSync(clubSt.thumbFile(ldir, x1)), 'gone from the cloud and from this PC');
+  assert.equal((await clubSt.review(c, cfg, { ids: [ids[0]], action: 'reopen' })).changed, 1);
+  assert.equal(p(ids[0]).status, 'new');
+  await clubSt.review(c, cfg, { ids: [ids[0]], action: 'accept' });
+
+  // -- a capture from the accepted photos of one room
+  const room = { building_code: 'hayden-library', floor: '1', room: 'Lobby' };
+  let built = await clubSt.buildCapture(c, cfg, room, inbox, '2.5.0');
+  assert.equal(built.photos, 12 + 3, '12 photos, and the 3 taken for the mission');
+  assert.ok(built.sharedCamera, 'one phone, one orientation: one camera');
+  assert.match(built.file, /Hayden_Library_Lobby_2026110\d_club-photos\.zip$/);
+  const entries = await listZip(built.file);
+  assert.equal(entries.filter((e) => /images\/\d{4}\.jpg$/.test(e.name)).length, built.photos);
+  const man = JSON.parse(await readZipText(built.file, 'splatscout.json'));
+  assert.deepEqual([man.capture.engine, man.capture.tracking, man.capture.building, man.capture.room], ['club-photos', 'none', 'Hayden Library', 'Lobby']);
+  assert.ok(man.club.contributors.includes('Mesa_Quail'));
+  assert.ok(man.club.lightSlots.includes('evening') && man.club.lightSlots.includes('afternoon'));
+  assert.ok(man.frames.every((f) => f.intrinsics && f.intrinsics.w === 1920 && Math.abs(f.intrinsics.fx - 1920 / 2 / Math.tan((68 / 2) * (Math.PI / 180))) < 0.1), 'one camera: its field of view is offered as a starting guess');
+  // Photos from another phone: each photo's lens is left for COLMAP to work out.
+  const other = add({ device: 'iPhone 15' }, {});
+  await clubSt.review(c, cfg, { ids: [other], action: 'accept' });
+  built = await clubSt.buildCapture(c, cfg, room, inbox);
+  assert.ok(!built.sharedCamera);
+  assert.ok(JSON.parse(await readZipText(built.file, 'splatscout.json')).frames.every((f) => !f.intrinsics));
+  await assert.rejects(clubSt.buildCapture(c, cfg, { building_code: 'hayden-library', floor: '9', room: 'Nowhere' }, inbox), /at least 10 are needed/);
+
+  // -- freeing the cloud's storage keeps the local copies and the points
+  const kept = clubSt.photoFile(ldir, ids[2]);
+  const before = [...fake.db.files.keys()].length;
+  const freed = await clubSt.freeCloud(c, cfg);
+  assert.ok(freed.photos >= 15 && freed.bytes > 0);
+  assert.ok([...fake.db.files.keys()].length < before && p(ids[2]).file_removed && p(ids[2]).points === 1 && existsSync(kept));
+
+  // -- missions, invites, members, restricted places
+  await assert.rejects(clubSt.createMission(c, { title: 'x' }), /3 to 80/);
+  const mission = await clubSt.createMission(c, { title: 'Hayden lobby at night', building_code: 'hayden-library', light: 'night', bonus: 99, wanted: -5 });
+  assert.deepEqual([mission.bonus, mission.wanted, mission.light, mission.active], [50, 1, 'night', true], 'values are kept in range');
+  await clubSt.updateMission(c, mission.id, { active: false });
+  assert.equal(fake.db.missions.get(mission.id).active, false);
+  await clubSt.deleteMission(c, mission.id);
+  assert.ok(!fake.db.missions.has(mission.id));
+
+  const inv = await clubSt.createInvite(c, { label: 'Robotics club', max_uses: 3 });
+  assert.match(inv.code, /^CLUB-[A-HJ-NP-Z2-9]{6}$/);
+  assert.equal(fake.db.invites.get(inv.code).max_uses, 3);
+  await clubSt.setInviteActive(c, inv.code, false);
+  assert.equal(fake.db.invites.get(inv.code).active, false);
+
+  const members = await clubSt.listMembers(c);
+  assert.ok(members.find((m) => m.handle === 'Mesa_Quail').points > 17);
+  await assert.rejects(clubSt.setMember(c, U2, { handle: 'bad handle' }), /3 to 20/);
+  await clubSt.setMember(c, U2, { handle: 'Solar_Hawk2', banned: true });
+  assert.deepEqual([fake.db.profiles.get(U2).handle, fake.db.profiles.get(U2).banned], ['Solar_Hawk2', true]);
+  const purged = await clubSt.purgeMember(c, cfg, U2);
+  assert.ok(purged.photos >= 5 && !fake.db.profiles.has(U2) && ![...fake.db.photos.values()].some((x) => x.user_id === U2));
+  assert.ok(!existsSync(clubSt.photoFile(ldir, copy)), 'their local copies are deleted too');
+
+  const flagged = [...buildings.values()].filter((b) => b.restricted).length;
+  fake.db.restricted_buildings.clear();
+  assert.equal(await clubSt.syncRestricted(c, buildings), flagged);
+  assert.equal(fake.db.restricted_buildings.size, flagged);
+  assert.ok(fake.db.restricted_buildings.has('cereus-hall'));
+  await clubSt.setRestricted(c, 'hayden-library', 'lab');
+  assert.equal(fake.db.restricted_buildings.get('hayden-library').reason, 'lab');
+  await clubSt.setRestricted(c, 'hayden-library', null);
+  assert.ok(!fake.db.restricted_buildings.has('hayden-library'));
+
+  // -- only this PC may use the club tools
+  assert.ok(clubApi.isLocal({ socket: { remoteAddress: '::ffff:127.0.0.1' } }) && clubApi.isLocal({ socket: { remoteAddress: '::1' } }));
+  assert.ok(!clubApi.isLocal({ socket: { remoteAddress: '203.0.113.7' } }), 'another device on the network');
+  const own = Object.values(networkInterfaces()).flat().find((i) => i && i.family === 'IPv4' && !i.internal);
+  if (own) assert.ok(clubApi.isLocal({ socket: { remoteAddress: own.address } }), 'this PC’s own network address (the dashboard opened by its Wi-Fi address)');
+  let answer = null;
+  await clubApi.handleClub({ req: { socket: { remoteAddress: '203.0.113.7' }, method: 'GET' }, res: {}, path: '/api/club/photos', cfg, readBody: async () => ({}), sendJson: (res, body, code) => (answer = [code, body]), say() {}, scanInbox() {} });
+  assert.equal(answer[0], 403, 'a phone on the Wi-Fi is refused');
+  passed++;
+  console.log('  ok club (PC): first opinions, points (first photo, light, mission, daily limit), reject deletes, capture from photos, members, invites, restricted places');
+})();
+
+// With ffmpeg: measuring and syncing real photos.
+await (async () => {
+  let ffmpeg = null;
+  for (const f of ['ffmpeg', join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe')]) {
+    try {
+      execFileSync(f, ['-version'], { stdio: 'ignore' });
+      ffmpeg = f;
+      break;
+    } catch {}
+  }
+  if (!ffmpeg) return console.log('  (skipped: measuring real photos needs ffmpeg)');
+  const dir = mkdtempSync(join(tmpdir(), 'clubff-'));
+  const make = (name, vf) => execFileSync(ffmpeg, ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=1', '-vf', vf, '-frames:v', '1', join(dir, name)]);
+  make('sharp.jpg', 'null');
+  make('blurry.jpg', 'boxblur=14');
+  make('dark.jpg', 'eq=brightness=-0.85');
+  const a = await clubSt.measure(ffmpeg, join(dir, 'sharp.jpg')), b = await clubSt.measure(ffmpeg, join(dir, 'blurry.jpg')), d = await clubSt.measure(ffmpeg, join(dir, 'dark.jpg'));
+  assert.deepEqual([a.w, a.h], [1280, 720], 'the real size, not the analysis size');
+  assert.match(a.phash, /^[0-9a-f]{16}$/);
+  assert.ok(a.sharp > b.sharp * 20, `sharp ${a.sharp} against blurred ${b.sharp}`);
+  assert.ok(d.mean < 30 && a.mean > 60, 'brightness');
+  assert.ok(R.hamming(a.phash, b.phash) <= 12, 'a blurred copy of a view still looks like the same view');
+
+  // sync: download new photos, measure them and make thumbnails
+  const cfg = { workDir: dir, tools: { ffmpeg }, dirs: {} };
+  const c = { url: FAKE_URL, key: 'sb_secret_test' };
+  fake.db.photos.clear(); // (the earlier checks left rows behind)
+  fake.db.files.clear();
+  const id = 'dddddddd-dddd-4ddd-8ddd-000000000001', path = `hayden-library/floor-1-lobby/${id}.jpg`;
+  fake.db.profiles.set('u9', { user_id: 'u9', handle: 'Sync_Test', banned: false });
+  fake.db.photos.set(id, { id, user_id: 'u9', status: 'new', storage_path: path, file_removed: false, created_at: new Date().toISOString() });
+  fake.db.files.set('club-photos/' + path, new Uint8Array(readFileSync(join(dir, 'sharp.jpg'))));
+  const res = await clubSt.sync(c, cfg);
+  assert.deepEqual([res.total, res.downloaded, res.failed], [1, 1, 0]);
+  const ldir = clubSt.clubDir(dir), idx = clubSt.loadIndex(ldir);
+  assert.deepEqual([idx[id].w, idx[id].h], [1280, 720]);
+  assert.ok(existsSync(clubSt.photoFile(ldir, id)) && existsSync(clubSt.thumbFile(ldir, id)));
+  assert.equal((await clubSt.sync(c, cfg)).downloaded, 0, 'only new photos are downloaded');
+  fake.db.profiles.delete('u9');
+  fake.db.photos.delete(id);
+  passed++;
+  console.log('  ok club (PC, with ffmpeg): measures real photos (size, sharpness, light, hash) and syncs only the new ones');
+})();
+
 globalThis.fetch = realFetch;
 
 console.log(`\n${passed} checks passed`);

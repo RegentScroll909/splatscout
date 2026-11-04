@@ -30,6 +30,12 @@ createServer(async (req, res) => {
     out.on('error', (e) => res.writeHead(500).end(String(e)));
     return;
   }
+  // Dev only: the in-memory Supabase stand-in, so the screens can be tried without a network.
+  if (req.url === '/__tools/fake-supabase.mjs') {
+    res.writeHead(200, { 'Content-Type': TYPES['.js'], 'Cache-Control': 'no-store' });
+    res.end(await readFile(join(dirname(fileURLToPath(import.meta.url)), 'fake-supabase.mjs')));
+    return;
+  }
   try {
     let p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
     if (p.endsWith('/')) p += 'index.html';

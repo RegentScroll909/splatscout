@@ -5,11 +5,20 @@ import { icon, templateIcon } from './icons.js';
 import { xrSupport } from '../sources/xrSource.js';
 import { modeLabel } from './review.js';
 import * as store from '../data/store.js';
+import * as club from '../data/club.js';
 
 export async function homeScreen(root, { navigate }) {
   const status = h('div.status-line', h('span.status-dot.pending'), h('span.mono', 'Checking device…'));
   const storage = h('span.mono.muted.small');
   const list = h('div.cap-list');
+  const clubCard = h('button.club-card', { onclick: () => navigate('#/club') });
+  const paintClub = (p) => mount(clubCard,
+    icon('trophy'),
+    h('div.club-card-body',
+      h('div.club-card-title', 'Club', h('span.tag.good', 'Beta')),
+      h('div.small.muted', p ? `@${p.handle}: take photos, earn points, climb the leaderboard` : 'Join the club: contribute photos of campus and compete on the leaderboard')),
+    icon('chevron', 'dim'));
+  paintClub(club.cachedProfile());
   mount(
     root,
     h(
@@ -25,6 +34,7 @@ export async function homeScreen(root, { navigate }) {
         h('button.btn.block', { onclick: () => navigate('#/new?practice=1') }, icon('cube'), 'Practice room'),
         h('button.btn.block', { onclick: () => navigate('#/learn') }, icon('book'), 'Capture guide'),
       ),
+      clubCard,
       list,
       h('footer.foot', storage),
     ),

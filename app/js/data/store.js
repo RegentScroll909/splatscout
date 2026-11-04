@@ -2,7 +2,7 @@
 // so nothing is lost if the browser tab is closed mid-capture.
 
 const DB_NAME = 'splatscout';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 let dbPromise = null;
 
 function open() {
@@ -20,6 +20,7 @@ function open() {
         const s = db.createObjectStore('frames', { keyPath: 'id' });
         s.createIndex('captureId', 'captureId');
       }
+      if (!db.objectStoreNames.contains('snaps')) db.createObjectStore('snaps', { keyPath: 'id' }); // single photos for the club
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -85,6 +86,13 @@ export async function getFrames(captureId) {
   return all.sort((a, b) => a.seq - b.seq);
 }
 
+// ---- snaps: single photos taken for the club, waiting to be sent (or already sent; then only the thumbnail is kept)
+export const putSnap = (s) => tx('snaps', 'readwrite', (st) => st.put(s));
+export const getSnap = (id) => tx('snaps', 'readonly', (st, set) => req2p(st.get(id)).then(set));
+export const listSnaps = () => tx('snaps', 'readonly', (st, set) => req2p(st.getAll()).then(set));
+export const deleteSnap = (id) => tx('snaps', 'readwrite', (st) => st.delete(id));
+export const clearSnaps = () => tx('snaps', 'readwrite', (st) => st.clear());
+
 export async function storageEstimate() {
   if (!navigator.storage?.estimate) return null;
   const e = await navigator.storage.estimate();
@@ -101,5 +109,5 @@ export async function requestPersistence() {
 }
 
 export async function clearAll() {
-  for (const s of ['frames', 'captures', 'buildings']) await tx(s, 'readwrite', (st) => st.clear());
+  for (const s of ['frames', 'captures', 'buildings', 'snaps']) await tx(s, 'readwrite', (st) => st.clear());
 }

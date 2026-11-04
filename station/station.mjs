@@ -19,8 +19,13 @@ import { readZipText } from './lib/zipread.mjs';
 import { walkInputs, walkMapFor } from './lib/walkmap.mjs';
 import { cropPly, topDown, CROP_MARGIN } from './lib/crop.mjs';
 import * as crowd from './lib/crowd.mjs';
+import { handleClub, isLocal, awardScan } from './lib/clubapi.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+let PKG_VERSION = '0';
+try {
+  PKG_VERSION = JSON.parse(readFileSync(join(HERE, '..', 'package.json'), 'utf8')).version;
+} catch {}
 const WEB = join(HERE, 'web');
 const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')).map(([k, v]) => [k, v ?? true]));
 const cfg = loadConfig(args.dir ? { workDir: args.dir } : {});
@@ -406,6 +411,11 @@ const server = createServer(async (req, res) => {
     }
     if (path === '/api/jobs') return sendJson(res, jobs.map(publicJob));
     if (path === '/api/library') return sendJson(res, library());
+    // The club tools use the database's secret key: only this PC may ask (not a phone on the Wi-Fi).
+    if (path.startsWith('/api/club')) {
+      return handleClub({ req, res, path, url, cfg, readBody, sendJson, say, scanInbox, version: PKG_VERSION });
+    }
+    if (path.startsWith('/api/crowd') && !isLocal(req)) return sendJson(res, { error: 'Club uploads can only be managed on the PC running SplatStation.' }, 403);
     if (path === '/api/crowd') {
       // Club uploads from phones (Supabase): list, import into the inbox, or delete.
       const c = crowd.crowdConfig(cfg.workDir);
@@ -432,7 +442,7 @@ const server = createServer(async (req, res) => {
         let last = 0;
         const file = await crowd.importUpload(c, id, cfg.dirs.inbox, (p) => {
           if (p - last >= 0.25) say(`Club upload: downloading ${Math.round((last = p) * 100)}%`);
-        });
+        }, awardScan);
         say(`Club upload imported: ${basename(file)}`);
         setTimeout(scanInbox, 100);
         return sendJson(res, { ok: true, file: basename(file) });

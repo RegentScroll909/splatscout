@@ -52,7 +52,7 @@ function session() {
   return sessionReq;
 }
 
-async function api(path, { method = 'GET', body, type = 'application/json', headers = {} } = {}) {
+export async function api(path, { method = 'GET', body, type = 'application/json', headers = {} } = {}) {
   const s = await session();
   const r = await fetch(CROWD.url + path, {
     method,
@@ -67,7 +67,7 @@ async function api(path, { method = 'GET', body, type = 'application/json', head
   return { ok: r.ok, status: r.status, body: j, text };
 }
 
-const why = (r) => (r.body && (r.body.message || r.body.error || r.body.msg)) || r.text || `error ${r.status}`;
+export const why = (r) => (r.body && (r.body.message || r.body.error || r.body.msg)) || r.text || `error ${r.status}`;
 
 // ------------------------------------------------------------------------------- uploads
 /**
@@ -114,7 +114,11 @@ export async function uploadCapture(capture, files, tags, { save, frameIds = nul
     status: 'uploading',
   };
   let r = await api('/rest/v1/captures', { method: 'POST', body: row, headers: { Prefer: 'return=minimal' } });
-  if (!r.ok && r.status !== 409) throw new Error('The club database refused the capture: ' + why(r));
+  if (!r.ok && r.status !== 409) {
+    // Row-level security: not a member (or banned), or a building the club doesn't photograph.
+    if (/row-level security/i.test(why(r))) throw Object.assign(new Error('The club database refused this upload: join the club first, and check the building isn’t a restricted one.'), { code: 'refused' });
+    throw new Error('The club database refused the capture: ' + why(r));
+  }
 
   // Files, a few at a time; the list of everything sent goes last so SplatStation knows it's whole.
   const sent = new Set(up.sent);
@@ -200,4 +204,30 @@ export async function myUploads() {
   const r = await api('/rest/v1/captures?select=id,status');
   if (!r.ok) throw new Error(why(r));
   return Object.fromEntries(r.body.map((x) => [x.id, x.status]));
+}
+
+/** Every file under a folder of a storage bucket (listing goes down into sub-folders). */
+export async function listObjects(bucket, prefix) {
+  const names = [];
+  const walk = async (dir) => {
+    for (let offset = 0; ; offset += 1000) {
+      const r = await api(`/storage/v1/object/list/${bucket}`, { method: 'POST', body: { prefix: dir, limit: 1000, offset } });
+      if (!r.ok) throw new Error(why(r));
+      for (const it of r.body) {
+        if (it.id) names.push(`${dir}/${it.name}`);
+        else await walk(`${dir}/${it.name}`);
+      }
+      if (r.body.length < 1000) break;
+    }
+  };
+  await walk(prefix);
+  return names;
+}
+
+/** Delete files from a storage bucket (up to 100 per request). */
+export async function removeObjects(bucket, names) {
+  for (let i = 0; i < names.length; i += 100) {
+    const r = await api(`/storage/v1/object/${bucket}`, { method: 'DELETE', body: { prefixes: names.slice(i, i + 100) } });
+    if (!r.ok) throw new Error(why(r));
+  }
 }

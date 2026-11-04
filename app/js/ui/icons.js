@@ -40,6 +40,9 @@ const P = {
   queue: '<path d="M4 6h16M4 12h16M4 18h10"/>',
   stop: '<rect x="6.5" y="6.5" width="11" height="11" rx="1.5"/>',
   external: '<path d="M14 4h6v6M20 4l-9 9M18 14v6H4V6h6"/>',
+  trophy: '<path d="M8 4h8v5a4 4 0 0 1-8 0z"/><path d="M8 6H5a3 3 0 0 0 3 4M16 6h3a3 3 0 0 1-3 4M12 13v4M8.5 20h7"/>',
+  flag: '<path d="M6 21V4M6 5h11l-2 4 2 4H6"/>',
+  users: '<circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0 1 12 0M16 5.5a3 3 0 0 1 0 5M18 14.5a6 6 0 0 1 3 5.5"/>',
   // Types of space (capture plans).
   room: '<path d="M4 5h16v14H4z"/><path d="M4 15h4M14 5v4"/>',
   hallway: '<path d="M3 8h18M3 16h18"/><path d="M7 12h10" stroke-dasharray="2 2.5"/>',

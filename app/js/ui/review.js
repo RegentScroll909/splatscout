@@ -10,6 +10,7 @@ import { buildExport, exportFiles, deliver } from '../data/exporter.js';
 import * as store from '../data/store.js';
 import * as campus from '../data/campus.js';
 import { uploadCapture, deleteUpload } from '../data/crowd.js';
+import * as club from '../data/club.js';
 import { getSettings, setSettings } from '../data/settings.js';
 
 const FLAG_LABEL = {
@@ -265,6 +266,17 @@ export async function reviewScreen(root, { captureId, navigate }) {
   const practice = () => /^demo/.test(capture.engine || '');
 
   async function startUpload(a) {
+    // Uploads are for club members (invite code, handle, rules agreed): the database refuses anyone else.
+    let me = null;
+    try {
+      me = await club.myProfile();
+    } catch {
+      me = club.cachedProfile();
+    }
+    if (!me) {
+      toast('Join the club first: you upload as your handle');
+      return navigate('#/club?join=1&back=' + encodeURIComponent('#/review/' + captureId));
+    }
     if (uploading()) return doUpload(null, null);
     if (capture.upload) {
       // Uploaded before (e.g. then captured more): the new upload replaces it.
@@ -289,28 +301,24 @@ export async function reviewScreen(root, { captureId, navigate }) {
         (await campus.matchName(capture.building)) ||
         (capture.geo && (await campus.near(capture.geo, 1)).map((x) => x.b)[0]) ||
         null;
-    const settings = getSettings();
-    const st = { building: guess ? guess.name : '', floor: capture.floor || '', room: capture.room || '', name: settings.author || '', ok: !!settings.crowdConsent };
+    const st = { building: guess ? guess.name : '', floor: capture.floor || '', room: capture.room || '', handle: (club.cachedProfile() || {}).handle || '' };
     const size = chosenFrames.reduce((s, f) => s + (f.size || 0), 0);
     const msg = h('p.small.warn-text');
-    const near = capture.geo && !practice() ? await campus.near(capture.geo) : [];
+    const near = capture.geo && !practice() ? (await campus.near(capture.geo)).filter((x) => !x.b.restricted) : [];
     const bInput = h('input', { list: 'ublist', value: st.building, placeholder: 'Start typing an ASU building', oninput: (e) => (st.building = e.target.value) });
     const back = h('div.modal-back', { onclick: (e) => e.target === back && back.remove() },
       h('div.modal.wide',
         h('h3', 'Upload to the club'),
         practice()
           ? h('p.small.muted', 'Practice captures are filed under “Practice”, apart from real buildings.')
-          : h('label.field', h('span', 'Building'), bInput, h('datalist#ublist', asu.map((b) => h('option', { value: b.name })))),
+          : h('label.field', h('span', 'Building'), bInput, h('datalist#ublist', asu.filter((b) => !b.restricted).map((b) => h('option', { value: b.name })))),
         near.length
           ? h('div.chips', near.map(({ b, dist }) => h('button.btn.small', { onclick: () => { st.building = bInput.value = b.name; } }, b.name + (dist > 0 ? ` · ${Math.round(dist)} m` : ''))))
           : null,
         h('div.row.two',
           h('label.field', h('span', 'Room or section'), h('input', { value: st.room, placeholder: 'e.g. 214, Main lobby', oninput: (e) => (st.room = e.target.value) })),
           h('label.field.narrow', h('span', 'Floor'), h('input', { value: st.floor, placeholder: '2', oninput: (e) => (st.floor = e.target.value) }))),
-        h('label.field', h('span', 'Your name (optional, shown to the club)'), h('input', { value: st.name, maxlength: 60, oninput: (e) => (st.name = e.target.value) })),
-        h('label.check-row',
-          h('input', { type: 'checkbox', checked: st.ok, onchange: (e) => (st.ok = e.target.checked) }),
-          h('span.check-label.small', 'I took these photos. The club may keep them and use them to make 3D models of campus that may be shown publicly. Nobody is in them who didn’t agree to be photographed.')),
+        h('p.small', 'Uploading as ', h('b', `@${st.handle}`), '. You agreed to the club rules when you joined; no people may be in the photos.'),
         h('p.small.muted.upload-note', `${chosenFrames.length} photos · ${fmtBytes(size)}. Keep this screen open while it uploads; if it stops, press Resume upload to carry on. You can remove your upload from this phone at any time.`),
         msg,
         h('div.row.end',
@@ -320,10 +328,9 @@ export async function reviewScreen(root, { captureId, navigate }) {
               const b = practice() ? { code: 'practice', name: 'Practice' } : asu.find((x) => x.name.toLowerCase() === st.building.trim().toLowerCase()) || (await campus.matchName(st.building));
               if (!b) return (msg.textContent = 'Pick the building from the list, so everyone’s uploads of it end up together.');
               if (!st.room.trim()) return (msg.textContent = 'Say which room or part of the building this is.');
-              if (!st.ok) return (msg.textContent = 'Tick the box to agree to how the photos are used.');
-              setSettings({ crowdConsent: Date.now(), author: st.name.trim() });
+              if (b.restricted) return (msg.textContent = `That is ${campus.RESTRICTED_TEXT[b.restricted] || 'a restricted building'}: it isn’t open for uploads.`);
               back.remove();
-              doUpload(chosenFrames.map((f) => f.id), { buildingCode: b.code, buildingName: b.name, floor: st.floor.trim(), room: st.room.trim(), contributor: st.name.trim() });
+              doUpload(chosenFrames.map((f) => f.id), { buildingCode: b.code, buildingName: b.name, floor: st.floor.trim(), room: st.room.trim(), contributor: st.handle });
             },
           }, icon('upload'), 'Upload'),
         ),
