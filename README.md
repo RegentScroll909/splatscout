@@ -306,6 +306,33 @@ only seconds), so it's off by default: turn it on to compare captures or presets
 with it ticked. SplatStation asks Brush to log (`RUST_LOG=error,brush_cli=info`) and reads the score from its
 `Eval iter …: PSNR …, ssim …` line, which also lands in the job's `job.log`.
 
+How to read the numbers, from the club's own captures, each trained on Quick and on Standard with every 12th
+photo held back (on the RTX 5080, November 2026). *Score* is what the Campus map makes of the PSNR; *estimate
+before* is what it said with no measurement:
+
+| Capture | Photos (held back) | Scan grade | Estimate before | Quick: PSNR · SSIM → score | Standard: PSNR · SSIM → score |
+|---|---|---|---|---|---|
+| Hayden Library · TestfibL | 481 (41) | B | 80 Good | 27.4 dB · 0.880 → 82 Good | 28.7 dB · 0.886 → 88 Good |
+| Schwada · Snall | 1052 (88) | A | 99 Excellent | 26.7 dB · 0.926 → 78 Good | 27.8 dB · 0.926 → 84 Good |
+| Schwada · Jfbbch | 413 (35) | A | 88 Good | 25.0 dB · 0.949 → 67 Fair | 27.3 dB · 0.960 → 81 Good |
+| Memorial Union · Lobby | 412 (35) | B | 85 Good | 24.7 dB · 0.880 → 64 Fair | 26.5 dB · 0.908 → 78 Good |
+| Memorial Union · Ggg | 537 (45) | A | 88 Good | 23.8 dB · 0.902 → 56 Fair | 26.5 dB · 0.924 → 77 Good |
+| Schwada · Dd | 233 (20) | C | 64 Fair | 21.8 dB · 0.752 → 40 Rough | 22.9 dB · 0.771 → 49 Rough |
+
+Next to the held-back photos, the splats' renders of them look like this: at 28.7 dB (TestfibL) the two are hard
+to tell apart; at 26.5–27.8 dB (Ggg, Lobby, Snall, Jfbbch) walls, furniture and signs are solid and only a little
+soft, with some haze or blotches on plain white walls and a blurred TV whose picture changed between photos; at
+22.9 dB (Dd) some views are clean, but the glass doors and the perforated stair panels smear and ghost. So the map
+scores PSNR in straight lines between these stops: under 20 dB *Not enough yet*, 20 *Rough*, 23 *Fair*, 26
+*Good*, 29 *Excellent* (`PSNR_STOPS` in `app/js/core/campusmodel.js`). Photos COLMAP couldn't place still count
+against a measured splat. Without a measurement, the map's estimates for five of these six ran 7–15 points high.
+
+What a measurement can't see: it scores the views the phone saw (each held-back photo sits between ones the splat
+trained on), not places nobody photographed, so a scan that missed a corner can still score well. Plain walls
+score higher than busy shelves (white haze on a white wall costs little), and anything that changed between
+photos (a TV, people walking through, the phone's exposure) pulls it down. Quick preview scores 1–3 dB below
+Standard on the same photos, so a Quick splat often lands a band lower: the measurement sees that it's softer.
+
 **Walk through it.** In the viewer, press **🚶 Walk** to explore the splat in first person, at the height the phone
 was held. Use W A S D (or ↑ ↓, with ← → to turn), click the scene and move the mouse to look around, hold Shift to
 hurry, Space to jump, press G for ghost mode (fly through walls; G again lands you on the floor) and M to hide the
@@ -386,6 +413,11 @@ Tested on this PC:
   2.2 it could even crash on reaching that pass, leaving the guide silent. In some runs it also gave up at once
   with the room 54–75% covered, because a gap in the depth map cut the user's spot off from the rest of the
   floor. After: 40–110 s in the room, 3–3½ minutes in the hallway, both ending at 93%, over 7 runs each.
+- **Measured quality (2.6)**: the Schwada "Dd" capture processed end to end with *Measure quality* on (PSNR
+  21.7 dB and SSIM 0.747 on its 20 held-back photos, saved in `info.json` and shown on the History card, the
+  Library tile and the Campus map), then six of the club's captures trained on Quick and Standard with every 12th
+  photo held back. The renders of the held-back views were checked by eye against the photos to set the PSNR
+  thresholds: see the table under *Measure quality*. Brush prints nothing to a pipe unless `RUST_LOG` is set.
 - **Cropping** on the Schwada "Snall" splat (2.2 million splats), whose plain white walls came out dark and
   see-through. The walls sat right on the outline and the crop removed only 0.1% of the solid splats at wall
   height, but cropping at 0.5, 1 or 2 m all left them dark: 73,000 large faint splats 7–28 m away outweighed
