@@ -25,10 +25,14 @@ async function overpass() {
 out body geom;
 (${CAMPUSES.map((c) => `wr["amenity"="university"](${bb(c)});`).join('')});
 out body geom;`;
-  for (const ep of ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter']) {
+  // The main server is the up-to-date one (a mirror once returned an older map missing residence halls),
+  // so it gets a few tries before the mirror is used.
+  const servers = ['https://overpass-api.de/api/interpreter', 'https://overpass-api.de/api/interpreter', 'https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+  for (const [i, ep] of servers.entries()) {
     const r = await fetch(ep, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'SplatScout-building-list' } }).catch(() => null);
     if (r && r.ok) return r.json();
-    console.log(`${ep}: ${r ? r.status : 'no answer'}, trying the next server`);
+    console.log(`${ep}: ${r ? r.status : 'no answer'}${i < servers.length - 1 ? ', trying again' : ''}`);
+    await new Promise((res) => setTimeout(res, 8000));
   }
   throw new Error('No Overpass server answered; try again in a few minutes');
 }
@@ -108,8 +112,10 @@ function simplify(ring, tol = 1) {
 // OpenStreetMap says the building is: where people live, health, police and courts, children's centres.
 // The station's Club page can add or remove any building by hand.
 const RESIDENCE = /^(dormitory|residential|apartments|house|hotel|convent|bungalow|terrace|semidetached_house)$/;
+// Known ASU residence halls the map doesn't tag as housing.
+const KNOWN_RESIDENCES = new Set(['Taylor Place']);
 function restrictedReason(t) {
-  if (RESIDENCE.test(t.building)) return "residence";
+  if (RESIDENCE.test(t.building) || KNOWN_RESIDENCES.has(t.name)) return "residence";
   const name = t.name || "";
   if (t.building === "hospital" || /student health|health services|health center|clinic|counsel/i.test(name)) return "health";
   if (/police|courthouse|municipal court|jail|detention/i.test(name) || /^(police|courthouse|prison)$/.test(t.amenity || "")) return "safety";
@@ -144,16 +150,30 @@ for (const e of osm.elements) {
   for (let n = 2; codes.has(code); n++) code = slug(e.tags.name).slice(0, 36) + '-' + n;
   codes.add(code);
   const why = restrictedReason(e.tags);
+  const levels = Math.round(parseFloat(e.tags['building:levels']));
   buildings.push({
     code,
     name: e.tags.name,
     ...(e.tags.ref ? { ref: e.tags.ref } : {}),
     ...(why ? { restricted: why } : {}),
     campus: CAMPUSES[k].id,
+    area: Math.round(area(ring)), // footprint, m²
+    ...(levels >= 1 && levels <= 40 ? { levels } : {}), // floors, where OpenStreetMap knows them
     c: c.map(r6),
     poly: simplify(ring.slice(0, -1).concat([ring[0]])).slice(0, -1).map((p) => p.map(r6)),
   });
 }
+// A building that was on the list before but didn't come back (an edit to the campus area on the map, or
+// a server with an older copy) stays, so nothing silently drops off: residence halls must keep their flag.
+try {
+  const have = new Set(buildings.map((b) => b.code));
+  const kept = JSON.parse(readFileSync(OUT, 'utf8')).buildings.filter((b) => !have.has(b.code));
+  for (const b of kept) {
+    const why = b.restricted || (KNOWN_RESIDENCES.has(b.name) ? 'residence' : null);
+    buildings.push({ ...b, ...(why ? { restricted: why } : {}), area: b.area || Math.round(area(b.poly.concat([b.poly[0]]))) });
+  }
+  if (kept.length) console.log(`kept ${kept.length} building(s) from the last list: ${kept.map((b) => b.name).join(', ')}`);
+} catch {}
 buildings.sort((a, b) => a.name.localeCompare(b.name));
 
 mkdirSync(dirname(OUT), { recursive: true });

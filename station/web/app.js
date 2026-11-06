@@ -70,6 +70,7 @@ async function loadStatus() {
   $('#adb').checked = status.adbAutoImport;
   $('#phoneAutoImport').checked = status.phoneAutoImport;
   $('#autoProcess').checked = status.autoProcess;
+  $('#measureQuality').checked = !!status.measureQuality;
   $('#startNow').checked = status.autoProcess;
   $('#pauseQueue').checked = status.queuePaused;
   renderPhone(status.phone);
@@ -103,6 +104,8 @@ setting('#cropToBounds', 'cropToBounds');
 setting('#adb', 'adbAutoImport', loadStatus);
 setting('#phoneAutoImport', 'phoneAutoImport', loadStatus);
 setting('#autoProcess', 'autoProcess', loadStatus);
+// Waiting captures without their own choice follow the default.
+setting('#measureQuality', 'measureQuality', () => loadStatus().then(renderJobs));
 $('#pauseQueue').addEventListener('change', (e) => api('/api/queue', { paused: e.target.checked }));
 $('#processAll').addEventListener('click', () => api('/api/process-all', {}));
 // Captures ticked for merging into one splat.
@@ -267,17 +270,22 @@ function summary(j) {
 
 /** Options chosen per capture before it's processed. */
 function optionControls(j) {
-  const d = drafts.get(j.id) || { preset: j.preset, usePoses: j.usePoses !== false && status.usePoses, crop: j.crop != null ? j.crop : status.cropToBounds };
-  const read = () => ({ preset: sel.value, usePoses: poses.checked, crop: crop.checked });
+  const d = drafts.get(j.id) || {
+    preset: j.preset, usePoses: j.usePoses !== false && status.usePoses, crop: j.crop != null ? j.crop : status.cropToBounds,
+    measure: j.measure != null ? j.measure : !!status.measureQuality,
+  };
+  const read = () => ({ preset: sel.value, usePoses: poses.checked, crop: crop.checked, measure: measure.checked });
   const keep = () => drafts.set(j.id, read());
   const sel = h('select', { onchange: keep }, ...Object.entries(status.presets || {}).map(([k, p]) => h('option', { value: k, selected: k === d.preset }, p.label)));
   const poses = h('input', { type: 'checkbox', checked: d.usePoses, onchange: keep });
   const crop = h('input', { type: 'checkbox', checked: d.crop, onchange: keep });
+  const measure = h('input', { type: 'checkbox', checked: d.measure, onchange: keep });
   const box = h('div', { class: 'opts' },
     h('label', { class: 'field inline' }, h('span', { class: 'lbl' }, 'Quality'), sel),
     j.source.kind === 'zip' ? h('label', { class: 'check inline' }, poses, h('span', {}, 'AR positions')) : null,
     mergeToggle(j),
-    j.source.kind === 'zip' || j.source.kind === 'merge' ? h('label', { class: 'check inline' }, crop, h('span', {}, 'Crop to scan area')) : null);
+    j.source.kind === 'zip' || j.source.kind === 'merge' ? h('label', { class: 'check inline' }, crop, h('span', {}, 'Crop to scan area')) : null,
+    h('label', { class: 'check inline', title: 'Hold back every 12th photo and score the splat on them (PSNR, SSIM). It trains on about 8% fewer photos.' }, measure, h('span', {}, 'Measure quality')));
   return { box, read };
 }
 
@@ -350,15 +358,27 @@ function historyCard(j) {
     info.push(`trained in ${fmtDur(t.seconds)}`);
   }
   if (j.started && j.finished) info.push(`total ${fmtDur((j.finished - j.started) / 1000)}`);
+  const measured = j.status === 'done' && j.result && j.result.info && j.result.info.training && j.result.info.training.eval;
   return h('div', { class: 'job ' + j.status },
     h('div', { class: 'job-head' }, title(j), h('span', { class: 'badge ' + j.status }, j.status === 'done' ? 'Done' : j.status)),
     h('div', { class: 'meta' }, h('span', {}, `${presetName(j.preset)} · ${j.finished ? fmtTime(j.finished) : fmtTime(j.created)}${info.length ? ' · ' + info.join(' · ') : ''}`)),
+    measured ? h('div', { class: 'meta' }, qualityChip(measured)) : null,
     j.error ? h('div', { class: 'err' }, j.error) : null,
     j.messages && j.messages.length && j.status !== 'done' ? h('ul', { class: 'msgs' }, j.messages.slice(-2).map((m) => h('li', {}, m.text))) : null,
     h('div', { class: 'actions' }, actions,
       h('button', { class: 'btn ghost danger', onclick: () => confirm('Delete this job and its working files? Finished splats in the library are kept.') && api(`/api/jobs/${j.id}/delete`, {}) }, icon('trash'), 'Delete')),
     redo,
   );
+}
+
+/** A splat's measured quality: how closely it redraws the photos held back from its training. */
+function qualityChip(ev) {
+  if (!ev || !Number.isFinite(ev.psnr)) return null;
+  const views = ev.views ? `${ev.views} photos` : 'photos';
+  return h('span', {
+    class: 'qchip mono',
+    title: `Measured on ${views} held back from training (every ${ev.every || 12}th): PSNR compares the splat's render of each one with the photo, in dB; SSIM compares structure, up to 1 for a perfect match. Higher is better for both.`,
+  }, h('span', { class: 'lbl' }, 'Measured'), `PSNR ${ev.psnr.toFixed(1)} dB · SSIM ${Number.isFinite(ev.ssim) ? ev.ssim.toFixed(3) : '–'}`, ev.views ? h('span', { class: 'muted' }, `on ${ev.views} held-back photos`) : null);
 }
 
 const fileUrl = (j, abs) => `/files/jobs/${j.id}/` + abs.slice(abs.lastIndexOf(j.id) + j.id.length + 1).replace(/\\/g, '/').split('/').map(encodeURIComponent).join('/');
@@ -390,6 +410,7 @@ async function loadLibrary() {
       h('div', { class: 'tile-body' },
         h('div', { class: 'tile-title' }, `${it.building} / ${it.room}`),
         h('div', { class: 'small muted mono' }, `${it.stamp.replace('_', ' ')} · ${i.photos || '?'} photos${t.splats ? ` · ${(t.splats / 1e6).toFixed(2)} M` : ''} · ${i.sizeMB || '?'} MB`),
+        t.eval ? h('div', { class: 'small' }, qualityChip(t.eval)) : null,
         h('div', { class: 'actions' },
           h('a', { class: 'btn primary small', href: viewerFromPath(it), target: '_blank' }, icon('eye'), 'View'),
           h('a', { class: 'btn small', href: base + '/scene.ply', download: `${it.building}_${it.room}.ply` }, icon('download'), '.ply'),

@@ -57,6 +57,7 @@ const DEFAULTS = {
   adbAutoImport: true, // watch for a phone plugged in over USB and list the SplatScout ZIPs on it
   phoneAutoImport: false, // copy every new export from the phone by itself (otherwise you pick them)
   autoProcess: false, // start processing new captures by themselves (otherwise they wait for "Process")
+  measureQuality: false, // hold every 12th photo back from training and score the splat on them (PSNR/SSIM)
   matcher: 'auto', // auto | exhaustive | sequential
   tools: {},
 };

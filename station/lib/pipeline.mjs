@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, copyFi
 import { join, basename, extname } from 'node:path';
 import { extractZip } from './zipread.mjs';
 import { reconstruct, viewHint, countImages } from './colmap.mjs';
-import { trainBrush } from './trainer.mjs';
+import { trainBrush, HOLD_OUT_EVERY } from './trainer.mjs';
 import { selectFrames, extractFrames, probeVideo, isEquirect, extract360, viewSize, rigConfig, VIEWS_360 } from './video.mjs';
 import { run } from './run.mjs';
 import { cropPly, CROP_MARGIN } from './crop.mjs';
@@ -104,8 +104,10 @@ export async function processJob(job, ctx) {
 
   // ---------------------------------------------------------------- training
   const preset = PRESETS[job.preset] || PRESETS[cfg.preset] || PRESETS.standard;
+  // Measuring quality holds every 12th photo back from training and scores the splat on them.
+  const measure = job.measure != null ? !!job.measure : !!cfg.measureQuality;
   ctx.stage('train', 0, preset.label);
-  ctx.say(`Training the splat on the GPU (${preset.steps.toLocaleString()} steps)…`);
+  ctx.say(`Training the splat on the GPU (${preset.steps.toLocaleString()} steps)${measure ? `, holding back every ${HOLD_OUT_EVERY}th photo to measure its quality` : ''}…`);
   const out = join(dir, 'splats');
   const presetKey = PRESETS[job.preset] ? job.preset : cfg.preset;
   const tr = await trainBrush({
@@ -114,6 +116,7 @@ export async function processJob(job, ctx) {
     outDir: out,
     preset,
     nImages: rec.stats.images,
+    holdOut: measure ? HOLD_OUT_EVERY : 0,
     stepsPerSec: cfg.rates && cfg.rates[presetKey],
     cacheDir: join(cfg.workDir, 'brush-cache'),
     progress: (f, note) => ctx.stage('train', f, note),
@@ -121,6 +124,11 @@ export async function processJob(job, ctx) {
     token,
     log,
   });
+  if (measure) {
+    ctx.say(tr.eval
+      ? `Measured on ${tr.eval.views} photos held back from training: PSNR ${tr.eval.psnr.toFixed(1)} dB, SSIM ${tr.eval.ssim.toFixed(3)}.`
+      : 'Brush didn’t report a quality score, so this splat has no measurement (see job.log).');
+  }
 
   // Remember the training speed so the next progress estimate starts out accurate.
   cfg.rates = { ...(cfg.rates || {}), [presetKey]: +tr.stepsPerSec.toFixed(2) };
@@ -170,7 +178,11 @@ export async function processJob(job, ctx) {
   const info = {
     building: job.building, room: job.room, created: new Date().toISOString(), jobId: job.id, view,
     photos: nImages, placed: rec.stats.images, colmap: { ...rec.stats, mode: rec.mode },
-    training: { preset: job.preset || cfg.preset, steps: tr.iter, seconds: Math.round(tr.seconds), splats: crop ? crop.kept : tr.splats },
+    training: {
+      preset: job.preset || cfg.preset, steps: tr.iter, seconds: Math.round(tr.seconds), splats: crop ? crop.kept : tr.splats,
+      // Measured quality on the held-back photos: {psnr (dB), ssim (0–1), views, step, every}.
+      ...(tr.eval ? { eval: tr.eval } : {}),
+    },
     // The outline the crop used (in splat coordinates), so the viewer can show and change it.
     crop: crop ? { removed: crop.removed, margin: CROP_MARGIN, areas: areas.map((a) => ({ poly: a.poly, floorY: a.floorY, top: a.top ?? null })), uncropped: tr.ply } : areas.length ? { off: true, margin: CROP_MARGIN, areas: areas.map((a) => ({ poly: a.poly, floorY: a.floorY, top: a.top ?? null })) } : null,
     capture: job.capture || null, pano: !!job.pano,

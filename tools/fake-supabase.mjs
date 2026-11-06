@@ -1,6 +1,7 @@
 // An in-memory stand-in for the club's Supabase project: the calls the phone app and SplatStation make,
 // with the rules that matter to them (membership, restricted buildings, files only into your own
-// unfinished photo, points only from SplatStation). It lets the self-checks run without a network and
+// unfinished photo, points only from SplatStation, the campus summary readable by members and written only by
+// SplatStation). It lets the self-checks run without a network and
 // lets the screens be tried in a browser (tools/serve.mjs serves it at /__tools/fake-supabase.mjs).
 // The real rules live in crowd/supabase-*.sql and are tested against Postgres (tools/sql-test.mjs).
 
@@ -21,6 +22,7 @@ const weekStart = (ms) => {
 export function createFake() {
   const db = {
     profiles: new Map(), invites: new Map(), restricted_buildings: new Map(), missions: new Map(), photos: new Map(), captures: new Map(),
+    campus_spaces: new Map(), campus_plans: new Map(), // the summary SplatStation publishes (crowd/supabase-campus.sql)
     files: new Map(), // 'bucket/path' -> Buffer
     posts: new Map(), // 'bucket/path' -> times a file was sent
     failOnce: new Set(), // path endings whose next upload is refused (a 400)
@@ -28,7 +30,9 @@ export function createFake() {
     tokens: new Map(), users: 0,
     clock: () => Date.now(),
   };
-  const tables = { profiles: [db.profiles, 'user_id'], invites: [db.invites, 'code'], restricted_buildings: [db.restricted_buildings, 'code'], missions: [db.missions, 'id'], photos: [db.photos, 'id'], captures: [db.captures, 'id'] };
+  const tables = { profiles: [db.profiles, 'user_id'], invites: [db.invites, 'code'], restricted_buildings: [db.restricted_buildings, 'code'], missions: [db.missions, 'id'], photos: [db.photos, 'id'], captures: [db.captures, 'id'],
+    campus_spaces: [db.campus_spaces, 'space_key'], campus_plans: [db.campus_plans, 'building_code'] };
+  const CAMPUS = new Set(['campus_spaces', 'campus_plans']);
 
   const compare = (a, b) => (typeof a === 'number' && !isNaN(+b) ? a - +b : String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0);
   function matches(val, spec) {
@@ -146,6 +150,11 @@ export function createFake() {
       const name = mm[1], [map, pk] = tables[name];
       const own = (r) => admin || name === 'restricted_buildings' || r.user_id === uid;
       if (!admin && ['invites', 'missions'].includes(name)) return json({ code: '42501', message: `permission denied for table ${name}` }, 403);
+      if (!admin && CAMPUS.has(name)) {
+        // Members read the campus summary (a stranger gets no rows); only the secret key writes it.
+        if (m !== 'GET') return json({ code: '42501', message: `permission denied for table ${name}` }, 403);
+        return json(member(uid) ? select([...map.values()], url.searchParams) : []);
+      }
       if (m === 'GET') return json(select([...map.values()].filter(own), url.searchParams));
       if (m === 'POST') {
         const rows = [].concat(await body());

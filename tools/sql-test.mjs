@@ -1,6 +1,6 @@
-// Runs crowd/supabase-setup.sql and crowd/supabase-beta.sql on a local Postgres (PGlite, Postgres compiled
-// to WebAssembly) with just enough of Supabase stubbed (roles, auth.uid(), storage tables), then checks that
-// the rules do what they say: who can add what, that points can only come from SplatStation, and so on.
+// Runs crowd/supabase-setup.sql, supabase-beta.sql and supabase-campus.sql on a local Postgres (PGlite, Postgres
+// compiled to WebAssembly) with just enough of Supabase stubbed (roles, auth.uid(), storage tables), then checks
+// that the rules do what they say: who can add what, that points can only come from SplatStation, and so on.
 // Not part of `npm run check` (the project has no dependencies). To run it:
 //   npm install --no-save @electric-sql/pglite
 //   node tools/sql-test.mjs
@@ -38,7 +38,10 @@ const run = async (file) => db.exec(readFileSync(new URL(file, ROOT), 'utf8'));
 await run('supabase-setup.sql');
 await run('supabase-beta.sql');
 await run('supabase-beta.sql'); // safe to run again
-console.log('both scripts ran, and the second run of beta.sql was fine');
+await run('supabase-campus.sql');
+const campusResult = (await run('supabase-campus.sql')).at(-1).rows[0]; // safe to run again; ends with a result row
+assert.deepEqual(campusResult, { result: 'SplatScout campus summary is installed', spaces: 0, plans: 0, member_rules: 2 });
+console.log('the scripts ran, and second runs of beta.sql and campus.sql were fine');
 
 const A = '11111111-1111-4111-8111-111111111111', B = '22222222-2222-4222-8222-222222222222', C = '33333333-3333-4333-8333-333333333333';
 await db.exec(`insert into auth.users (id) values ('${A}'), ('${B}'), ('${C}');
@@ -46,9 +49,9 @@ await db.exec(`insert into auth.users (id) values ('${A}'), ('${B}'), ('${C}');
   update public.invites set active = false where code = 'CLUB-OFF';
   insert into public.restricted_buildings (code, reason) values ('cereus-hall', 'residence hall');`);
 
-/** Run SQL as a signed-in user, or as anon; returns {rows} or {error}. */
+/** Run SQL as a signed-in user, as anon, or as 'service' (SplatStation's secret key); returns {rows} or {error}. */
 async function as(user, sql, params = []) {
-  await db.exec(user === 'anon' ? 'set role anon' : `set role authenticated; select set_config('request.jwt.claim.sub', '${user}', false)`);
+  await db.exec(user === 'anon' ? 'set role anon' : user === 'service' ? 'set role service_role' : `set role authenticated; select set_config('request.jwt.claim.sub', '${user}', false)`);
   try {
     const r = await db.query(sql, params);
     return { rows: r.rows, n: r.affectedRows };
@@ -176,6 +179,39 @@ assert.equal((await as(C, 'select * from public.missions_open')).rows.length, 0,
 fails(await as(A, `insert into public.missions (title) values ('my own mission')`), 'adding a mission', /permission denied/);
 pass('missions: members read open ones with progress; only SplatStation writes them');
 
+// ---- the campus summary: SplatStation publishes it with the secret key, members read it
+const spaceRow = (o = {}) => ({ space_key: 'hayden-library|1|main lobby', building_code: 'hayden-library', floor: '1', room: 'Main lobby', kind: 'large', score: 51, band: 'fair', evening: 90, need_good: 118, need_light: 'evening', ...o });
+const upsert = (row) => {
+  const cols = Object.keys(row);
+  return [`insert into public.campus_spaces (${cols}) values (${cols.map((_, i) => '$' + (i + 1))})
+           on conflict (space_key) do update set ${cols.map((col) => `${col} = excluded.${col}`)}`, Object.values(row)];
+};
+ok(await as('service', ...upsert(spaceRow())), 'the secret key publishes a space');
+ok(await as('service', ...upsert(spaceRow({ score: 60, evening: 110 }))), 'and publishing again updates it');
+ok(await as('service', `insert into public.campus_plans (building_code, spaces) values ('hayden-library', 4)`), 'and a building plan');
+r = await as(A, 'select * from public.campus_spaces');
+ok(r, 'a member reads the summary');
+assert.deepEqual(r.rows.map((x) => [x.space_key, x.score, x.evening, x.morning, x.need_light]), [['hayden-library|1|main lobby', 60, 110, 0, 'evening']]);
+assert.equal((await as(B, 'select * from public.campus_plans')).rows[0].spaces, 4);
+assert.equal((await as(C, 'select * from public.campus_spaces')).rows.length, 0, 'a stranger (signed in, never joined) sees nothing');
+assert.equal((await as(C, 'select * from public.campus_plans')).rows.length, 0);
+fails(await as('anon', 'select * from public.campus_spaces'), 'anon reads the summary', /permission denied/);
+fails(await as('anon', 'select * from public.campus_plans'), 'anon reads the plans', /permission denied/);
+fails(await as(A, ...upsert(spaceRow({ space_key: 'old-main|1|hall', building_code: 'old-main' }))), 'a member adds a space', /permission denied/);
+fails(await as(A, 'update public.campus_spaces set score = 100'), 'a member raises a score', /permission denied/);
+fails(await as(A, 'delete from public.campus_spaces'), 'a member deletes the summary', /permission denied/);
+fails(await as(A, `insert into public.campus_plans (building_code, spaces) values ('old-main', 1)`), 'a member sets a plan', /permission denied/);
+fails(await as('service', ...upsert(spaceRow({ space_key: 'hayden-library|9|a', score: 101 }))), 'a score over 100', /check/);
+fails(await as('service', ...upsert(spaceRow({ space_key: 'hayden-library|9|b', band: 'great' }))), 'an unknown band', /check/);
+fails(await as('service', ...upsert(spaceRow({ space_key: 'hayden-library|9|c', need_light: 'dusk' }))), 'an unknown light', /check/);
+fails(await as('service', ...upsert(spaceRow({ space_key: 'old-main|1|lobby' }))), 'a key from another building', /space_key_building/);
+// A publish removes what it didn't send again (older rows).
+ok(await as('service', ...upsert(spaceRow({ space_key: 'hayden-library|2|gone', room: 'Gone', updated_at: new Date(Date.now() - 864e5).toISOString() }))), 'an old row');
+r = await as('service', `delete from public.campus_spaces where updated_at < now() - interval '1 hour'`);
+assert.equal(r.n, 1, 'only the old row goes');
+assert.equal((await as(A, 'select * from public.campus_spaces')).rows.length, 1);
+pass('campus summary: members read it, strangers and the bare public key see nothing, only the secret key writes');
+
 // ---- the daily cap, bans, deleting your own data
 await db.exec(`insert into public.photos (id, user_id, taken_at, building_code, building_name, storage_path, status)
                select ('bbbbbbbb-bbbb-4bbb-8bbb-' || lpad(g::text, 12, '0'))::uuid, '${A}', now(), 'hayden-library', 'Hayden Library',
@@ -186,6 +222,7 @@ ok(await as(B, ...photoSql(uuid(31))), 'the cap is per person');
 await db.exec(`update public.profiles set banned = true where user_id = '${B}'`);
 fails(await as(B, ...photoSql(uuid(32))), 'a banned member', /row-level security/);
 assert.ok(!(await as(A, 'select * from public.leaderboard')).rows.some((x) => x.handle === 'Sun_Devil'), 'banned members leave the leaderboard');
+assert.equal((await as(B, 'select * from public.campus_spaces')).rows.length, 0, 'and see no campus summary');
 // Files first: a phone can only delete a file while its photo row still exists.
 r = await as(A, `delete from storage.objects where bucket_id = 'club-photos'`);
 assert.equal(r.n, 1, 'deleting your own files');
@@ -194,6 +231,7 @@ assert.equal(r.n, 400, 'deleting your own photos');
 r = await as(A, `delete from public.profiles where user_id = '${A}'`);
 assert.equal(r.n, 1, 'leaving the club');
 assert.ok(!(await as(A, 'select * from public.leaderboard')).rows.some((x) => x.handle === 'Desert_Fox'));
+assert.equal((await as(A, 'select * from public.campus_spaces')).rows.length, 0, 'having left, no campus summary either');
 pass('400-a-day cap, bans, and leaving the club removes your photos, files and profile');
 
 console.log(`\n${checks} groups of checks passed`);

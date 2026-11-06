@@ -65,9 +65,13 @@ const words = (s) => (s || '').toLowerCase().split(/[^a-z0-9]+/).filter((w) => w
 
 /** Best guess for a typed building name ("Schwada Building" → Schwada Classroom Office Building), or null. */
 export async function matchName(name) {
+  return matchNameIn(await buildings(), name);
+}
+
+/** The same, against a given list of buildings (SplatStation reads the list from disk). */
+export function matchNameIn(all, name) {
   const q = (name || '').trim().toLowerCase();
   if (!q) return null;
-  const all = await buildings();
   const exact = all.find((b) => b.name.toLowerCase() === q || (b.ref && b.ref.toLowerCase() === q));
   if (exact) return exact;
   const qw = words(q);

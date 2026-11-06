@@ -6,6 +6,7 @@ const P = {
   chevron: '<path d="M9 5l7 7-7 7"/>',
   chevronLeft: '<path d="M15 5l-7 7 7 7"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
+  minus: '<path d="M5 12h14"/>',
   check: '<path d="M5 12.5l4.5 4.5L19 7"/>',
   play: '<path d="M8 5.5v13l11-6.5z" fill="currentColor" stroke="none"/>',
   pause: '<path d="M8 5v14M16 5v14" stroke-width="3"/>',

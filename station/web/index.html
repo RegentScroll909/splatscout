@@ -17,7 +17,11 @@
         <div class="sub">Captures in, Gaussian splats out</div>
       </div>
     </div>
-    <div id="gpu" class="gpu mono">GPU —</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <a class="btn small ghost" href="campus.html" title="Map of the campus: what the club has, how complete each building is, how good a splat to expect">Campus map</a>
+      <a class="btn small ghost" href="club.html">Club</a>
+      <div id="gpu" class="gpu mono">GPU —</div>
+    </div>
   </header>
 
   <main>
@@ -47,6 +51,7 @@
         <label class="check"><input type="checkbox" id="adb"> <span>Look for a phone plugged in over USB</span></label>
         <label class="check"><input type="checkbox" id="phoneAutoImport"> <span>Copy new exports from the phone by themselves</span></label>
         <label class="check"><input type="checkbox" id="autoProcess"> <span>Process new captures by themselves</span></label>
+        <label class="check"><input type="checkbox" id="measureQuality"> <span>Measure quality (hold back every 12th photo)<span class="hint">Scores each splat on photos it never trained on (PSNR and SSIM), shown on its card and on the Campus map. The splat trains on about 8% fewer photos, so it can come out slightly less sharp.</span></span></label>
         <div id="paths" class="paths"></div>
       </section>
     </div>

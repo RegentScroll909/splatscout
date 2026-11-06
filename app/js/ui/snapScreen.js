@@ -10,7 +10,8 @@ import * as club from '../data/club.js';
 import * as snaps from '../data/snaps.js';
 import { getSettings, setSettings } from '../data/settings.js';
 import { analyzeImage, rgbaToGray, SharpnessReference } from '../core/analyzer.js';
-import { RULES, LIGHT_LABEL, lightSlot, dhash, hamming, NEAR_DUPLICATE, photoChecks } from '../core/clubrules.js';
+import { RULES, LIGHT_LABEL, LIGHT_SLOTS, lightSlot, dhash, hamming, NEAR_DUPLICATE, photoChecks } from '../core/clubrules.js';
+import { LIGHT_HOURS } from '../data/campusmap.js';
 
 const MAX_EDGE = 2048; // long side of the saved photo, px
 const QUALITY = 0.85;
@@ -38,7 +39,7 @@ export async function snapScreen(root, { navigate, query }) {
   }
   if (!me) {
     toast('Join the club to send photos');
-    navigate('#/club?join=1&back=' + encodeURIComponent('#/snap' + (query.get('mission') ? '?mission=' + query.get('mission') : '')));
+    navigate('#/club?join=1&back=' + encodeURIComponent('#/snap' + (query.toString() ? '?' + query.toString() : '')));
     return;
   }
 
@@ -49,7 +50,17 @@ export async function snapScreen(root, { navigate, query }) {
     floor: settings.snapFloor || '', room: settings.snapRoom || '',
     mission: null, session: crypto.randomUUID(), geo: null, near: [], geoMsg: '', stopWatch: null,
     stream: null, timer: 0, hashes: [], taken: 0, last: null, live: { state: 'wait', rel: 1 }, busy: false,
+    want: null, // the light the Campus map said this space needs
   };
+  // From the Campus map: the building, floor and room filled in, the light the space needs, and the way back.
+  const back = /^#\/[\w/?=&%.+-]*$/.test(query.get('back') || '') ? query.get('back') : '#/club';
+  const pre = query.get('building') && asu.find((b) => b.code === query.get('building') && !b.restricted);
+  if (pre) {
+    S.building = pre;
+    S.floor = query.get('floor') || '';
+    S.room = query.get('room') || '';
+  }
+  if (LIGHT_SLOTS.includes(query.get('light'))) S.want = query.get('light');
   if (query.get('mission')) {
     const m = (await club.missions().catch(() => [])).find((x) => x.id === query.get('mission'));
     if (m) {
@@ -64,6 +75,17 @@ export async function snapScreen(root, { navigate, query }) {
   const unsubs = [];
 
   const resolve = (name) => asu.find((b) => b.name.toLowerCase() === name.trim().toLowerCase()) || null;
+
+  /** The light the Campus map asked for, and whether it is that light now. */
+  function lightNote(want) {
+    const now = lightSlot(Date.now());
+    const words = `${LIGHT_LABEL[want].toLowerCase()} light (${LIGHT_HOURS[want]})`;
+    return h('section.card.mission',
+      h('b', `This space needs ${words}`),
+      now === want
+        ? h('p.small.muted', 'It’s that light now: good time to shoot.')
+        : h('p.small.warn-text', `It’s ${LIGHT_LABEL[now].toLowerCase()} now. Photos in other light help a space only a little, so come back in ${LIGHT_LABEL[want].toLowerCase()} light if you can.`));
+  }
 
   // ------------------------------------------------------------------ step 1: where
   function renderSetup() {
@@ -119,10 +141,11 @@ export async function snapScreen(root, { navigate, query }) {
     }, icon('camera'), 'Start camera');
     mount(root, h('div.page',
       h('header.page-head',
-        h('button.icon-btn', { onclick: () => navigate('#/club'), 'aria-label': 'Back' }, icon('back')),
+        h('button.icon-btn', { onclick: () => navigate(back), 'aria-label': 'Back' }, icon('back')),
         h('div.head-text', h('div.kicker', 'Club beta'), h('h1', 'Take photos'))),
       S.mission ? h('section.card.mission', h('div.row.space', h('b', S.mission.title), h('span.tag.good', `+${S.mission.bonus} each`)), S.mission.detail ? h('p.small.muted', S.mission.detail) : null,
         S.mission.light !== 'any' ? h('p.small.warn-text', `Needs ${LIGHT_LABEL[S.mission.light].toLowerCase()} light: it only scores in that light.`) : null) : null,
+      !S.mission && S.want ? lightNote(S.want) : null,
       h('section.card',
         h('h2', 'Where are you?'),
         h('label.field', h('span', 'Building'), bInput, h('datalist#snap-blist', asu.filter((b) => !b.restricted).map((b) => h('option', { value: b.name })))),
@@ -201,7 +224,7 @@ export async function snapScreen(root, { navigate, query }) {
     mount(root, h('div.snap',
       video,
       h('div.snap-top',
-        h('button.icon-btn.glass', { onclick: () => navigate('#/club'), 'aria-label': 'Done' }, icon('check')),
+        h('button.icon-btn.glass', { onclick: () => navigate(back), 'aria-label': 'Done' }, icon('check')),
         h('button.snap-chip.place', { onclick: renderSetup }, icon('pin'), `${S.building.name}${S.floor ? ` · F${S.floor}` : ''} · ${S.room}`),
         count),
       S.mission ? h('div.snap-mission', icon('flag'), S.mission.title + (S.mission.light !== 'any' ? ` · ${LIGHT_LABEL[S.mission.light].toLowerCase()} light` : '')) : null,

@@ -949,6 +949,58 @@ test('360 video: views cut from each frame make a rig that turns the right way',
   });
 });
 
+// Measured quality: Brush holds photos back and logs a score; these lines are copied from Brush 0.3.
+const { brushEval, trainBrush, HOLD_OUT_EVERY } = await import('../station/lib/trainer.mjs');
+test('measured quality: PSNR and SSIM read from Brush\'s log, the last eval counts', () => {
+  const log = [
+    '[2026-11-06T05:54:50Z INFO  brush_cli] Starting up',
+    '[2026-11-06T05:54:51Z INFO  brush_cli] Loaded dataset with 213 training, 20 eval views',
+    '[2026-11-06T05:54:54Z INFO  brush_cli] Refine iter 234, 142726 splats.',
+    '[2026-11-06T05:54:57Z INFO  brush_cli] Eval iter 500: PSNR 15.215976, ssim 0.5729805',
+    '[2026-11-06T05:55:01Z INFO  brush_cli] Eval iter 1000: PSNR 18.028294, ssim 0.64160347',
+    '[2026-11-06T05:55:02Z INFO  brush_cli] Done training! Took FormattedDuration(7s).',
+  ];
+  assert.deepEqual(brushEval(log), { psnr: 18.03, ssim: 0.6416, views: 20, step: 1000 });
+  assert.equal(brushEval(log.filter((l) => !/Eval iter/.test(l))), null, 'no eval, no score');
+  assert.equal(brushEval([...log, '[2026-11-06T05:55:03Z INFO  brush_cli] Eval iter 1500: PSNR NaN, ssim NaN']).psnr, 18.03, 'a broken score is ignored');
+  assert.equal(brushEval(['Eval iter 7000: PSNR 21.78, ssim 0.752']).views, null, 'a score without the split line still counts');
+  assert.equal(brushEval(['Loaded dataset with 233 training, 0 eval views', 'Eval iter 7000: PSNR 30, ssim 0.9']), null, 'no photos held back, no score');
+});
+await (async () => {
+  // trainBrush against a stand-in for brush_app.exe (a Node script) that answers the way Brush 0.3 does:
+  // silent unless RUST_LOG asks, a score only with an eval split, the final .ply at the last step.
+  const dir = mkdtempSync(join(tmpdir(), 'sse-'));
+  const fake = join(dir, 'fake-brush.mjs');
+  writeFileSync(fake, `import { writeFileSync } from 'node:fs';
+const a = process.argv.slice(2), opt = (k) => (a.includes(k) ? a[a.indexOf(k) + 1] : null);
+const steps = +opt('--total-steps'), split = +opt('--eval-split-every') || 0, out = opt('--export-path');
+const say = (s) => /brush_cli=info/.test(process.env.RUST_LOG || '') && console.log('[2026-11-06T05:56:17Z INFO  brush_cli] ' + s);
+writeFileSync(out + '/args.json', JSON.stringify({ args: a, log: process.env.RUST_LOG }));
+say('Loaded dataset with ' + (split ? '213 training, 20' : '233 training, 0') + ' eval views');
+if (split && +opt('--eval-every') <= steps) say('Eval iter ' + steps + ': PSNR 24.123456, ssim 0.8123456');
+writeFileSync(out + '/splat_' + steps + '.ply', 'ply\\nformat binary_little_endian 1.0\\nelement vertex 1234\\nend_header\\n');
+say('Done training! Took FormattedDuration(1s).');
+`);
+  const train = (holdOut, name) => trainBrush({
+    brush: process.execPath, dataset: fake, outDir: join(dir, name), preset: { steps: 3000, maxResolution: 1920, maxSplats: 1e6 },
+    progress: () => {}, nImages: 233, holdOut, cacheDir: dir, log: join(dir, name + '.log'),
+  });
+  const on = await train(HOLD_OUT_EVERY, 'on');
+  assert.deepEqual(on.eval, { psnr: 24.12, ssim: 0.8123, views: 20, step: 3000, every: 12 });
+  assert.equal(on.splats, 1234);
+  const sent = JSON.parse(readFileSync(join(dir, 'on', 'args.json'), 'utf8'));
+  const flag = (k) => sent.args[sent.args.indexOf(k) + 1];
+  assert.deepEqual([flag('--eval-split-every'), flag('--eval-every')], ['12', '3000'], 'every 12th photo held back, one eval at the last step');
+  assert.match(sent.log, /brush_cli=info/);
+  assert.match(readFileSync(join(dir, 'on.log'), 'utf8'), /Eval iter 3000: PSNR 24\.123456/, 'the score is in the job log too');
+  const off = await train(0, 'off');
+  assert.equal(off.eval, null);
+  const sentOff = JSON.parse(readFileSync(join(dir, 'off', 'args.json'), 'utf8'));
+  assert.ok(!sentOff.args.includes('--eval-split-every') && sentOff.args[sentOff.args.indexOf('--eval-every') + 1] === '3001', 'off: every photo trains, no eval');
+  passed++;
+  console.log('  ok measured quality: trainBrush holds back every 12th photo, asks Brush to log, and returns its score');
+})();
+
 // ---------------------------------------------------------------- club (beta)
 // An in-memory stand-in for the club's Supabase project (tools/fake-supabase.mjs) answers for both the
 // phone code and the station code; the ASU building list is read from disk instead of over HTTP.
@@ -1423,6 +1475,255 @@ await (async () => {
   fake.db.photos.delete(id);
   passed++;
   console.log('  ok club (PC, with ffmpeg): measures real photos (size, sharpness, light, hash) and syncs only the new ones');
+})();
+
+// ---------------------------------------------------------------- campus view
+const CM = await import('../app/js/core/campusmodel.js');
+test('campus model: quality bands, photo curve, light mixing, scans, builds, plans and completion', () => {
+  assert.deepEqual([0, 24, 25, 49, 50, 74, 75, 89, 90, 100].map((q) => CM.bandOf(q).id), ['none', 'none', 'rough', 'rough', 'fair', 'fair', 'good', 'good', 'excellent', 'excellent']);
+  assert.deepEqual(['Main lobby', '2nd floor hallway', 'Room 214', 'Snall', 'Reading room', 'Stairwell B'].map(CM.kindOf), ['large', 'hallway', 'room', 'room', 'large', 'hallway']);
+  // A room is Good at about 125 photos in one light and Excellent at about 208; bigger spaces need more.
+  assert.equal(CM.photosFor(CM.GOOD, 'room'), 125);
+  assert.equal(CM.photosFor(CM.EXCELLENT, 'room'), 208);
+  assert.ok(CM.photosFor(CM.GOOD, 'large') > CM.photosFor(CM.GOOD, 'hallway') && CM.photosFor(CM.GOOD, 'hallway') > CM.photosFor(CM.GOOD, 'room'));
+  assert.ok(CM.photoCurve(19, 'room') <= 15, 'too few photos to place');
+  const curve = CM.curvePoints('room');
+  assert.ok(curve.every((p, i) => !i || p[1] >= curve[i - 1][1]), 'more photos never hurt');
+
+  const one = CM.photoEstimate({ byLight: { afternoon: 125 } }, 'room');
+  assert.deepEqual([one.score, one.dominant, one.share], [75, 'afternoon', 1]);
+  const mixed = CM.photoEstimate({ byLight: { afternoon: 60, evening: 60 } }, 'room');
+  assert.equal(Math.round(mixed.effective), 75, 'the other light counts a quarter');
+  assert.ok(mixed.score < one.score - 15 && mixed.parts.some(([t, v]) => /mixed/.test(t) && v < 0), 'and mixed light costs points');
+  assert.equal(CM.photoEstimate({ byLight: { morning: 125 }, devices: 3 }, 'room').score, 72, 'three phones: -3');
+  assert.equal(CM.photoEstimate({}, 'room').score, 0);
+
+  assert.equal(CM.scanEstimate([{ grade: 'A' }]).score, 87);
+  assert.equal(CM.scanEstimate([{ grade: 'C' }, { grade: 'B', score: 85 }]).score, 81, 'the best scan counts');
+  const snall = { photos: 1052, placed: 1052, reprojError: 0.58, preset: 'standard', gradeScore: 99 };
+  assert.equal(CM.builtEstimate(snall).score, 99, 'a clean build keeps what its scan promised');
+  assert.equal(CM.builtEstimate({ ...snall, placed: 526 }).score, 59, 'half the photos placed');
+  assert.equal(CM.builtEstimate({ ...snall, reprojError: 2.5 }).score, 59, 'a poor reprojection error');
+  assert.equal(CM.builtEstimate({ ...snall, preset: 'quick' }).score, 84, 'quick training');
+  assert.equal(CM.builtEstimate({ photos: 120, placed: 120, reprojError: 0.56, preset: 'quick' }).score, 63, 'no scan grade: judged by its photos');
+  // Measured quality: PSNR on held-back photos replaces the estimate. Each band starts at a round number of dB.
+  assert.deepEqual([13, 20, 23, 26, 29, 32, 40].map((db) => CM.bandOf(CM.psnrScore(db)).id), ['none', 'rough', 'fair', 'good', 'excellent', 'excellent', 'excellent']);
+  assert.deepEqual([19.9, 22.9, 25.9, 28.9].map((db) => CM.bandOf(CM.psnrScore(db)).id), ['none', 'rough', 'fair', 'good'], 'just under each threshold');
+  assert.deepEqual([CM.psnrScore(24.5), CM.psnrScore(NaN), CM.psnrScore(50)], [62.5, 0, 100]);
+  const measuredBuild = CM.builtEstimate({ ...snall, preset: 'quick', reprojError: 2.5, eval: { psnr: 21.7, ssim: 0.7469, views: 20 } });
+  assert.deepEqual([measuredBuild.score, measuredBuild.measured], [39, true], 'the measurement wins over the scan’s promise, the preset and the reprojection error');
+  assert.match(measuredBuild.parts[0][0], /Measured: PSNR 21\.7 dB on 20 photos held back/);
+  assert.equal(CM.builtEstimate({ ...snall, placed: 526, eval: { psnr: 26, ssim: 0.9, views: 44 } }).score, 45, 'photos COLMAP couldn’t place still count against it');
+  assert.equal(CM.builtEstimate(snall).measured, false);
+
+  const fresh = CM.spaceEstimate({ room: 'Main lobby' });
+  assert.deepEqual([fresh.score, fresh.source, fresh.kind], [0, 'none', 'large']);
+  // Advice counts photos exactly as the score is shown: 205 make a big space Good (the curve's round figure is 208).
+  assert.match(fresh.advice[0], /Nothing yet\. About 205 photos/);
+  const partial = CM.spaceEstimate({ room: 'Room 214', photos: { byLight: { evening: 90 }, pending: 4 } });
+  assert.equal(partial.source, 'photos');
+  assert.ok(partial.advice.some((a) => /About 33 more photos in evening light would make it Good/.test(a)), partial.advice.join(' / '));
+  // photosNeeded: that many more in that light reach Good and one fewer doesn't; mixed light needs more than the plain curve says.
+  assert.deepEqual(CM.photosNeeded({ room: 'Room 214', photos: { byLight: { evening: 90 } } }), { n: 33, light: 'evening' });
+  const mixedRoom = { room: 'Room 101', photos: { byLight: { afternoon: 60, evening: 60 } } };
+  assert.deepEqual(CM.photosNeeded(mixedRoom), { n: 52, light: 'afternoon' });
+  assert.ok(CM.spaceEstimate({ ...mixedRoom, photos: { byLight: { afternoon: 111, evening: 60 } } }).score < CM.GOOD, 'one fewer is still Fair');
+  assert.ok(CM.spaceEstimate({ ...mixedRoom, photos: { byLight: { afternoon: 110, evening: 60 } } }).score < CM.GOOD, 'the plain curve’s 50 falls short');
+  assert.deepEqual(CM.photosNeeded({ room: 'Main lobby' }), { n: 205, light: null }, 'nothing yet: any one kind of light');
+  assert.equal(CM.photosNeeded({ room: 'Room 2', photos: { byLight: { night: 40 } }, scans: [{ grade: 'C' }] }).n, 64, 'a scan counts towards it');
+  assert.equal(CM.photosNeeded({ room: 'Snall', builds: [snall] }).n, 0, 'already there');
+  assert.ok(partial.advice.some((a) => /4 photos are waiting for review/.test(a)));
+  const built = CM.spaceEstimate({ room: 'Snall', photos: { byLight: { night: 10 }, sinceBuild: 10 }, builds: [snall] });
+  assert.deepEqual([built.score, built.source, built.band.id], [99, 'built', 'excellent']);
+  assert.ok(built.advice.some((a) => /10 photos accepted since the last build/.test(a)));
+  const both = CM.spaceEstimate({ room: 'Room 214', photos: { byLight: { morning: 125 } }, scans: [{ grade: 'B', score: 80 }] });
+  assert.equal(both.score, Math.round(76 + 0.1 * 75), 'the scan (80, less 5%) and the photos (75) back each other up a little');
+
+  assert.deepEqual(CM.defaultPlan({ levels: 4, area: 5476 }), { spaces: 13, floors: 4, perFloor: 3, guessed: false });
+  assert.deepEqual(CM.defaultPlan({ area: 900 }), { spaces: 5, floors: 2, perFloor: 2, guessed: true });
+  const prog = CM.buildingProgress([80, 37.5, 0], 5);
+  assert.deepEqual([prog.completion, prog.good, prog.started], [0.3, 1, 2]);
+  assert.equal(CM.buildingProgress([90, 90, 90], 2).completion, 1, 'never more than complete');
+  assert.equal(CM.buildingProgress([90], 0).completion, 0, 'a plan of 0 leaves a building out');
+});
+
+const campusLib = await import('../station/lib/campus.mjs');
+await (async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'campus-'));
+  const buildings = new Map(asuList.map((b) => [b.code, b]));
+  for (const t of ['profiles', 'photos', 'captures', 'missions']) fake.db[t].clear();
+  const U = '00000000-0000-4000-8000-0000000000c1';
+  fake.db.profiles.set(U, { user_id: U, handle: 'Map_Tester', banned: false });
+  const hl = buildings.get('hayden-library');
+  const noon = Date.UTC(2026, 10, 3, 20, 0), evening = Date.UTC(2026, 10, 4, 1, 0); // 13:00 and 18:00 in Phoenix
+  const add = (i, o) => {
+    const id = `ca000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
+    fake.db.photos.set(id, { id, user_id: U, created_at: new Date(o.t + 6e4).toISOString(), taken_at: new Date(o.t).toISOString(), building_code: 'hayden-library', building_name: 'Hayden Library',
+      floor: '1', room: 'Main Lobby', session: 's1', device: 'Pixel 8', lat: hl.c[0], lon: hl.c[1], gps_accuracy_m: 9, status: 'accepted', reviewed_at: new Date(o.t + 864e5).toISOString(), ...o, t: undefined });
+  };
+  for (let i = 0; i < 160; i++) add(i, { t: noon + i * 1000 });
+  for (let i = 160; i < 200; i++) add(i, { t: evening + i * 1000 });
+  for (let i = 200; i < 205; i++) add(i, { t: noon, status: 'new', reviewed_at: null });
+  fake.db.captures.set('c-1', { id: 'c-1', user_id: U, created_at: new Date(noon).toISOString(), building_code: 'memorial-union', building_name: 'Memorial Union', floor: '2', room: 'Ballroom foyer', photo_count: 380, grade: 'B', status: 'approved', lat: null, lon: null });
+  const library = [
+    { path: 'Hayden Library/Main lobby/2026-11-01_1200', building: 'Hayden Library', room: 'Main lobby', stamp: '2026-11-01_1200',
+      info: { building: 'Hayden Library', room: 'main lobby', created: new Date(Date.UTC(2026, 10, 1, 19)).toISOString(), photos: 300, placed: 290, colmap: { reprojError: 0.7, mode: 'sfm' }, training: { preset: 'standard', splats: 1e6 }, capture: null } },
+    { path: 'Practice/Demo classroom/2026-10-19_1836', building: 'Practice', room: 'Demo classroom', stamp: '2026-10-19_1836', info: { building: 'Practice', room: 'Demo classroom', photos: 309, placed: 309 } },
+  ];
+  const jobs = [{ id: 'j1', status: 'waiting', building: 'Old Main', room: 'Main hall', summary: { photos: 140 }, source: { name: 'Old_Main_Main_hall.zip' } }];
+  campusLib.savePlan(workDir, 'hayden-library', 4);
+  assert.deepEqual(campusLib.loadPlans(workDir), { 'hayden-library': 4 });
+
+  const d = await campusLib.campusData({ club: { url: FAKE_URL, key: 'sb_secret_test' }, library, jobs, buildings, workDir });
+  assert.deepEqual(d.notes, []);
+  const lobby = d.spaces.find((x) => x.code === 'hayden-library');
+  assert.equal(d.spaces.filter((x) => x.code === 'hayden-library').length, 1, 'photos and the built splat of "Main Lobby" / "main lobby" are one space');
+  assert.deepEqual([lobby.photos.accepted, lobby.photos.pending, lobby.photos.byLight.afternoon, lobby.photos.byLight.evening], [200, 5, 160, 40]);
+  assert.equal(lobby.kind, 'large');
+  assert.equal(lobby.builds.length, 1);
+  assert.equal(lobby.source, 'built', 'its splat (290 of 300 photos placed) beats what the 200 club photos in mixed light promise');
+  assert.ok(lobby.score > lobby.photos.score);
+  assert.ok(lobby.advice.some((a) => /200 photos accepted since the last build/.test(a)), lobby.advice.join(' / '));
+  assert.ok(lobby.advice.some((a) => /5 photos are waiting for review/.test(a)));
+  assert.equal(lobby.contributors[0].handle, 'Map_Tester');
+  const hayden = d.buildings.find((b) => b.code === 'hayden-library');
+  assert.deepEqual([hayden.plan.spaces, hayden.plan.set, hayden.plan.default], [4, true, 13], 'the club’s own plan wins, the default is kept for reference');
+  assert.ok(Math.abs(hayden.completion - Math.min(1, lobby.score / 75) / 4) < 1e-9);
+  assert.equal(hayden.photos, 200);
+  const mu = d.spaces.find((x) => x.code === 'memorial-union');
+  assert.deepEqual([mu.source, mu.scanScore], ['scan', 76]);
+  const om = d.spaces.find((x) => x.code === 'old-main');
+  assert.deepEqual([om.jobs.length, om.score], [1, 0], 'a capture waiting on the dashboard shows up, but counts once it’s built');
+  assert.equal(d.elsewhere.length, 1);
+  assert.equal(d.elsewhere[0].building, 'Practice');
+  const tempe = d.campuses.find((c) => c.id === 'Tempe');
+  assert.equal(tempe.started, 3);
+  assert.ok(tempe.planned > 500 && tempe.completion > 0 && tempe.completion < 0.05);
+  assert.ok(d.buildings.filter((b) => b.restricted).every((b) => b.completion === 0));
+  assert.equal(d.points.length, 205, 'every photo with a GPS reading');
+  const day = d.days.find((x) => x.day === '2026-11-03');
+  assert.deepEqual([day.photos, day.accepted, day.pending, day.scans], [205, 200, 5, 1], 'days are Phoenix days: 6 pm on the 3rd is still the 3rd');
+  assert.equal(d.days.find((x) => x.day === '2026-11-01').builds, 1);
+  assert.equal(d.model.kinds.room.good, 125);
+  assert.ok(d.model.kinds.room.curve.length > 20);
+
+  // Without the club database: this PC's splats only, and a note saying so.
+  const local = await campusLib.campusData({ club: null, library, jobs: [], buildings, workDir });
+  assert.match(local.notes[0], /isn’t set up/);
+  assert.equal(local.spaces.length, 1);
+  assert.equal(local.spaces[0].source, 'built');
+  assert.equal(local.totals.photos, 0);
+  passed++;
+  console.log('  ok campus view: spaces from photos, scans, splats and queued captures, building plans, campus totals, map points and daily activity');
+})();
+
+// ---------------------------------------------------------------- campus map on the phone
+// SplatStation publishes the campus view's summary with the secret key; members' phones read it and colour
+// the map with the same rules (app/js/data/campusmap.js).
+const campusMap = await import('../app/js/data/campusmap.js');
+await (async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'campusmap-'));
+  const buildings = new Map(asuList.map((b) => [b.code, b]));
+  const c = { url: FAKE_URL, key: 'sb_secret_test' };
+  for (const t of ['photos', 'captures', 'missions', 'campus_spaces', 'campus_plans']) fake.db[t].clear();
+  const U = '00000000-0000-4000-8000-0000000000d1';
+  fake.db.profiles.set(U, { user_id: U, handle: 'Light_Seeker', banned: false });
+  const noon = Date.UTC(2026, 10, 3, 20, 0), evening = Date.UTC(2026, 10, 4, 1, 0), morning = Date.UTC(2026, 10, 4, 16, 0); // 13:00, 18:00, 09:00 in Phoenix
+  let k = 0;
+  const add = (code, floor, room, n, t, o = {}) => {
+    for (let i = 0; i < n; i++) {
+      const id = `cb000000-0000-4000-8000-${String(++k).padStart(12, '0')}`;
+      fake.db.photos.set(id, { id, user_id: U, created_at: new Date(t + i * 1000 + 6e4).toISOString(), taken_at: new Date(t + i * 1000).toISOString(), building_code: code, building_name: buildings.get(code).name,
+        floor, room, session: 's2', device: 'Pixel 8', lat: null, lon: null, status: 'accepted', reviewed_at: new Date(t + 864e5).toISOString(), ...o });
+    }
+  };
+  add('hayden-library', '2', 'Room 214', 90, evening); // one light
+  add('hayden-library', '1', 'Main lobby', 160, noon);
+  add('hayden-library', '1', 'Main lobby', 60, evening); // mostly afternoon, some evening
+  add('hayden-library', '1', 'Main lobby', 4, noon, { status: 'new', reviewed_at: null });
+  add('memorial-union', '1', 'Food court', 150, morning); // Good
+  add('cereus-hall', '1', 'Lounge', 30, noon); // a residence hall: never published
+  campusLib.savePlan(workDir, 'memorial-union', 2);
+
+  const d = await campusLib.campusData({ club: c, library: [], jobs: [], buildings, workDir });
+  assert.equal(d.clubError, null);
+  const room = d.spaces.find((x) => x.room === 'Room 214'), lobby = d.spaces.find((x) => x.room === 'Main lobby'), food = d.spaces.find((x) => x.room === 'Food court');
+  assert.deepEqual([room.more.good, room.more.light], [33, 'evening']);
+  assert.ok(room.advice.includes('About 33 more photos in evening light would make it Good.'), 'the Campus page says the same number the phone will');
+  // Exact under the model's own rules: that many more in that light reach Good, one fewer doesn't.
+  const lobbyWith = (extra) => CM.spaceEstimate({ room: 'Main lobby', photos: { byLight: { afternoon: 160 + extra, evening: 60 }, devices: 1 } }).score;
+  assert.equal(lobby.more.light, 'afternoon');
+  assert.ok(lobbyWith(lobby.more.good) >= CM.GOOD && lobbyWith(lobby.more.good - 1) < CM.GOOD, `lobby needs ${lobby.more.good}`);
+  assert.deepEqual([food.band, food.more.good, food.more.light], ['good', 0, 'morning']);
+  assert.ok(food.more.excellent > 0);
+
+  // The rows members get: counts only (no handles, member ids or GPS points), nothing in off-limits buildings.
+  const rows = campusLib.summaryRows(d, '2026-11-05T20:00:00.000Z');
+  assert.deepEqual(rows.spaces.map((r) => r.building_code).sort(), ['hayden-library', 'hayden-library', 'memorial-union']);
+  const r214 = rows.spaces.find((r) => r.room === 'Room 214');
+  assert.deepEqual([r214.space_key, r214.floor, r214.kind, r214.evening, r214.morning, r214.need_good, r214.need_light, r214.band], ['hayden-library|2|room 214', '2', 'room', 90, 0, 33, 'evening', 'fair']);
+  assert.equal(rows.spaces.find((r) => r.room === 'Main lobby').pending, 4);
+  assert.ok(!JSON.stringify(rows).includes('Light_Seeker') && !JSON.stringify(rows).includes(U) && !/"lat"|"lon"/.test(JSON.stringify(rows)), 'no handles, ids or GPS');
+  assert.deepEqual(rows.plans, [{ building_code: 'memorial-union', spaces: 2, updated_at: '2026-11-05T20:00:00.000Z' }]);
+
+  // A view built without the club's photos is never published (it would wipe the map).
+  await assert.rejects(campusLib.publishSummary(c, { ...d, clubError: 'timeout' }), /couldn’t be read/);
+  await assert.rejects(campusLib.publishSummary(c, { ...d, club: false }), /couldn’t be read/);
+  let pub = await campusLib.publishSummary(c, d);
+  assert.deepEqual([pub.spaces, pub.plans, fake.db.campus_spaces.size, fake.db.campus_plans.size], [3, 1, 3, 1]);
+
+  // The phone: a stranger sees nothing; a member gets the summary and colours buildings as SplatStation does.
+  const mem = {};
+  campusMap.useCache({ get: () => mem.v || null, set: (v) => (mem.v = JSON.parse(JSON.stringify(v))) });
+  assert.equal(await clubApp.myProfile({ fresh: true }), null, 'this phone left the club earlier');
+  let sm = await campusMap.load();
+  assert.deepEqual([sm.spaces.length, sm.plans.length], [0, 0], 'not a member: nothing');
+  await clubApp.join('Map_Fox', 'CLUB-TEST');
+  sm = await campusMap.load();
+  assert.equal(sm.spaces.length, 3);
+  assert.equal(sm.at, Date.parse(pub.at), 'when the club PC last published');
+  const phone = campusMap.summarize(asuList, sm);
+  for (const b of d.buildings.filter((x) => !x.restricted)) {
+    const p = phone.find((x) => x.code === b.code);
+    assert.ok(Math.abs(p.completion - b.completion) < 1e-9 && p.planned === b.plan.spaces && p.good === b.good, `${b.name}: phone ${p.completion}/${p.planned}, station ${b.completion}/${b.plan.spaces}`);
+  }
+  const mu = phone.find((x) => x.code === 'memorial-union'), hl = phone.find((x) => x.code === 'hayden-library'), cereus = phone.find((x) => x.code === 'cereus-hall');
+  assert.deepEqual([mu.planned, mu.planSet, mu.completion, campusMap.completionBin(mu)], [2, true, 0.5, 3], 'the club’s plan of 2 spaces, one of them Good');
+  assert.ok(cereus.restricted && cereus.completion === 0 && !cereus.spaces.length);
+  assert.equal(campusMap.completionBin(phone.find((x) => x.code === 'old-main')), 0, 'no photos yet');
+  assert.equal(campusMap.needText(hl.spaces.find((x) => x.room === 'Room 214')), 'About 33 more photos in evening light (4–8 pm) would make it Good.');
+  assert.match(campusMap.needText(mu.spaces[0]), /^Good already\. About \d+ more in morning light \(6–11 am\) would make it Excellent\.$/);
+  assert.equal(campusMap.needText({ score: 0, need_good: 123, need_light: null }), 'About 123 photos in one kind of light would make it Good.');
+  assert.deepEqual(campusMap.closestToGood(phone, { light: 'evening' }).map((p) => p.x.room), ['Room 214'], 'what to shoot in the evening');
+  const todo = campusMap.closestToGood(phone);
+  assert.deepEqual(todo.map((p) => p.x.room).sort(), ['Main lobby', 'Room 214']);
+  assert.ok(todo[0].x.need_good <= todo[1].x.need_good, 'fewest photos to Good first');
+  const near = campusMap.nearby(phone, { lat: mu.c[0], lon: mu.c[1], acc: 10 }, { within: 300 });
+  assert.equal(near[0].b.code, 'memorial-union');
+  assert.ok(near.every((p) => !p.b.restricted && p.dist <= 300));
+
+  // Members can't write it.
+  assert.equal((await crowdApp.api('/rest/v1/campus_spaces', { method: 'POST', body: { ...rows.spaces[0], score: 100 } })).status, 403);
+  assert.equal((await crowdApp.api('/rest/v1/campus_spaces?space_key=not.is.null', { method: 'DELETE' })).status, 403);
+
+  // Publishing again replaces it: a space whose photos were all rejected goes, and so does a plan set back to the default.
+  for (const p of fake.db.photos.values()) if (p.room === 'Room 214') p.status = 'rejected';
+  campusLib.savePlan(workDir, 'memorial-union', null);
+  pub = await campusLib.publishSummary(c, await campusLib.campusData({ club: c, library: [], jobs: [], buildings, workDir }));
+  assert.deepEqual([pub.spaces, fake.db.campus_spaces.size, fake.db.campus_plans.size], [2, 2, 0]);
+  assert.ok([...fake.db.campus_spaces.values()].every((x) => x.updated_at === pub.at));
+  campusLib.savePublished(workDir, { ...pub, by: 'button' });
+  assert.deepEqual(campusLib.loadPlans(workDir), {}, 'campus.json keeps plans and the last publish side by side');
+  assert.equal(campusLib.loadPublished(workDir).spaces, 2);
+
+  // Offline, the phone keeps the copy it last saw.
+  const online = globalThis.fetch;
+  globalThis.fetch = () => Promise.reject(new TypeError('fetch failed'));
+  sm = await campusMap.load();
+  globalThis.fetch = online;
+  assert.ok(sm.offline && sm.spaces.length === 3, 'the earlier copy, marked offline');
+  passed++;
+  console.log('  ok campus map (phone): SplatStation publishes counts and needs per space, members read them, completion matches the Campus page, stale rows go, offline keeps the last copy');
 })();
 
 globalThis.fetch = realFetch;

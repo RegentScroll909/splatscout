@@ -149,6 +149,15 @@ what is still open (permission, consent wording, faces); it also has a five-minu
   splat built from one lighting condition is much cleaner than one built from a mix.
 - **Missions:** the club asks for a view in a kind of light ("Hayden lobby in evening light, +3 each"). A mission
   asking for evening light only scores in the evening.
+- **Campus map** (Club → *Campus map*): ASU's buildings coloured by how complete the club's photos of them are
+  (one blue, darker = less done; dark grey = off limits), with you on it when location is allowed. Under the map:
+  the buildings *near you*, the spaces that are *good to shoot now* (they need the light it is now) and the ones
+  closest to Good. Tap a building for its spaces: each has its quality band, its accepted photos in each kind of
+  light, and "about 33 more photos in evening light (4–8 pm) would make it Good"; *Take photos here* opens Snap
+  with the building, floor and room filled in and says whether it's the right light now. The list of buildings
+  under the map has the same information without the map. The numbers come from SplatStation's Campus page,
+  which publishes them for members (counts only, no names or GPS points); the phone keeps the last copy for
+  places with no signal.
 - **Scans** work as before (Upload on the review screen), but now need membership and upload as your handle.
   Photos go one by one, so a dropped connection resumes with **Resume upload**. *Remove from club database*
   deletes your upload again. Photos carry no GPS or camera metadata (they come from the canvas); the GPS reading
@@ -159,8 +168,11 @@ what is still open (permission, consent wording, faces); it also has a five-minu
   photo or scan. Each phone signs in anonymously and the database rules let it add, finish and delete only its
   own uploads (at most 400 photos a day), never see anyone else's, and never set its own points.
 - **Set up** (once, in the Supabase SQL Editor, each in a *new* query): turn on anonymous sign-ins, run
-  [`crowd/supabase-setup.sql`](crowd/supabase-setup.sql), then [`crowd/supabase-beta.sql`](crowd/supabase-beta.sql).
-  The project URL and publishable key are in `app/js/data/crowd.js`; make invite codes on SplatStation's Club page.
+  [`crowd/supabase-setup.sql`](crowd/supabase-setup.sql), then [`crowd/supabase-beta.sql`](crowd/supabase-beta.sql),
+  then [`crowd/supabase-campus.sql`](crowd/supabase-campus.sql) (the Campus map's summary: members read it, only
+  SplatStation writes it). Each ends with a one-row result saying it was installed; "Success. No rows returned"
+  means an older saved query ran instead. The project URL and publishable key are in `app/js/data/crowd.js`;
+  make invite codes on SplatStation's Club page.
 
 ## 3. Use the export in your pipeline
 
@@ -241,6 +253,30 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   **Build a capture** puts them into *Ready to process* like a camera-mode capture, so they become a splat the
   usual way. The page also makes **missions**, **invite codes** (who can join and how many times), pauses, renames
   or removes members (removing deletes everything they sent), and edits the list of off-limits buildings.
+- **Campus map** (dashboard header, or `/campus.html`, this PC only): every ASU building on a map, coloured by
+  how complete it is, with the GPS points where photos and scans were taken. Click a building for its spaces (each
+  room or area members tagged), and a space for how good a splat to expect, how that number was reached, its photos
+  by light, the splats built from it with a link to the viewer, and what would make it better; *Ask members for
+  photos* turns that into a mission. Above the map: the spaces ready for a good splat, campus coverage, buildings
+  started, photos, splats and members. Below it, each with a table view: **How good a splat to expect** (the rule of
+  thumb for rooms, hallways and large spaces against photo count, with the club's spaces and finished splats on
+  it), **Buildings by completion**, **Light coverage** (photos per building, or per space, in each kind of light)
+  and **Photos sent per day**, then a sortable table of every building and *How the numbers work*.
+
+  The numbers are estimates, and the page says so. A space's expected quality comes from its photos (in a room
+  about 125 photos in one kind of light make it Good and 208 Excellent; hallways and big lobbies need more; mixed
+  light counts less), from a scan's grade, or from a finished splat (what it promised, less for photos COLMAP
+  couldn't place, a high reprojection error or quick training). A building's completion counts its spaces against
+  a plan: by default the entrance plus 2 spaces per floor (3 in big buildings), floors from OpenStreetMap where
+  known; change it on the building's panel. Your existing splats are filed under their building by name
+  ("Schwada Building" counts for Schwada Classroom Office Building).
+
+  **Publish to members** (top of the page) sends the phones' Campus map a summary: each space's expected quality,
+  its accepted photos per kind of light, how many wait for review, and about how many more photos, in which light,
+  would make it Good, plus the building plans you set. The count is worked out with the same rules (so the phone
+  and this page agree, mixed light and scans included). No member names, no GPS points, nothing in off-limits
+  buildings. It also publishes by itself a few seconds after you review photos on the Club page. Needs
+  `crowd/supabase-campus.sql` run once in the Supabase SQL editor.
 
 **Quality presets** (choose on the dashboard; you can re-train any finished job with a different preset):
 
@@ -255,8 +291,20 @@ solve and 58 s of training. Training time grows roughly with the step count; the
 
 **Output:** `%USERPROFILE%\SplatStation\library\<Building>\<Room>\<date>\` contains `scene.ply` (standard 3DGS
 format, works in SuperSplat, Postshot, Unity/Unreal plugins and the web viewers), `info.json` (photos, camera-solve
-quality, training stats, capture grade) and `thumb.jpg`. Click **View** for the built-in viewer, or **Edit in
-SuperSplat** to crop and clean floaters.
+quality, training stats, capture grade, measured quality) and `thumb.jpg`. Click **View** for the built-in viewer,
+or **Edit in SuperSplat** to crop and clean floaters.
+
+**Measure quality (optional).** Everything else said about a splat's quality is a guess from its photos and its
+camera solve. For a real number, tick *Measure quality (hold back every 12th photo)* under Defaults, or *Measure
+quality* on a capture's card before pressing Process. Brush then keeps every 12th photo out of training, and when
+training ends it renders the splat from exactly where each of those photos was taken and compares the two:
+**PSNR** (in dB: how far the pixels are off) and **SSIM** (up to 1: whether edges and texture line up), averaged
+over the held-back photos. Both show on the job's History card and its Library tile, are saved in `info.json` as
+`training.eval` (`{"psnr": 21.7, "ssim": 0.7469, "views": 20, "step": 7000, "every": 12}`), and the Campus map
+uses them in place of its estimate. The cost is that the splat trains on about 8% fewer photos (measuring takes
+only seconds), so it's off by default: turn it on to compare captures or presets, or re-process a finished capture
+with it ticked. SplatStation asks Brush to log (`RUST_LOG=error,brush_cli=info`) and reads the score from its
+`Eval iter …: PSNR …, ssim …` line, which also lands in the job's `job.log`.
 
 **Walk through it.** In the viewer, press **🚶 Walk** to explore the splat in first person, at the height the phone
 was held. Use W A S D (or ↑ ↓, with ← → to turn), click the scene and move the mouse to look around, hold Shift to
@@ -303,7 +351,7 @@ The original captures stay as they are. 360° videos can't be merged yet.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (50 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (55 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
@@ -321,11 +369,17 @@ Tested on this PC:
   refusal and resuming; leaving deleting everything; scan uploads resuming without sending anything twice;
   SplatStation's first opinions on photos, points for the first photo of a room, a new light and missions with
   the daily limit, a rejected photo deleted everywhere, a capture built from accepted photos, members, invites,
-  and refusing requests from the Wi-Fi). They run against an in-memory stand-in for Supabase
+  and refusing requests from the Wi-Fi), and the campus view (expected quality from photos, mixed light, scans and
+  finished builds; building plans and completion; photos, splats and queued captures of one room joined into one
+  space; campus totals, map points and daily activity), and the phone's campus map (exact photo counts to Good,
+  mixed light and scans included; the published summary leaving out names, GPS and off-limits buildings; never
+  publishing when the database couldn't be read; members only; building completion on the phone equal to the
+  Campus page's; stale rows removed on the next publish; the last copy kept offline). They run against an in-memory stand-in for Supabase
   (`tools/fake-supabase.mjs`; `tools/fake-supabase-server.mjs` serves it so the phone app and SplatStation can be
-  tried together). The database rules themselves are tested on a real Postgres with `tools/sql-test.mjs`
+  tried together; `--demo` fills it with made-up members and photos to try the Campus map). The database rules themselves are tested on a real Postgres with `tools/sql-test.mjs`
   (needs `npm install --no-save @electric-sql/pglite`): who can add what, that points only come from
-  SplatStation, members-only views, the daily limit, bans, and leaving.
+  SplatStation, members-only views, the daily limit, bans, leaving, and the campus summary (members read it,
+  strangers and the bare public key see nothing, only the secret key writes it).
 - **The guide loop (2.3)**, with a simulated person following every pass of the Practice hallway and room
   (walking, turning, taking the photos the app asks for, pressing Skip when it offers). Before: the last pass
   never ended (in the hallway, still going after 15 minutes with 83 turn reversals and 96 trips back), and since
@@ -400,19 +454,23 @@ Not yet tested, because it needs real hardware: a live ARCore session on your Pi
 
 ```
 app/js/core/      platform-independent logic (analysis, coverage, depth filter, scan bounds, guide, walkable floor
-                  plan, re-alignment + photo matching, keyframes, coaching, plans, scoring, export formats)
+                  plan, re-alignment + photo matching, keyframes, coaching, plans, scoring, export formats,
+                  clubrules: club points and checks, campusmodel: expected quality and building completion)
 app/js/sources/   xrSource (WebXR/ARCore), cameraSource (getUserMedia + orientation), demoSource/demoScene (practice room, hallway)
 app/js/capture/   session engine, 3D overlay (+ guide geometry), minimap, audio
 app/js/data/      IndexedDB storage, settings, ZIP export, campus (ASU buildings + GPS), crowd (club uploads),
-                  club (membership, leaderboard, missions), snaps (the on-phone photo queue)
+                  club (membership, leaderboard, missions), snaps (the on-phone photo queue),
+                  campusmap (the published campus summary, kept offline; completion by campusmodel's rules)
 app/js/ui/        screens
 app/data/         asu-buildings.json (from OpenStreetMap: node tools/asu-buildings.mjs refreshes it)
 crowd/            supabase-setup.sql + supabase-beta.sql (the club database: tables, private buckets, rules, views),
+                  supabase-campus.sql (the summary behind the phone's Campus map),
                   ADVISOR-BRIEF.md
 tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs, asu-buildings.mjs,
                   fake-supabase.mjs / fake-supabase-server.mjs (stand-in database), sql-test.mjs (database rules on Postgres)
-station/          SplatStation: station.mjs (server, queue, inbox, merges), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb, crowd),
-                  web/ (dashboard, viewer, walk.js: walk-mode collision shared with the self-checks)
+station/          SplatStation: station.mjs (server, queue, inbox, merges), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb,
+                  crowd + club + clubapi: the club, campus: the campus view's data),
+                  web/ (dashboard, viewer, walk.js: walk-mode collision shared with the self-checks, club, campus)
 ```
 
 - `npm start`: local server on http://localhost:8080

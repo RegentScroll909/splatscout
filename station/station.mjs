@@ -19,7 +19,8 @@ import { readZipText } from './lib/zipread.mjs';
 import { walkInputs, walkMapFor } from './lib/walkmap.mjs';
 import { cropPly, topDown, CROP_MARGIN } from './lib/crop.mjs';
 import * as crowd from './lib/crowd.mjs';
-import { handleClub, isLocal, awardScan } from './lib/clubapi.mjs';
+import { handleClub, isLocal, awardScan, buildings as asuBuildings } from './lib/clubapi.mjs';
+import { campusData, savePlan, publishSummary, savePublished } from './lib/campus.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 let PKG_VERSION = '0';
@@ -315,6 +316,41 @@ function library() {
 
 const crowdBusy = new Set(); // club uploads being imported or deleted
 
+// ------------------------------------------------------------------------------------ campus summary for members
+// The phones' Campus map shows a summary of the Campus page (counts and what each space needs, no names or
+// locations), published to the club database with the secret key: from the Campus page's button, and by
+// itself a few seconds after photos are reviewed on the Club page. One publish at a time.
+const campusNow = (c) => campusData({
+  club: c, library: library(), jobs: jobs.filter((j) => ['waiting', 'queued', 'running'].includes(j.status)),
+  buildings: asuBuildings(), workDir: cfg.workDir, jobsDir: cfg.dirs.jobs,
+});
+let publishChain = Promise.resolve(), publishTimer = null, publishError = null;
+function publishCampus(by) {
+  const run = publishChain.then(async () => {
+    const c = crowd.crowdConfig(cfg.workDir);
+    if (c.error) throw new Error(c.error);
+    const r = await publishSummary(c, await campusNow(c));
+    savePublished(cfg.workDir, { ...r, by });
+    publishError = null;
+    return r;
+  }).catch((e) => {
+    const repeat = publishError && publishError.message === e.message;
+    publishError = { at: new Date().toISOString(), message: e.message };
+    if (by === 'review' && !repeat) say(`Campus map: couldn’t publish for members (${e.message})`);
+    throw e;
+  });
+  publishChain = run.catch(() => {});
+  return run;
+}
+/** After a review: publish once things settle (several reviews in a row make one publish). */
+function schedulePublish() {
+  if (publishTimer) return;
+  publishTimer = setTimeout(() => {
+    publishTimer = null;
+    publishCampus('review').catch(() => {});
+  }, 5000);
+}
+
 // ------------------------------------------------------------------------------------ crops
 let cropBusy = false;
 const cropMaps = new Map(); // folder -> {key, map}
@@ -405,7 +441,7 @@ const server = createServer(async (req, res) => {
         tools: Object.fromEntries(Object.entries(cfg.tools).map(([k, v]) => [k, v ? basename(v) : null])),
         workDir: cfg.workDir, inbox: cfg.dirs.inbox, library: cfg.dirs.library,
         preset: cfg.preset, presets: PRESETS, usePoses: cfg.usePoses, cropToBounds: cfg.cropToBounds !== false, adbAutoImport: cfg.adbAutoImport,
-        phoneAutoImport: !!cfg.phoneAutoImport, autoProcess: !!cfg.autoProcess, queuePaused,
+        phoneAutoImport: !!cfg.phoneAutoImport, autoProcess: !!cfg.autoProcess, measureQuality: !!cfg.measureQuality, queuePaused,
         lan: lanUrls(), gpu, phone: phone.status, running: current ? current.job.id : null,
       });
     }
@@ -413,7 +449,35 @@ const server = createServer(async (req, res) => {
     if (path === '/api/library') return sendJson(res, library());
     // The club tools use the database's secret key: only this PC may ask (not a phone on the Wi-Fi).
     if (path.startsWith('/api/club')) {
-      return handleClub({ req, res, path, url, cfg, readBody, sendJson, say, scanInbox, version: PKG_VERSION });
+      return handleClub({ req, res, path, url, cfg, readBody, sendJson, say, scanInbox, version: PKG_VERSION, onPhotosChanged: schedulePublish });
+    }
+    if (path.startsWith('/api/campus')) {
+      // The campus view: coverage per building and space, and expected splat quality. It shows where members
+      // took photos, so like the club tools it only answers this PC.
+      if (!isLocal(req)) return sendJson(res, { error: 'The campus view only works on the PC running SplatStation.' }, 403);
+      if (path === '/api/campus/plan' && req.method === 'POST') {
+        const b = await readBody(req);
+        if (!asuBuildings().has(b.code)) return sendJson(res, { error: 'Unknown building' }, 400);
+        const n = b.spaces == null || b.spaces === '' ? null : Number(b.spaces);
+        if (n != null && !Number.isFinite(n)) return sendJson(res, { error: 'Give a number of spaces' }, 400);
+        savePlan(cfg.workDir, b.code, n);
+        return sendJson(res, { ok: true });
+      }
+      if (path === '/api/campus/publish' && req.method === 'POST') {
+        // Send the summary to members' phones now (the same thing happens by itself after a review).
+        try {
+          const r = await publishCampus('button');
+          say(`Campus map: published ${r.spaces} space${r.spaces === 1 ? '' : 's'} for members.`);
+          return sendJson(res, { ok: true, ...r });
+        } catch (e) {
+          return sendJson(res, { error: e.message }, 500);
+        }
+      }
+      if (path === '/api/campus') {
+        const c = crowd.crowdConfig(cfg.workDir);
+        const data = await campusNow(c.error ? null : c);
+        return sendJson(res, { ...data, publishError });
+      }
     }
     if (path.startsWith('/api/crowd') && !isLocal(req)) return sendJson(res, { error: 'Club uploads can only be managed on the PC running SplatStation.' }, 403);
     if (path === '/api/crowd') {
@@ -525,6 +589,7 @@ const server = createServer(async (req, res) => {
       if (typeof b.adbAutoImport === 'boolean') cfg.adbAutoImport = b.adbAutoImport;
       if (typeof b.phoneAutoImport === 'boolean') cfg.phoneAutoImport = b.phoneAutoImport;
       if (typeof b.autoProcess === 'boolean') cfg.autoProcess = b.autoProcess;
+      if (typeof b.measureQuality === 'boolean') cfg.measureQuality = b.measureQuality;
       saveConfig(cfg);
       if (b.adbAutoImport || b.phoneAutoImport) phone.check().catch(() => {});
       return sendJson(res, { ok: true });
@@ -633,6 +698,7 @@ const server = createServer(async (req, res) => {
           if (b.preset && PRESETS[b.preset]) job.preset = b.preset;
           if (typeof b.usePoses === 'boolean') job.usePoses = b.usePoses;
           if (typeof b.crop === 'boolean') job.crop = b.crop;
+          if (typeof b.measure === 'boolean') job.measure = b.measure;
           job.status = 'queued';
           job.order = Date.now();
           job.error = null;

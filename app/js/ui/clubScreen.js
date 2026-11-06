@@ -97,6 +97,11 @@ export async function clubScreen(root, { navigate, query }) {
         c.waiting && navigator.onLine === false ? h('p.small.muted', 'Offline: photos will send when you have a connection.') : null,
         c.waiting && navigator.onLine !== false && !sendState.running ? h('button.btn.small', { onclick: () => snaps.kick() }, icon('upload'), 'Send now') : null),
 
+      h('button.club-card', { onclick: () => navigate('#/campus') },
+        icon('map'),
+        h('div.club-card-body', h('div.club-card-title', 'Campus map'), h('div.small.muted', 'Which buildings and spaces still need photos, and in what light')),
+        icon('chevron', 'dim')),
+
       S.missions && S.missions.length
         ? h('section.card',
             h('div.card-head', h('h2', 'Missions'), h('span.mono.muted', String(S.missions.length).padStart(2, '0'))),

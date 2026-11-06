@@ -65,6 +65,7 @@ main { max-width: 1120px; margin: 0 auto; padding: 22px 24px 64px; display: flex
 select { font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--line-2); border-radius: 8px; padding: 7px 10px; }
 .check { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; color: #cdd6df; }
 .check.inline { align-items: center; font-size: 0.86rem; }
+.check .hint { display: block; color: var(--muted); font-size: 0.78rem; margin-top: 2px; }
 input[type=checkbox] { appearance: none; width: 16px; height: 16px; border: 1px solid var(--line-2); border-radius: 4px; background: var(--surface-2); margin: 2px 0 0; flex: none; cursor: pointer; display: grid; place-items: center; }
 input[type=checkbox]:checked { background: var(--accent); border-color: var(--accent); }
 input[type=checkbox]:checked::after { content: ''; width: 8px; height: 4px; border: 2px solid var(--accent-ink); border-top: 0; border-right: 0; transform: rotate(-45deg) translate(1px, -1px); }
@@ -118,6 +119,8 @@ input[type=checkbox]:disabled { opacity: 0.4; }
 .g-a, .g-b { color: var(--good); }
 .g-c { color: var(--warn); }
 .g-d, .g-f { color: var(--bad); }
+.qchip { display: inline-flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 0.78rem; color: var(--text); }
+.qchip .lbl { color: var(--accent); }
 .badge { font-family: var(--mono); font-size: 0.68rem; font-weight: 600; padding: 3px 8px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.08em; border: 1px solid var(--line-2); color: var(--muted); }
 .badge.running { color: var(--accent); border-color: rgba(61, 220, 255, 0.45); }
 .badge.waiting { color: var(--text); }

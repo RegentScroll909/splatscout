@@ -85,6 +85,7 @@ export async function handleClub(ctx) {
         try {
           const r = await club.review(c, cfg, { ids, action: post.action, note: String(post.note || '').slice(0, 200) });
           say(`Club review: ${post.action} ${r.changed} photo(s)${r.points ? `, ${r.points} points awarded` : ''}.`);
+          if (r.changed && ctx.onPhotosChanged) ctx.onPhotosChanged(); // members' Campus map follows
           return sendJson(res, { ok: true, ...r });
         } finally {
           ids.forEach((id) => busy.delete(id));
