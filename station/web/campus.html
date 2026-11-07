@@ -59,6 +59,11 @@
     #map .b.sel { stroke: var(--accent); stroke-width: 2.5; }
     #map .lab { fill: var(--text); paint-order: stroke; stroke: #0c0f13; stroke-linejoin: round; pointer-events: none; }
     #map .pt { stroke: #0c0f13; vector-effect: non-scaling-stroke; pointer-events: none; }
+    /* A photo or scan that arrived since the last update rings a few times. */
+    #map .pt.new { stroke: var(--st-warning); animation: ptnew 1.5s ease-out 4; }
+    @keyframes ptnew { from { stroke-width: 0; stroke-opacity: 0.9; } to { stroke-width: 18; stroke-opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) { #map .pt.new { animation: none; stroke-width: 3; } }
+    .newnote { color: var(--accent); font-weight: 600; }
     .zoom { position: absolute; right: 10px; top: 10px; display: flex; flex-direction: column; gap: 4px; }
     .zoom button { width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--line-2); background: rgba(16, 20, 25, 0.9); color: var(--text); font: inherit; cursor: pointer; }
     .legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 0.78rem; color: var(--muted); }
@@ -87,7 +92,15 @@
     .parts td { padding: 4px 0; border-top: 1px solid var(--line); }
     .parts td.v { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; padding-left: 10px; }
     .plan { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 0.84rem; color: var(--muted); }
-    .plan input { width: 64px; font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 6px; }
+    .plan input, .plan select { width: 64px; font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 6px; }
+    .plan select { width: auto; }
+    .floors { display: grid; grid-template-columns: minmax(96px, auto) 1fr auto; gap: 4px 10px; align-items: center; font-size: 0.8rem; }
+    .floors .fb { height: 8px; background: var(--grid); border-radius: 2px; overflow: hidden; }
+    .floors .fb i { display: block; height: 100%; background: var(--seq-3); border-radius: 0 2px 2px 0; }
+    .floors .n { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); text-align: right; white-space: nowrap; }
+    .since { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: var(--surface); border: 1px solid var(--line-2); border-radius: 10px; padding: 8px 12px; font-size: 0.86rem; }
+    .live { display: inline-flex; align-items: center; gap: 5px; font-size: 0.8rem; color: var(--muted); cursor: pointer; }
+    .live input { margin: 0; }
     .lightbars { display: grid; grid-template-columns: 76px 1fr 40px; gap: 4px 8px; align-items: center; font-size: 0.8rem; }
     .lightbars .b2 { height: 10px; border-radius: 0 3px 3px 0; min-width: 0; }
     .lightbars .n { text-align: right; font-family: var(--mono); color: var(--muted); }
@@ -146,17 +159,20 @@
       <div class="seg" id="periodSeg" aria-label="Activity period"></div>
       <span class="grow"></span>
       <span class="updated" id="updated"></span>
+      <label class="live" title="Check for new photos every 15 seconds while this page is open"><input type="checkbox" id="live" checked> Live</label>
       <button class="btn small ghost" id="refresh">Refresh</button>
+      <button class="btn small ghost" id="fresh" title="Start the map from zero: only photos, scans and splats from now on count. Nothing is deleted, and you can switch back.">Start fresh</button>
       <span class="updated" id="pubState" aria-live="polite"></span>
       <button class="btn small" id="publish" title="Send each space’s expected quality, photos per light and what it still needs (no member names, no GPS points) to the Campus map in members’ phones. It also happens by itself after you review photos on the Club page.">Publish to members</button>
     </div>
     <div id="notes"></div>
+    <div id="since" class="since" aria-live="polite" hidden></div>
     <section class="kpis" id="kpis" aria-label="Headline numbers"></section>
 
     <section class="mapgrid">
       <div class="card">
         <div class="card-head">
-          <div class="grow"><h2>Campus map</h2><p class="desc">Buildings coloured by how complete they are. Click one for its spaces.</p></div>
+          <div class="grow"><h2>Campus map</h2><p class="desc">Buildings coloured by how much of their floor area is covered. Click one for its floors and spaces.</p></div>
         </div>
         <div class="maptools">
           <input type="search" id="find" placeholder="Find a building" list="bnames" aria-label="Find a building">

@@ -20,7 +20,7 @@ import { walkInputs, walkMapFor } from './lib/walkmap.mjs';
 import { cropPly, topDown, CROP_MARGIN } from './lib/crop.mjs';
 import * as crowd from './lib/crowd.mjs';
 import { handleClub, isLocal, awardScan, buildings as asuBuildings } from './lib/clubapi.mjs';
-import { campusData, savePlan, publishSummary, savePublished } from './lib/campus.mjs';
+import { campusData, saveFloors, saveSize, setSince, publishSummary, savePublished, loadPublished } from './lib/campus.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 let PKG_VERSION = '0';
@@ -336,20 +336,34 @@ function publishCampus(by) {
   }).catch((e) => {
     const repeat = publishError && publishError.message === e.message;
     publishError = { at: new Date().toISOString(), message: e.message };
-    if (by === 'review' && !repeat) say(`Campus map: couldn’t publish for members (${e.message})`);
+    if (by !== 'button' && !repeat) say(`Campus map: couldn’t publish for members (${e.message})`);
     throw e;
   });
   publishChain = run.catch(() => {});
   return run;
 }
-/** After a review: publish once things settle (several reviews in a row make one publish). */
-function schedulePublish() {
+/** After a review or a change of settings: publish once things settle (several in a row make one publish). */
+function schedulePublish(by = 'review') {
   if (publishTimer) return;
   publishTimer = setTimeout(() => {
     publishTimer = null;
-    publishCampus('review').catch(() => {});
+    publishCampus(by).catch(() => {});
   }, 5000);
 }
+// New photos or scans from phones: once the members' map is in use, publish again within a minute of them
+// arriving, so phones follow every upload (two one-row requests a minute while SplatStation runs).
+async function watchUploads() {
+  const p = loadPublished(cfg.workDir);
+  if (!p) return;
+  const c = crowd.crowdConfig(cfg.workDir);
+  if (c.error) return;
+  try {
+    const newest = (await Promise.all(['photos', 'captures'].map((t) => crowd.call(c, `/rest/v1/${t}?select=created_at&order=created_at.desc&limit=1`))))
+      .flat().reduce((t, r) => Math.max(t, Date.parse(r.created_at) || 0), 0);
+    if (newest > Date.parse(p.at)) schedulePublish('upload');
+  } catch {}
+}
+setInterval(watchUploads, 60e3).unref();
 
 // ------------------------------------------------------------------------------------ crops
 let cropBusy = false;
@@ -455,13 +469,48 @@ const server = createServer(async (req, res) => {
       // The campus view: coverage per building and space, and expected splat quality. It shows where members
       // took photos, so like the club tools it only answers this PC.
       if (!isLocal(req)) return sendJson(res, { error: 'The campus view only works on the PC running SplatStation.' }, 403);
-      if (path === '/api/campus/plan' && req.method === 'POST') {
+      if (path === '/api/campus/floors' && req.method === 'POST') {
+        // The club's own floor count for a building (null: OpenStreetMap's, or 2).
         const b = await readBody(req);
         if (!asuBuildings().has(b.code)) return sendJson(res, { error: 'Unknown building' }, 400);
-        const n = b.spaces == null || b.spaces === '' ? null : Number(b.spaces);
-        if (n != null && !Number.isFinite(n)) return sendJson(res, { error: 'Give a number of spaces' }, 400);
-        savePlan(cfg.workDir, b.code, n);
+        const n = b.floors == null || b.floors === '' ? null : Number(b.floors);
+        if (n != null && !(Number.isFinite(n) && n >= 1)) return sendJson(res, { error: 'Give a number of floors, 1 or more' }, 400);
+        saveFloors(cfg.workDir, b.code, n);
+        if (loadPublished(cfg.workDir)) schedulePublish('settings');
         return sendJson(res, { ok: true });
+      }
+      if (path === '/api/campus/size' && req.method === 'POST') {
+        // A space's size (null: guessed from its name, or measured by a scan).
+        const b = await readBody(req);
+        if (typeof b.key !== 'string' || !b.key.includes('|')) return sendJson(res, { error: 'Unknown space' }, 400);
+        try {
+          saveSize(cfg.workDir, b.key.slice(0, 200), b.size || null);
+        } catch (e) {
+          return sendJson(res, { error: e.message }, 400);
+        }
+        if (loadPublished(cfg.workDir)) schedulePublish('settings');
+        return sendJson(res, { ok: true });
+      }
+      if (path === '/api/campus/since' && req.method === 'POST') {
+        // A fresh start (since: 'now'), or count everything again (since: null). Nothing is deleted.
+        const b = await readBody(req);
+        let since;
+        try {
+          since = setSince(cfg.workDir, b.since == null ? null : String(b.since));
+        } catch (e) {
+          return sendJson(res, { error: e.message }, 400);
+        }
+        say(since ? `Campus map: fresh start, counting what arrives from ${new Date(since).toLocaleString()} on.` : 'Campus map: counting everything again.');
+        // Members' phones follow straight away, when the club database is set up.
+        let published = null, publishFailed = null;
+        if (!crowd.crowdConfig(cfg.workDir).error) {
+          try {
+            published = await publishCampus('fresh start');
+          } catch (e) {
+            publishFailed = e.message;
+          }
+        }
+        return sendJson(res, { ok: true, since, published, publishFailed });
       }
       if (path === '/api/campus/publish' && req.method === 'POST') {
         // Send the summary to members' phones now (the same thing happens by itself after a review).

@@ -1,15 +1,16 @@
-// The campus summary SplatStation publishes for members (crowd/supabase-campus.sql): every space's expected
-// splat quality, its accepted photos in each kind of light and about how many more (in which light) would
-// make it Good, plus the club's own building plans. The copy last seen stays on the phone, so the Campus map
-// opens in a basement with no signal. Building completion follows the same rules as SplatStation's Campus page
+// The campus summary SplatStation publishes for members (crowd/supabase-campus.sql and -campus-2.sql): every
+// space's expected splat quality and the floor area it counts for, its accepted photos in each kind of light
+// and about how many more (in which light) would make it Good, plus the floor counts the club set. The copy
+// last seen stays on the phone, so the Campus map opens in a basement with no signal. Building completion (the
+// share of a building's floor area covered) follows the same rules as SplatStation's Campus page
 // (core/campusmodel.js), so the phone and the club PC agree.
 
 import { api, why } from './crowd.js';
-import { buildingProgress, defaultPlan, bandOf, photosNeeded, BANDS, GOOD, EXCELLENT } from '../core/campusmodel.js';
+import { buildingCoverage, floorArea, SIZES, completionBin as binOf, COMPLETION_LABELS, pctText, bandOf, photosNeeded, BANDS, GOOD, EXCELLENT } from '../core/campusmodel.js';
 import { LIGHT_SLOTS, LIGHT_LABEL, lightSlot } from '../core/clubrules.js';
 import { distanceTo } from './campus.js';
 
-export { BANDS, GOOD, EXCELLENT, bandOf };
+export { BANDS, GOOD, EXCELLENT, bandOf, pctText };
 /** Photos in one kind of light that make an empty space of this kind ('room', 'hallway', 'large') Good: the same count the Campus page gives. */
 export const photosForGood = (kind) => photosNeeded({ room: { room: 'Room', hallway: 'Hallway', large: 'Lobby' }[kind] || 'Room' }, GOOD).n;
 
@@ -60,7 +61,7 @@ export async function load() {
   try {
     const [spaces, plans, restricted] = await Promise.all([
       rows('campus_spaces', '*', 'space_key.asc'),
-      rows('campus_plans', 'building_code,spaces,updated_at', 'building_code.asc'),
+      rows('campus_plans', '*', 'building_code.asc'), // * : the floors column only exists after supabase-campus-2.sql
       rows('restricted_buildings', 'code,reason', 'code.asc'),
     ]);
     const at = [...spaces, ...plans].reduce((t, r) => Math.max(t, Date.parse(r.updated_at) || 0), 0) || null;
@@ -78,12 +79,18 @@ export async function load() {
 const byPlace = (a, b) => (a.floor || '').localeCompare(b.floor || '', undefined, { numeric: true }) || a.room.localeCompare(b.room);
 
 /**
+ * The floor area (m²) a published space counts for: as SplatStation sent it, or typical for its kind when the
+ * club's database doesn't have sizes yet (before supabase-campus-2.sql).
+ */
+export const areaOf = (x) => (x.area > 0 ? x.area : (SIZES[x.kind] || SIZES.room).area);
+
+/**
  * Every building with its published spaces and how complete it is, by the same rules as SplatStation:
- * [{...building, restricted, spaces, planned, planSet, completion, credit, good, started, best}].
+ * [{...building, restricted, spaces, floorArea, byFloor, completion, covered, good, started, best}].
  * A building is off limits if the building list or the club database says so.
  */
 export function summarize(list, s = {}) {
-  const plans = new Map((s.plans || []).map((p) => [p.building_code, p.spaces]));
+  const floors = new Map((s.plans || []).filter((p) => p.floors > 0).map((p) => [p.building_code, p.floors]));
   const off = new Map((s.restricted || []).map((r) => [r.code, r.reason]));
   const byCode = new Map();
   for (const x of s.spaces || []) {
@@ -93,19 +100,19 @@ export function summarize(list, s = {}) {
   return list.map((b) => {
     const restricted = b.restricted || off.get(b.code) || null;
     const spaces = (byCode.get(b.code) || []).sort(byPlace);
-    const planned = plans.has(b.code) ? plans.get(b.code) : defaultPlan(b).spaces;
-    const prog = buildingProgress(spaces.map((x) => x.score), planned);
+    const fa = floorArea(b, floors.get(b.code));
+    const cov = buildingCoverage(spaces.map((x) => ({ score: x.score, area: areaOf(x), floor: x.floor })), fa);
     return {
-      ...b, restricted, spaces, planned, planSet: plans.has(b.code),
-      completion: restricted ? 0 : prog.completion, credit: prog.credit, good: prog.good, started: prog.started,
+      ...b, restricted, spaces, floorArea: fa, byFloor: cov.byFloor,
+      completion: restricted ? 0 : cov.completion, covered: restricted ? 0 : cov.covered, good: cov.good, started: cov.started,
       best: spaces.reduce((m, x) => Math.max(m, x.score), 0),
     };
   });
 }
 
-/** Completion as a bin of the one-hue ramp (1 = started, under 25% … 5 = complete), 0 = no photos yet. */
-export const completionBin = (b) => (!b.spaces.length ? 0 : b.completion >= 1 ? 5 : b.completion >= 0.75 ? 4 : b.completion >= 0.5 ? 3 : b.completion >= 0.25 ? 2 : 1);
-export const BIN_LABELS = ['No photos yet', 'Started, under 25%', '25–49%', '50–74%', '75–99%', 'Complete'];
+/** Completion as a step of the one-hue ramp (core/campusmodel.completionBin), 0 = no photos yet. */
+export const completionBin = (b) => binOf(b.completion, b.spaces.length > 0);
+export const BIN_LABELS = COMPLETION_LABELS;
 
 /** Accepted photos of a space, all lights together. */
 export const photosOf = (x) => LIGHT_SLOTS.reduce((n, k) => n + (x[k] || 0), 0);

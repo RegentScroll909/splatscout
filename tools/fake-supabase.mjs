@@ -23,6 +23,7 @@ export function createFake() {
   const db = {
     profiles: new Map(), invites: new Map(), restricted_buildings: new Map(), missions: new Map(), photos: new Map(), captures: new Map(),
     campus_spaces: new Map(), campus_plans: new Map(), // the summary SplatStation publishes (crowd/supabase-campus.sql)
+    campusV1: false, // true: the campus tables as supabase-campus.sql made them, before supabase-campus-2.sql
     files: new Map(), // 'bucket/path' -> Buffer
     posts: new Map(), // 'bucket/path' -> times a file was sent
     failOnce: new Set(), // path endings whose next upload is refused (a 400)
@@ -159,6 +160,11 @@ export function createFake() {
       if (m === 'POST') {
         const rows = [].concat(await body());
         const keep = (req.headers.get('prefer') || '').includes('return=representation');
+        // A club that hasn't run supabase-campus-2.sql yet: no space sizes, no floor counts.
+        if (CAMPUS.has(name) && db.campusV1) {
+          const col = rows.flatMap((r) => Object.keys(r)).find((k) => k === 'area' || k === 'floors');
+          if (col) return json({ code: 'PGRST204', message: `Could not find the '${col}' column of '${name}' in the schema cache` }, 400);
+        }
         for (const row of rows) {
           if (!admin) {
             if (!['photos', 'captures'].includes(name)) return json({ code: '42501', message: `permission denied for table ${name}` }, 403);

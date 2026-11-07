@@ -41,7 +41,9 @@ const api = async (path, body) => {
   return j;
 };
 const fmt = (n) => Math.round(n).toLocaleString();
-const pct = (x) => (x > 0 && x < 0.01 ? '<1%' : `${Math.round(x * 100)}%`);
+/** A share as a percentage that still shows small progress: "0.3%", "2.4%", "24%" (as campusmodel.pctText). */
+const pct = (x) => (!(x > 0) ? '0%' : x < 0.001 ? '<0.1%' : x < 0.1 ? `${(x * 100).toFixed(1).replace(/\.0$/, '')}%` : `${Math.round(Math.min(1, x) * 100)}%`);
+const fmtArea = (m2) => `${fmt(m2)} m²`;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const fmtDay = (d) => new Date(d + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 const fmtDate = (t) => new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
@@ -76,8 +78,10 @@ function chip(b, extra) {
   const [color, sym] = STATUS[b.status];
   return h('span', { class: 'chip', title: b.means }, h('span', { class: 'ic2', style: `background:${color}` }, sym), b.label, extra ? h('span', { class: 'muted' }, extra) : null);
 }
-const compColor = (b) => (b.restricted ? 'var(--off)' : !b.spaces ? null : b.completion >= 1 ? 'var(--seq-5)' : b.completion >= 0.75 ? 'var(--seq-4)' : b.completion >= 0.5 ? 'var(--seq-3)' : b.completion >= 0.25 ? 'var(--seq-2)' : 'var(--seq-1)');
-const COMP_KEYS = [['var(--seq-1)', 'Started, under 25%'], ['var(--seq-2)', '25–49%'], ['var(--seq-3)', '50–74%'], ['var(--seq-4)', '75–99%'], ['var(--seq-5)', 'Complete']];
+/** Completion as a step of the one-hue ramp (campusmodel.completionBin): narrow steps at the bottom, as buildings fill up slowly. */
+const compBin = (b) => (!b.spaces ? 0 : 1 + S.data.model.completionSteps.filter((v) => b.completion >= v).length);
+const compColor = (b) => (b.restricted ? 'var(--off)' : compBin(b) ? `var(--seq-${compBin(b)})` : null);
+const compKeys = () => S.data.model.completionLabels.slice(1).map((t, i) => [`var(--seq-${i + 1})`, t]);
 const heatColor = (n) => (!n ? null : n >= 200 ? 'var(--seq-5)' : n >= 100 ? 'var(--seq-4)' : n >= 50 ? 'var(--seq-3)' : n >= 10 ? 'var(--seq-2)' : 'var(--seq-1)');
 const heatInk = (n) => (n >= 100 ? '#0b0b0b' : '#ffffff');
 const HEAT_KEYS = [['var(--seq-1)', '1–9'], ['var(--seq-2)', '10–49'], ['var(--seq-3)', '50–99'], ['var(--seq-4)', '100–199'], ['var(--seq-5)', '200+']];
@@ -119,23 +123,83 @@ function colPath(x, y, w, hgt, r = 4) {
 const width = (el, min = 300) => Math.max(min, Math.floor(el.clientWidth - 32));
 
 // ------------------------------------------------------------------ load
-async function load() {
-  document.body.style.opacity = S.data ? '0.6' : '1';
+const pointKey = (p) => `${p.lat},${p.lon},${p.t}`;
+let seenPoints = null; // photos and scans already on the map, so new ones can be marked as they arrive
+
+/** Fetch everything again. quiet: a live update, which keeps the view and marks what's new. */
+async function load({ quiet = false } = {}) {
+  if (!quiet) document.body.style.opacity = S.data ? '0.6' : '1';
+  let data;
   try {
-    S.data = await api('/api/campus');
+    data = await api('/api/campus');
   } catch (e) {
-    put($('#notes'), h('div', { class: 'err' }, e.message));
+    if (!quiet) put($('#notes'), h('div', { class: 'err' }, e.message));
     document.body.style.opacity = '1';
     return;
   }
   document.body.style.opacity = '1';
+  const first = !S.data;
+  const before = first ? null : S.data.totals.photos + S.data.totals.pending;
+  seenPoints = first ? null : new Set(S.data.points.map(pointKey));
+  S.data = data;
   if (!S.data.campuses.some((c) => c.id === S.campus)) S.campus = S.data.campuses[0].id;
-  $('#updated').textContent = `Updated ${new Date(S.data.generatedAt).toLocaleTimeString()}`;
+  if (S.space && !S.data.spaces.some((x) => x.key === S.space)) S.space = null; // left out by a fresh start
+  const now = S.data.totals.photos + S.data.totals.pending, diff = before == null ? 0 : now - before;
+  put($('#updated'), `Updated ${new Date(S.data.generatedAt).toLocaleTimeString()}`,
+    diff ? h('b', { class: 'newnote' }, ` · ${diff > 0 ? '+' : '−'}${Math.abs(diff)} photo${Math.abs(diff) === 1 ? '' : 's'}`) : null);
   renderPublished();
+  renderSince();
   put($('#notes'), S.data.notes.map((n) => h('div', { class: 'muted small' }, n)));
   put($('#bnames'), S.data.buildings.map((b) => h('option', { value: b.name })));
-  renderAll(true);
+  hideTip();
+  renderAll(first);
 }
+
+// Live: check for new photos every 15 seconds while the page is in view, unless someone is typing in a field.
+let liveBusy = false;
+async function liveTick() {
+  if (!$('#live').checked || document.hidden || liveBusy || !S.data) return;
+  const a = document.activeElement;
+  if (a && a.matches('input:not([type=checkbox]), select, textarea')) return;
+  liveBusy = true;
+  try {
+    await load({ quiet: true });
+  } finally {
+    liveBusy = false;
+  }
+}
+setInterval(liveTick, 15000);
+document.addEventListener('visibilitychange', liveTick);
+
+// ------------------------------------------------------------------ fresh start
+/** The fresh-start banner: when counting began, what it leaves out, and the way back. */
+function renderSince() {
+  const el = $('#since'), d = S.data;
+  $('#fresh').hidden = !!d.since;
+  el.hidden = !d.since;
+  if (!d.since) return;
+  const hd = d.hidden || {};
+  const kinds = [[hd.builds, 'splat', 'splats'], [hd.jobs, 'capture on the dashboard', 'captures on the dashboard'], [hd.photos, 'photo', 'photos'], [hd.scans, 'scan', 'scans']].filter(([n]) => n);
+  const left = kinds.map(([n, one, many]) => `${n} ${n === 1 ? one : many}`);
+  const single = kinds.length === 1 && kinds[0][0] === 1;
+  put(el,
+    h('b', {}, `Fresh start: counting from ${fmtWhen(d.since)}`),
+    h('span', { class: 'muted' }, left.length ? `${left.join(', ')} from before then ${single ? 'isn’t' : 'aren’t'} counted. Nothing is deleted.` : 'Nothing from before then was left out.'),
+    h('span', { class: 'grow' }),
+    h('button', { class: 'tbtn', onclick: () => setSinceTo(null) }, 'Count everything again'));
+}
+async function setSinceTo(since) {
+  if (since && !confirm('Start the Campus map from zero?\n\nOnly photos, scans and splats that arrive from now on will count. Nothing is deleted, and “Count everything again” switches back. Members’ phones show the fresh map too.')) return;
+  try {
+    const r = await api('/api/campus/since', { since });
+    if (r.publishFailed) alert(`The map here changed, but members’ phones weren’t updated: ${r.publishFailed}`);
+  } catch (e) {
+    return alert(e.message);
+  }
+  S.building = S.space = null;
+  await load();
+}
+$('#fresh').onclick = () => setSinceTo('now');
 
 function renderAll(fit) {
   renderFilters();
@@ -160,8 +224,8 @@ function renderKpis() {
   const sum = (k) => bs.reduce((n, b) => n + b[k], 0);
   const tile = (label, value, sub, cls = '', extra = null) => h('div', { class: 'kpi ' + cls }, h('span', { class: 'lbl' }, label), h('span', { class: 'val' }, value), extra, sub ? h('span', { class: 'sub' }, sub) : null);
   put($('#kpis'),
-    tile('Spaces ready for a good splat', fmt(good), `of ${fmt(c.planned)} planned spaces on the ${S.campus} campus`, 'hero'),
-    tile('Campus covered', pct(c.completion), `${c.credit.toFixed(1)} of ${fmt(c.planned)} spaces' worth`, '', h('div', { class: 'meter', role: 'meter', 'aria-valuenow': Math.round(c.completion * 100), 'aria-valuemin': 0, 'aria-valuemax': 100 }, h('div', { style: `width:${Math.max(c.completion > 0 ? 2 : 0, c.completion * 100)}%` }))),
+    tile('Spaces ready for a good splat', fmt(good), `of ${fmt(sp.length)} space${sp.length === 1 ? '' : 's'} with photos or splats on the ${S.campus} campus`, 'hero'),
+    tile('Campus floor area covered', pct(c.completion), `about ${fmtArea(c.covered)} of ${fmtArea(c.area)}`, '', h('div', { class: 'meter', role: 'meter', 'aria-valuenow': +(c.completion * 100).toFixed(2), 'aria-valuemin': 0, 'aria-valuemax': 100 }, h('div', { style: `width:${Math.max(c.completion > 0 ? 2 : 0, c.completion * 100)}%` }))),
     tile('Buildings started', fmt(c.started), `of ${fmt(open.length)} that can be photographed`),
     tile('Photos accepted', fmt(sum('photos')), `${fmt(sum('pending'))} waiting for review`),
     tile('Splats built', fmt(sum('builds')), `${fmt(sum('jobs'))} in the queue · ${fmt(sum('scans'))} scans sent`),
@@ -207,7 +271,8 @@ function renderMap(fit) {
   const codes = new Set(bs.map((b) => b.code));
   for (const pt of S.data.points.filter((q) => codes.has(q.code))) {
     const [x, y] = map.proj([pt.lat, pt.lon]);
-    gP.append(s('circle', { class: 'pt', cx: x.toFixed(1), cy: y.toFixed(1), r: 3, style: `fill:${pt.status === 'accepted' || pt.status === 'approved' || pt.status === 'processed' ? 'var(--st-good)' : 'var(--st-warning)'}` }));
+    const fresh = seenPoints && !seenPoints.has(pointKey(pt)); // arrived since the last update: pulses for a few seconds
+    gP.append(s('circle', { class: 'pt' + (fresh ? ' new' : ''), cx: x.toFixed(1), cy: y.toFixed(1), r: 3, style: `fill:${pt.status === 'accepted' || pt.status === 'approved' || pt.status === 'processed' ? 'var(--st-good)' : 'var(--st-warning)'}` }));
   }
   map.layers = { b: gB, p: gP, l: gL };
   gP.style.display = $('#lyrPoints').checked ? '' : 'none';
@@ -224,8 +289,9 @@ function renderMap(fit) {
   if (fit || !map.view) setView(fitBox(map.fit));
   else setView(map.view);
   put($('#mapLegend'),
+    h('span', { class: 'muted' }, 'Floor area covered:'),
     h('span', { class: 'key' }, h('span', { class: 'sw', style: 'background:transparent;border:1px solid var(--axis)' }), 'No photos yet'),
-    COMP_KEYS.map(([c, t]) => h('span', { class: 'key' }, h('span', { class: 'sw', style: `background:${c}` }), t)),
+    compKeys().map(([c, t]) => h('span', { class: 'key' }, h('span', { class: 'sw', style: `background:${c}` }), t)),
     h('span', { class: 'key' }, h('span', { class: 'sw', style: 'background:var(--off);border:1px solid var(--grid)' }), 'Off limits'),
     h('span', { class: 'key' }, h('span', { class: 'dot', style: 'background:var(--st-good)' }), 'Photo or scan accepted'),
     h('span', { class: 'key' }, h('span', { class: 'dot', style: 'background:var(--st-warning)' }), 'Waiting for review'));
@@ -309,11 +375,12 @@ function focusBuilding(b) {
 
 function buildingTip(b) {
   if (b.restricted) return [...tipValue(b.name, 'Off limits for photos')];
-  const out = tipValue(b.spaces ? `${pct(b.completion)} complete` : 'No photos yet', b.name + (b.ref ? ` (${b.ref})` : ''));
+  const fa = b.floorArea;
+  const out = tipValue(b.spaces ? `${pct(b.completion)} of its floor area` : 'No photos yet', b.name + (b.ref ? ` (${b.ref})` : ''));
   if (b.spaces) {
-    out.push(tipRow(`${b.good} of ${b.plan.spaces} planned spaces good · best: ${bandForScore(b.best).label}`));
+    out.push(tipRow(`About ${fmtArea(b.covered)} of ${fmtArea(fa.area)} · ${b.spaces} space${b.spaces === 1 ? '' : 's'}, ${b.good} Good · best: ${bandForScore(b.best).label}`));
     out.push(tipRow(`${fmt(b.photos)} photos accepted${b.pending ? `, ${fmt(b.pending)} waiting` : ''} · ${b.builds} splat${b.builds === 1 ? '' : 's'}`));
-  } else out.push(tipRow(`Plan: ${b.plan.spaces} spaces`));
+  } else out.push(tipRow(`${fmtArea(fa.area)} of floor: ${fa.floors} floor${fa.floors === 1 ? '' : 's'}${fa.guessed ? ' (guessed)' : ''} × ${fmtArea(fa.footprint)}`));
   return out;
 }
 
@@ -360,21 +427,31 @@ function overviewPanel() {
 
 function buildingPanel(b) {
   const sp = spacesOf(b.code).sort((a, c) => c.score - a.score);
-  const input = h('input', { type: 'number', min: 0, max: 500, value: String(b.plan.spaces), 'aria-label': 'Planned spaces' });
-  const rule = b.plan.set ? `set by the club; the default is ${b.plan.default}` : `entrance + ${b.plan.perFloor} per floor × ${b.plan.floors} floors${b.plan.guessed ? ' (floors guessed)' : ' (floors from OpenStreetMap)'}`;
+  const fa = b.floorArea;
+  const input = h('input', { type: 'number', min: 1, max: 60, value: String(fa.floors), 'aria-label': 'Floors' });
+  const rule = fa.set ? 'set by the club' : fa.guessed ? 'guessed: OpenStreetMap doesn’t say' : 'from OpenStreetMap';
+  const saveFloors = async (floors) => {
+    await api('/api/campus/floors', { code: b.code, floors }).catch((e) => alert(e.message));
+    await load();
+  };
   return [
     h('div', { style: 'display:flex;justify-content:space-between;align-items:center;gap:8px' }, h('span', { class: 'kicker' }, `${b.campus}${b.ref ? ` · ${b.ref}` : ''}`), h('button', { class: 'tbtn', onclick: () => select(null, null) }, 'Back to campus')),
     h('h3', {}, b.name),
     b.restricted ? h('p', { class: 'muted' }, 'Off limits: the club doesn’t photograph this building.') : [
-      h('div', { style: 'display:flex;align-items:baseline;gap:10px;flex-wrap:wrap' }, h('span', { class: 'big' }, pct(b.completion)), h('span', { class: 'muted small' }, `complete · ${b.credit.toFixed(1)} of ${b.plan.spaces} planned spaces' worth`)),
+      h('div', { style: 'display:flex;align-items:baseline;gap:10px;flex-wrap:wrap' }, h('span', { class: 'big' }, pct(b.completion)), h('span', { class: 'muted small' }, `of its floor area · about ${fmtArea(b.covered)} of ${fmtArea(fa.area)}`)),
       h('div', { class: 'meter' }, h('div', { style: `width:${Math.max(b.completion > 0 ? 2 : 0, b.completion * 100)}%` })),
-      h('div', { class: 'plan' }, 'Plan:', input, 'spaces', h('button', {
-        class: 'tbtn', onclick: async () => {
-          await api('/api/campus/plan', { code: b.code, spaces: input.value }).catch((e) => alert(e.message));
-          await load();
-        },
-      }, 'Save'), b.plan.set ? h('button', { class: 'tbtn', onclick: async () => { await api('/api/campus/plan', { code: b.code, spaces: null }); await load(); } }, 'Reset') : null, h('span', {}, `(${rule})`)),
+      h('div', { class: 'plan' }, 'Floors:', input, h('button', { class: 'tbtn', onclick: () => saveFloors(input.value) }, 'Save'),
+        fa.set ? h('button', { class: 'tbtn', onclick: () => saveFloors(null) }, 'Reset') : null,
+        h('span', {}, `(${rule}) × ${fmtArea(fa.footprint)} footprint${fa.footprintGuessed ? ' (guessed)' : ''}`)),
       h('p', { class: 'muted small', style: 'margin:0' }, `${fmt(b.photos)} photos accepted${b.pending ? ` · ${fmt(b.pending)} waiting for review` : ''} · ${b.scans} scan${b.scans === 1 ? '' : 's'} · ${b.builds} splat${b.builds === 1 ? '' : 's'} built${b.jobs ? ` · ${b.jobs} in the queue` : ''}`),
+      b.byFloor.length ? [
+        h('h2', { style: 'margin-top:6px' }, 'Floor by floor'),
+        h('div', { class: 'floors' }, b.byFloor.map((f) => [
+          h('span', {}, f.floor ? `Floor ${f.floor}` : 'Floor not given'),
+          h('span', { class: 'fb', title: `${pct(f.share)} of a ${fmtArea(fa.footprint)} floor` }, h('i', { style: `width:${Math.max(f.share > 0 ? 2 : 0, f.share * 100)}%` })),
+          h('span', { class: 'n' }, `${pct(f.share)} · ${f.spaces} space${f.spaces === 1 ? '' : 's'}`)])),
+        h('p', { class: 'muted small', style: 'margin:0' }, 'Each floor’s share is of the footprint. Where on a floor a photo was taken isn’t known yet: members tag the floor and room, not a spot.'),
+      ] : null,
       h('h2', { style: 'margin-top:6px' }, `Spaces (${sp.length})`),
       sp.length
         ? h('div', { class: 'rows' }, sp.map((x) => h('div', { class: 'srow', tabindex: 0, onclick: () => select(b.code, x.key), onkeydown: (e) => e.key === 'Enter' && select(b.code, x.key) },
@@ -390,8 +467,24 @@ function buildingPanel(b) {
 const spaceLine = (x) => [
   x.photos.accepted ? `${x.photos.accepted} photos` : null, x.photos.pending ? `${x.photos.pending} waiting` : null,
   x.scans.length ? `${x.scans.length} scan${x.scans.length === 1 ? '' : 's'}` : null, x.builds.length ? `${x.builds.length} built` : null, x.jobs.length ? `${x.jobs.length} in the queue` : null,
-  `${S.data.model.kinds[x.kind].label.toLowerCase()}`,
+  `${S.data.model.sizes[x.size].label.toLowerCase()}, ${x.areaSource === 'measured' ? 'measured ' : '~'}${fmtArea(x.area)}`,
 ].filter(Boolean).join(' · ');
+
+/** A space's size: the floor area it counts for in its building, and which photo rule applies. */
+function sizeEditor(x) {
+  const sizes = S.data.model.sizes;
+  const auto = x.sizeSet ? 'Not set: guess from its name or a scan' : x.areaSource === 'measured' ? `Measured by its scan: ${fmtArea(x.area)}` : `Guessed from its name: ${sizes[x.size].label} (~${fmtArea(sizes[x.size].area)})`;
+  const sel = h('select', {
+    'aria-label': 'Size of this space',
+    onchange: async () => {
+      await api('/api/campus/size', { key: x.key, size: sel.value || null }).catch((e) => alert(e.message));
+      await load();
+    },
+  }, h('option', { value: '' }, auto), Object.entries(sizes).map(([k, v]) => h('option', { value: k }, `${v.label} (~${fmtArea(v.area)}: ${v.hint})`)));
+  sel.value = x.sizeSet ? x.size : '';
+  return h('div', { class: 'plan' }, 'Size:', sel,
+    h('span', {}, `counts for about ${fmtArea(x.covered)} of its ${fmtArea(x.area)} so far (all of it at Good)`));
+}
 
 function spacePanel(x) {
   if (!x) return overviewPanel();
@@ -405,6 +498,7 @@ function spacePanel(x) {
     h('div', { style: 'display:flex;align-items:center;gap:10px;flex-wrap:wrap' }, h('span', { class: 'big' }, String(x.score)), h('span', { class: 'muted small' }, '/ 100'), chip(b)),
     h('p', { class: 'small', style: 'margin:0' }, b.means),
     h('p', { class: 'muted small', style: 'margin:0' }, `${x.source === 'built' && x.built && x.built.measured ? 'Measured on the splat already built, with photos held back from its training' : `Expected quality ${src}`}. ${S.data.model.kinds[x.kind].label}: about ${x.need.good} photos in one kind of light make it Good, ${x.need.excellent} Excellent.`),
+    sizeEditor(x),
     parts.length ? [h('h2', { style: 'margin-top:6px' }, 'How the number was reached'), h('table', { class: 'parts' }, parts.map(([label, v]) => h('tr', {}, h('td', {}, label), h('td', { class: 'v' }, v > 0 && label !== parts[0][0] ? `+${v}` : String(v)))))] : null,
     x.photos.accepted ? [
       h('h2', { style: 'margin-top:6px' }, 'Accepted photos by light'),
@@ -470,7 +564,7 @@ function renderCharts() {
 function qualityChart() {
   const card = $('#qualityCard'), m = S.data.model;
   const sp = S.building ? spacesOf(S.building) : campusSpaces();
-  const dots = sp.filter((x) => x.photos.accepted > 0);
+  const dots = sp.filter((x) => x.photos.accepted + x.photos.pending > 0);
   const builds = sp.flatMap((x) => x.builds.map((bd) => ({ ...bd, x })));
   const kinds = Object.entries(m.kinds);
   const legend = h('div', { class: 'legend' },
@@ -509,7 +603,7 @@ function qualityChart() {
       for (const d of dots) {
         const cx = x(Math.max(10, d.photos.effective)), cy = y(d.photos.score);
         svg.append(s('circle', { cx, cy, r: 4.5, style: `fill:${KIND_COLOR[d.kind]};stroke:var(--surface)`, 'stroke-width': 2 }));
-        svg.append(hit(cx, cy, [...tipValue(`${d.photos.score} expected from photos`, `${d.building} · ${placeName(d)}`), tipRow(`${d.photos.accepted} photos, ${Math.round(d.photos.effective)} counting light`), tipRow(bandForScore(d.photos.score).label)]));
+        svg.append(hit(cx, cy, [...tipValue(`${d.photos.score} expected from photos`, `${d.building} · ${placeName(d)}`), tipRow(`${d.photos.accepted} photos accepted${d.photos.pending ? ` + ${d.photos.pending} waiting` : ''}, ${Math.round(d.photos.effective)} counting light`), tipRow(bandForScore(d.photos.score).label)]));
       }
       for (const bd of builds) {
         // Filled: measured on held-back photos. Outlined: estimated from how the build went. (A filled
@@ -524,27 +618,32 @@ function qualityChart() {
       return svg;
     },
     () => tableOf(['Space', 'Kind', 'Photos', 'Expected from photos', 'Scan', 'Built', 'Overall'],
-      sp.map((x) => [`${x.building} · ${placeName(x)}`, m.kinds[x.kind].label, String(x.photos.accepted), x.photos.accepted ? String(x.photos.score) : '–', x.scanScore ? String(x.scanScore) : '–', x.built ? `${x.built.score} ${x.built.measured ? 'measured' : 'estimated'}` : '–', `${x.score} ${bandForScore(x.score).label}`]), [2, 3, 4, 5]),
+      sp.map((x) => [`${x.building} · ${placeName(x)}`, m.kinds[x.kind].label, String(x.photos.accepted + x.photos.pending), x.photos.accepted + x.photos.pending ? String(x.photos.score) : '–', x.scanScore ? String(x.scanScore) : '–', x.built ? `${x.built.score} ${x.built.measured ? 'measured' : 'estimated'}` : '–', `${x.score} ${bandForScore(x.score).label}`]), [2, 3, 4, 5]),
     legend);
 }
 
-/** Started buildings, ranked by completion. */
+/** Started buildings, ranked by the share of their floor area covered. */
 function rankChart() {
   const card = $('#rankCard');
-  const bs = campusBuildings().filter((b) => !b.restricted && b.spaces > 0).sort((a, b) => b.completion - a.completion || b.credit - a.credit).slice(0, 12);
-  frame(card, 'rank', 'Buildings by completion', `How much of each building’s plan has data good enough for a good splat (${S.campus}, started buildings).`,
+  const bs = campusBuildings().filter((b) => !b.restricted && b.spaces > 0).sort((a, b) => b.completion - a.completion || b.covered - a.covered).slice(0, 12);
+  // Real buildings fill up slowly, so the bars run to a round share just above the leader, said in the title.
+  const top = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1].find((v) => v >= Math.max(0, ...bs.map((b) => b.completion))) || 1;
+  frame(card, 'rank', 'Buildings by floor area covered', `The share of each building’s floor area its spaces cover (${S.campus}, started buildings). Bars run from 0 to ${pct(top)}.`,
     () => {
       if (!bs.length) return empty('No building on this campus has photos or splats yet.');
-      const W = width(card, 300), row = 30, labelW = Math.min(190, W * 0.38), valueW = 92, H = bs.length * row + 6;
+      const W = width(card, 300), row = 30, labelW = Math.min(190, W * 0.38), valueW = 112, H = bs.length * row + 22;
       const bw = W - labelW - valueW;
-      const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': 'Buildings ranked by completion' });
-      svg.append(s('line', { class: 'axisline', x1: labelW, x2: labelW, y1: 0, y2: H }));
+      const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': `Buildings ranked by floor area covered, bars from 0 to ${pct(top)}` });
+      svg.append(s('line', { class: 'axisline', x1: labelW, x2: labelW, y1: 0, y2: H - 16 }));
+      svg.append(s('line', { class: 'gridline', x1: labelW + bw, x2: labelW + bw, y1: 0, y2: H - 16 }));
+      svg.append(s('text', { x: labelW, y: H - 3, 'text-anchor': 'middle' }, '0'));
+      svg.append(s('text', { x: labelW + bw, y: H - 3, 'text-anchor': 'middle' }, pct(top)));
       bs.forEach((b, i) => {
-        const y0 = i * row + 8, len = Math.max(b.completion > 0 ? 3 : 0, b.completion * bw);
+        const y0 = i * row + 8, len = Math.max(b.completion > 0 ? 3 : 0, (b.completion / top) * bw);
         const name = b.name.length > 28 ? b.name.slice(0, 27) + '…' : b.name;
         svg.append(s('text', { x: labelW - 8, y: y0 + 11, 'text-anchor': 'end', style: `fill:${S.building === b.code ? 'var(--text)' : 'var(--ink-muted)'}` }, name));
         svg.append(s('path', { d: barPath(labelW, y0, len, 14), style: 'fill:var(--cat-1)' }));
-        svg.append(s('text', { x: labelW + len + 6, y: y0 + 11 }, `${pct(b.completion)} · ${b.good}/${b.plan.spaces}`));
+        svg.append(s('text', { x: labelW + len + 6, y: y0 + 11 }, `${pct(b.completion)} · ${fmtArea(b.covered)}`));
         svg.append(s('rect', {
           class: 'hit', x: 0, y: y0 - 7, width: W, height: row, tabindex: 0,
           onpointermove: (e) => showTip(e, ...buildingTip(b)), onpointerleave: hideTip, onclick: () => select(b.code, null, true), onkeydown: (e) => e.key === 'Enter' && select(b.code, null, true),
@@ -552,7 +651,7 @@ function rankChart() {
       });
       return svg;
     },
-    () => tableOf(['Building', 'Complete', 'Good spaces', 'Planned', 'Photos', 'Splats'], bs.map((b) => [b.name, pct(b.completion), String(b.good), String(b.plan.spaces), fmt(b.photos), String(b.builds)]), [1, 2, 3, 4, 5]));
+    () => tableOf(['Building', 'Floor area covered', 'Covered', 'Floor area', 'Spaces', 'Good', 'Photos', 'Splats'], bs.map((b) => [b.name, pct(b.completion), fmtArea(b.covered), fmtArea(b.floorArea.area), String(b.spaces), String(b.good), fmt(b.photos), String(b.builds)]), [1, 2, 3, 4, 5, 6, 7]));
 }
 
 /** Accepted photos per light slot: buildings (or a building's spaces) against morning…night. */
@@ -643,7 +742,7 @@ function renderTable() {
   let bs = all.filter((b) => (S.show === 'all' ? true : S.show === 'started' ? b.spaces > 0 && !b.restricted : S.show === 'open' ? !b.restricted : b.restricted))
     .filter((b) => !q || b.name.toLowerCase().includes(q) || (b.ref || '').toLowerCase().includes(q));
   const key = S.sort.key, dir = S.sort.dir;
-  const val = { name: (b) => b.name.toLowerCase(), completion: (b) => b.completion, good: (b) => b.good, plan: (b) => b.plan.spaces, best: (b) => b.best, photos: (b) => b.photos, pending: (b) => b.pending, builds: (b) => b.builds, contributors: (b) => b.contributors }[key];
+  const val = { name: (b) => b.name.toLowerCase(), completion: (b) => b.completion, covered: (b) => b.covered, floors: (b) => b.floorArea.floors, good: (b) => b.good, best: (b) => b.best, photos: (b) => b.photos, pending: (b) => b.pending, builds: (b) => b.builds, contributors: (b) => b.contributors }[key];
   bs = bs.sort((a, b) => (val(a) < val(b) ? -dir : val(a) > val(b) ? dir : a.name.localeCompare(b.name)));
   const th = (label, k, num) => h('th', { class: 'sortable', style: num ? 'text-align:right' : null, 'aria-sort': S.sort.key === k ? (dir > 0 ? 'ascending' : 'descending') : 'none', onclick: () => { S.sort = { key: k, dir: S.sort.key === k ? -dir : k === 'name' ? 1 : -1 }; renderTable(); } }, label + (S.sort.key === k ? (dir > 0 ? ' ↑' : ' ↓') : ''));
   const search = h('input', { type: 'search', value: S.search, placeholder: 'Filter by name', style: 'font:inherit;font-size:0.85rem;color:var(--text);background:var(--surface-2);border:1px solid var(--line-2);border-radius:8px;padding:5px 10px', oninput: (e) => { S.search = e.target.value; renderTable(); setTimeout(() => { const i = $('#tableCard input[type=search]'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); } });
@@ -652,11 +751,13 @@ function renderTable() {
       search,
       h('div', { class: 'seg' }, [['started', 'Started'], ['open', 'Can be photographed'], ['off', 'Off limits'], ['all', 'All']].map(([k, l]) => h('button', { class: S.show === k ? 'on' : '', onclick: () => { S.show = k; renderTable(); } }, l)))),
     bs.length ? h('div', { class: 'tablev', style: 'max-height:460px' }, h('table', { class: 'data' },
-      h('thead', {}, h('tr', {}, th('Building', 'name'), th('Complete', 'completion'), th('Good spaces', 'good', true), th('Planned', 'plan', true), th('Best space', 'best'), th('Photos', 'photos', true), th('Waiting', 'pending', true), th('Splats', 'builds', true), h('th', {}, 'Light'), th('Members', 'contributors', true))),
+      h('thead', {}, h('tr', {}, th('Building', 'name'), th('Floor area covered', 'completion'), th('Covered', 'covered', true), th('Floors', 'floors', true), th('Good spaces', 'good', true), th('Best space', 'best'), th('Photos', 'photos', true), th('Waiting', 'pending', true), th('Splats', 'builds', true), h('th', {}, 'Light'), th('Members', 'contributors', true))),
       h('tbody', {}, bs.map((b) => h('tr', { class: 'click' + (b.restricted ? ' off' : ''), tabindex: 0, onclick: () => !b.restricted && select(b.code, null, true), onkeydown: (e) => e.key === 'Enter' && !b.restricted && select(b.code, null, true) },
         h('td', {}, b.name, b.ref && b.ref.length >= 2 ? h('span', { class: 'muted' }, ` ${b.ref}`) : null),
-        h('td', {}, b.restricted ? 'Off limits' : [h('span', { class: 'tbar' }, h('i', { style: `width:${b.completion * 100}%` })), pct(b.completion)]),
-        h('td', { class: 'n' }, String(b.good)), h('td', { class: 'n' }, String(b.plan.spaces)),
+        h('td', {}, b.restricted ? 'Off limits' : [h('span', { class: 'tbar' }, h('i', { style: `width:${Math.max(b.completion > 0 ? 3 : 0, b.completion * 100)}%` })), pct(b.completion)]),
+        h('td', { class: 'n' }, b.restricted ? '–' : fmtArea(b.covered)),
+        h('td', { class: 'n', title: b.floorArea.set ? 'Set by the club' : b.floorArea.guessed ? 'Guessed: OpenStreetMap doesn’t say' : 'From OpenStreetMap' }, `${b.floorArea.floors}${b.floorArea.guessed ? '?' : ''}`),
+        h('td', { class: 'n' }, String(b.good)),
         h('td', {}, b.spaces ? chip(bandForScore(b.best)) : '–'),
         h('td', { class: 'n' }, fmt(b.photos)), h('td', { class: 'n' }, fmt(b.pending)), h('td', { class: 'n' }, String(b.builds)),
         h('td', {}, h('span', { class: 'mini', title: LIGHTS.map(([k, l]) => `${l}: ${b.light[k] || 0}`).join(', ') }, LIGHTS.map(([k]) => h('span', { style: `background:${heatColor(b.light[k] || 0) || 'transparent'};outline:1px solid var(--grid)` })))),
@@ -676,11 +777,14 @@ function renderHow() {
     h('p', {}, 'From a scan: the capture coach’s grade (it scores coverage, sharpness and light as you scan), less a little because a good scan can still fail to process.'),
     h('p', {}, 'From a splat already built: measured, when it was processed with Measure quality ticked on the dashboard. Every 12th photo was then held back from training, and the PSNR of the splat’s renders of those views against the photos sets the score (table below), less for photos COLMAP couldn’t place. Otherwise estimated: what its photos or scan promised, discounted when COLMAP placed fewer than 95% of the photos, when the reprojection error is above 1 pixel, or when it was trained with the quick preset. In the quality chart, measured splats are filled diamonds and estimated ones outlined.'),
     m.psnrStops ? h('div', { class: 'tablev', style: 'max-height:none' }, tableOf(['Measured PSNR', 'Score', 'Band'], m.psnrStops.map(([db, q]) => [`${db} dB`, String(q), chip(bandForScore(q))]), [1])) : null,
-    h('h3', {}, 'Completion'),
-    h('p', {}, 'Each building has a plan: how many spaces it should have before it counts as complete. By default that is the entrance plus 2 spaces per floor (3 in buildings over 4,000 m² of footprint), using the number of floors from OpenStreetMap where it is known and 2 where it isn’t. Change the plan on a building’s panel; 0 leaves a building out. A space counts fully once it reaches Good and partly before that, and a building is complete when its spaces add up to its plan. Campus coverage adds up every building that can be photographed.'),
+    h('h3', {}, 'How complete a building is'),
+    h('p', {}, `A building’s completion is the share of its floor area that its spaces cover. Its floor area is its footprint (from its outline on OpenStreetMap, or ${fmtArea(m.defaultFootprint)} where there is none) times its floors: OpenStreetMap’s count where it has one, otherwise 2 (marked with a ? in the table) until the club sets it on the building’s panel. Each space covers its own floor area in proportion to how close it is to Good: all of it at Good, half of it halfway there. A space’s area is measured from its scan’s outline when the splat was lined up with the phone’s AR tracking (and so is in metres). Otherwise it’s typical for its size, guessed from the space’s name until the club picks one on the space’s panel:`),
+    h('div', { class: 'tablev', style: 'max-height:none' }, tableOf(['Size', 'Counts for', 'For example', 'Photos for Good'], Object.values(m.sizes).map((v) => [v.label, fmtArea(v.area), v.hint, `about ${m.kinds[v.kind].good} (${m.kinds[v.kind].label.toLowerCase()})`]), [1, 3])),
+    h('p', {}, 'Offices, restrooms and rooms the club can’t enter count in a building’s floor area too, so a building whose public spaces are all done still shows well under 100%. A building’s panel also shows each floor’s share of the footprint. Where on a floor a photo was taken isn’t known: members tag the floor and room, not a spot.'),
+    h('p', {}, 'Photos waiting for review count straight away, so the map moves with every photo sent; rejecting one takes it off again. Start fresh counts only what arrives from then on (nothing is deleted, and Count everything again switches back). Live checks for new photos every 15 seconds and marks new map points as they arrive.'),
     h('p', {}, 'Off-limits buildings (residence halls, health, police and courts, children’s centers) are shown in dark grey and never count.'),
     h('h3', {}, 'What members see'),
-    h('p', {}, 'Publish to members sends a summary to the Campus map in the phone app: each space’s expected quality, its accepted photos in each kind of light, how many wait for review, and about how many more photos, in which light, would make it Good (counted with the same rules, so the phone says what this page says). Building plans go too, so the map is coloured the same. No member names and no GPS points are sent, and nothing in off-limits buildings. It also happens by itself a few seconds after you review photos on the Club page.'));
+    h('p', {}, 'Publish to members sends a summary to the Campus map in the phone app: each space’s expected quality and the floor area it counts for, its accepted photos in each kind of light, how many wait for review, and about how many more photos, in which light, would make it Good (counted with the same rules, so the phone says what this page says). Floor counts the club set go too, so the map is coloured the same. No member names and no GPS points are sent, and nothing in off-limits buildings. It also happens by itself a few seconds after you review photos, change a size or a floor count, and within a minute of new photos arriving while SplatStation runs.'));
 }
 
 // ------------------------------------------------------------------ publishing for members' phones
@@ -689,7 +793,7 @@ const PUBLISH_TIP = $('#publish').title;
 function renderPublished() {
   const p = S.data.published, e = S.data.publishError, el = $('#pubState');
   const failed = e && (!p || Date.parse(e.at) > Date.parse(p.at));
-  el.textContent = failed ? `Couldn’t publish: ${e.message}` : p ? `Members see ${p.spaces} space${p.spaces === 1 ? '' : 's'} from ${fmtWhen(p.at)}` : 'Not published to members yet';
+  el.textContent = failed ? `Couldn’t publish: ${e.message}` : p ? `Members see ${p.spaces} space${p.spaces === 1 ? '' : 's'} from ${fmtWhen(p.at)}${p.legacy ? ' (without sizes: run crowd/supabase-campus-2.sql)' : ''}` : 'Not published to members yet';
   el.classList.toggle('warn', !!failed);
   $('#publish').disabled = !S.data.club;
   $('#publish').title = S.data.club ? PUBLISH_TIP : 'Set up the club database on this PC (crowd.json) first.';
@@ -708,5 +812,5 @@ $('#publish').onclick = async () => {
   renderPublished();
 };
 
-$('#refresh').onclick = load;
+$('#refresh').onclick = () => load();
 load();

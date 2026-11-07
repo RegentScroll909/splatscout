@@ -1,4 +1,4 @@
-// Runs crowd/supabase-setup.sql, supabase-beta.sql and supabase-campus.sql on a local Postgres (PGlite, Postgres
+// Runs crowd/supabase-setup.sql, supabase-beta.sql, supabase-campus.sql and -campus-2.sql on a local Postgres (PGlite, Postgres
 // compiled to WebAssembly) with just enough of Supabase stubbed (roles, auth.uid(), storage tables), then checks
 // that the rules do what they say: who can add what, that points can only come from SplatStation, and so on.
 // Not part of `npm run check` (the project has no dependencies). To run it:
@@ -41,7 +41,10 @@ await run('supabase-beta.sql'); // safe to run again
 await run('supabase-campus.sql');
 const campusResult = (await run('supabase-campus.sql')).at(-1).rows[0]; // safe to run again; ends with a result row
 assert.deepEqual(campusResult, { result: 'SplatScout campus summary is installed', spaces: 0, plans: 0, member_rules: 2 });
-console.log('the scripts ran, and second runs of beta.sql and campus.sql were fine');
+await run('supabase-campus-2.sql');
+const campus2 = (await run('supabase-campus-2.sql')).at(-1).rows[0]; // safe to run again too
+assert.deepEqual(campus2, { result: 'SplatScout campus update 2 is installed', new_columns: 2 });
+console.log('the scripts ran, and second runs of beta.sql, campus.sql and campus-2.sql were fine');
 
 const A = '11111111-1111-4111-8111-111111111111', B = '22222222-2222-4222-8222-222222222222', C = '33333333-3333-4333-8333-333333333333';
 await db.exec(`insert into auth.users (id) values ('${A}'), ('${B}'), ('${C}');
@@ -210,6 +213,14 @@ ok(await as('service', ...upsert(spaceRow({ space_key: 'hayden-library|2|gone', 
 r = await as('service', `delete from public.campus_spaces where updated_at < now() - interval '1 hour'`);
 assert.equal(r.n, 1, 'only the old row goes');
 assert.equal((await as(A, 'select * from public.campus_spaces')).rows.length, 1);
+// supabase-campus-2.sql: each space's floor area, and the club's floor counts instead of planned spaces.
+ok(await as('service', ...upsert(spaceRow({ area: 400 }))), 'a space with the floor area it counts for');
+ok(await as('service', `insert into public.campus_plans (building_code, floors) values ('memorial-union', 3)`), 'a floor count, with no planned-spaces count');
+fails(await as('service', ...upsert(spaceRow({ space_key: 'hayden-library|9|d', area: 0 }))), 'an area of 0', /check/);
+fails(await as('service', `insert into public.campus_plans (building_code, floors) values ('old-main', 0)`), 'no floors at all', /check/);
+assert.deepEqual((await as(A, `select area from public.campus_spaces`)).rows, [{ area: 400 }]);
+assert.equal((await as(B, `select floors from public.campus_plans where building_code = 'memorial-union'`)).rows[0].floors, 3, 'members read floor counts');
+fails(await as(A, `update public.campus_plans set floors = 1`), 'a member changes a floor count', /permission denied/);
 pass('campus summary: members read it, strangers and the bare public key see nothing, only the secret key writes');
 
 // ---- the daily cap, bans, deleting your own data

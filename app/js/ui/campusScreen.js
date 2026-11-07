@@ -1,5 +1,5 @@
-// Campus (club beta): where the club still needs photos. A map of ASU buildings coloured by how complete the
-// club's photos of them are, the buildings near you, and for each space about how many more photos, in which
+// Campus (club beta): where the club still needs photos. A map of ASU buildings coloured by how much of their
+// floor area the club's photos cover, the buildings near you, and for each space about how many more photos, in which
 // light, would make a good splat, with a button that opens Snap already filled in. SplatStation works the
 // numbers out on the club PC and publishes them (data/campusmap.js); the colours follow the same rules as its
 // Campus page. The list of buildings under the map carries the same information without the map.
@@ -25,7 +25,8 @@ function s(tag, attrs = {}) {
   for (const [k, v] of Object.entries(attrs)) if (v != null && v !== false) el.setAttribute(k, v);
   return el;
 }
-const pct = (x) => (x > 0 && x < 0.01 ? '<1%' : `${Math.round(x * 100)}%`);
+const pct = CM.pctText; // "0.3%", "2.4%", "24%": small progress still shows
+const fmtArea = (m2) => `${Math.round(m2).toLocaleString()} m²`;
 const fmtDist = (m) => (m < 1 ? 'you’re here' : m < 1000 ? `${Math.max(10, Math.round(m / 10) * 10)} m` : `${(m / 1000).toFixed(1)} km`);
 const placeName = (x) => [x.floor && `Floor ${x.floor}`, x.room].filter(Boolean).join(' · ') || 'Unnamed';
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -46,7 +47,7 @@ function chip(x) {
 }
 
 /** A thin completion meter (fill on a darker step of the same blue). */
-const meter = (x) => h('div.cmeter', { role: 'meter', 'aria-valuenow': Math.round(x * 100), 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-label': 'Complete' }, h('div', { style: { width: `${Math.max(x > 0 ? 2 : 0, x * 100)}%` } }));
+const meter = (x) => h('div.cmeter', { role: 'meter', 'aria-valuenow': +(x * 100).toFixed(2), 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-label': 'Floor area covered' }, h('div', { style: { width: `${Math.max(x > 0 ? 2 : 0, x * 100)}%` } }));
 
 export async function campusScreen(root, { navigate, query }) {
   const settings = getSettings();
@@ -57,7 +58,7 @@ export async function campusScreen(root, { navigate, query }) {
   let alive = true;
   const status = h('div.status-line', h('span.status-dot.pending'), h('span.small', 'Loading the campus map…'));
   const seg = h('div.seg.campus-seg', { role: 'group', 'aria-label': 'Campus' });
-  const svg = s('svg', { id: 'cmap', role: 'img', 'aria-label': 'Map of the campus: buildings coloured by how complete the club’s photos of them are. The list of buildings below has the same information.' });
+  const svg = s('svg', { id: 'cmap', role: 'img', 'aria-label': 'Map of the campus: buildings coloured by how much of their floor area the club’s photos cover. The list of buildings below has the same information.' });
   const legend = h('div.c-legend');
   const mapCard = h('section.card.cmap-card',
     h('div.cmap-wrap', svg,
@@ -344,6 +345,7 @@ export async function campusScreen(root, { navigate, query }) {
   function renderLegend() {
     const key = (sw, text) => h('span.key', sw, text);
     mount(legend,
+      h('span.small.muted', 'Floor area covered:'),
       key(h('span.sw', { style: { background: 'transparent', border: '1px solid rgba(255,255,255,0.22)' } }), CM.BIN_LABELS[0]),
       CM.BIN_LABELS.slice(1).map((t, i) => key(h('span.sw', { style: { background: BIN_COLOR[i + 1] } }), t)),
       key(h('span.sw', { style: { background: 'var(--off)', border: '1px solid rgba(255,255,255,0.08)' } }), 'Off limits'),
@@ -400,7 +402,7 @@ export async function campusScreen(root, { navigate, query }) {
               const top = CM.closestToGood([b], { limit: 1 })[0];
               const tip = top ? ` · ${placeName(top.x)}: ~${top.x.need_good}${top.x.need_light ? ' ' + top.x.need_light : ''} photos to Good` : '';
               return h('button.c-row', { onclick: () => select(b.code, true) },
-                h('span.c-row-main', h('span.c-row-title', b.name), h('span.c-row-meta', `${fmtDist(dist)} · ${b.spaces.length ? `${pct(b.completion)} complete` : 'no photos yet'}${tip}`)),
+                h('span.c-row-main', h('span.c-row-title', b.name), h('span.c-row-meta', `${fmtDist(dist)} · ${b.spaces.length ? `${pct(b.completion)} covered` : 'no photos yet'}${tip}`)),
                 h('span.sw.big', { style: { background: BIN_COLOR[CM.completionBin(b)] || 'transparent' }, 'aria-hidden': 'true' }));
             }))
           : h('p.small.muted', `No ASU building that can be photographed within 700 m (GPS good to ${S.fix.acc} m).`)
@@ -424,12 +426,13 @@ export async function campusScreen(root, { navigate, query }) {
     return [
       head,
       h('h3', b.name),
-      h('div.c-big', h('span.big', pct(b.completion)), h('span.small.muted', `complete · ${b.good} of ${b.planned} planned space${b.planned === 1 ? '' : 's'} good`)),
+      h('div.c-big', h('span.big', pct(b.completion)), h('span.small.muted', `of its floor area · about ${fmtArea(b.covered)} of ${fmtArea(b.floorArea.area)}`)),
       meter(b.completion),
       h('p.small.muted', [
-        b.spaces.length ? `${sum('photos')} photos accepted` : `Plan: ${b.planned} space${b.planned === 1 ? '' : 's'}`, sum('pending') ? `${sum('pending')} waiting for review` : null,
+        b.spaces.length ? `${sum('photos')} photos accepted` : `${b.floorArea.floors} floor${b.floorArea.floors === 1 ? '' : 's'} of ${fmtArea(b.floorArea.footprint)}`, sum('pending') ? `${sum('pending')} waiting for review` : null,
         sum('builds') ? `${sum('builds')} splat${sum('builds') === 1 ? '' : 's'} built` : null, dist != null ? fmtDist(dist) + (dist >= 1 ? ' away' : '') : null,
       ].filter(Boolean).join(' · ')),
+      b.byFloor.length ? h('p.small.muted', 'By floor: ', b.byFloor.map((f) => `${f.floor ? `Floor ${f.floor}` : 'floor not given'} ${pct(f.share)}`).join(' · ')) : null,
       b.spaces.length
         ? [h('h4', `Spaces (${b.spaces.length})`), h('div.c-spaces', b.spaces.map((x) => spaceCard(b, x))),
             h('button.btn.small.ghost', { onclick: () => navigate(snapUrl(b, { floor: '', room: '' })) }, icon('camera'), 'Photos of another space here')]
@@ -494,7 +497,7 @@ export async function campusScreen(root, { navigate, query }) {
             h('span.sw.big', { style: b.restricted ? { background: 'var(--off)' } : { background: BIN_COLOR[CM.completionBin(b)] || 'transparent', border: CM.completionBin(b) ? '0' : '1px solid rgba(255,255,255,0.22)' }, 'aria-hidden': 'true' }),
             h('span.c-row-main',
               h('span.c-row-title', b.name + (b.ref && b.ref.length >= 2 ? ` (${b.ref})` : '')),
-              h('span.c-row-meta', b.restricted ? 'Off limits' : b.spaces.length ? `${pct(b.completion)} complete · ${b.good} of ${b.planned} spaces good · best ${bandOf({ score: b.best }).label}` : `No photos yet · plan: ${b.planned} spaces`)),
+              h('span.c-row-meta', b.restricted ? 'Off limits' : b.spaces.length ? `${pct(b.completion)} of its floor area · ${b.spaces.length} space${b.spaces.length === 1 ? '' : 's'}, ${b.good} Good · best ${bandOf({ score: b.best }).label}` : `No photos yet · ${fmtArea(b.floorArea.area)} of floor`)),
             b.restricted ? null : icon('chevron', 'dim'))))
         : h('p.small.muted', S.show === 'started' ? `No building on the ${S.campus} campus has photos yet.` : 'No buildings match.'));
   }

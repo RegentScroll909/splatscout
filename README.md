@@ -149,8 +149,8 @@ what is still open (permission, consent wording, faces); it also has a five-minu
   splat built from one lighting condition is much cleaner than one built from a mix.
 - **Missions:** the club asks for a view in a kind of light ("Hayden lobby in evening light, +3 each"). A mission
   asking for evening light only scores in the evening.
-- **Campus map** (Club → *Campus map*): ASU's buildings coloured by how complete the club's photos of them are
-  (one blue, darker = less done; dark grey = off limits), with you on it when location is allowed. Under the map:
+- **Campus map** (Club → *Campus map*): ASU's buildings coloured by how much of their floor area the club's photos
+  cover (one blue, darker = less done; dark grey = off limits), with you on it when location is allowed. Under the map:
   the buildings *near you*, the spaces that are *good to shoot now* (they need the light it is now) and the ones
   closest to Good. Tap a building for its spaces: each has its quality band, its accepted photos in each kind of
   light, and "about 33 more photos in evening light (4–8 pm) would make it Good"; *Take photos here* opens Snap
@@ -170,7 +170,8 @@ what is still open (permission, consent wording, faces); it also has a five-minu
 - **Set up** (once, in the Supabase SQL Editor, each in a *new* query): turn on anonymous sign-ins, run
   [`crowd/supabase-setup.sql`](crowd/supabase-setup.sql), then [`crowd/supabase-beta.sql`](crowd/supabase-beta.sql),
   then [`crowd/supabase-campus.sql`](crowd/supabase-campus.sql) (the Campus map's summary: members read it, only
-  SplatStation writes it). Each ends with a one-row result saying it was installed; "Success. No rows returned"
+  SplatStation writes it) and [`crowd/supabase-campus-2.sql`](crowd/supabase-campus-2.sql) (each space's floor
+  area and the floor counts the club sets; without it phones use typical sizes). Each ends with a one-row result saying it was installed; "Success. No rows returned"
   means an older saved query ran instead. The project URL and publishable key are in `app/js/data/crowd.js`;
   make invite codes on SplatStation's Club page.
 
@@ -254,29 +255,41 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   usual way. The page also makes **missions**, **invite codes** (who can join and how many times), pauses, renames
   or removes members (removing deletes everything they sent), and edits the list of off-limits buildings.
 - **Campus map** (dashboard header, or `/campus.html`, this PC only): every ASU building on a map, coloured by
-  how complete it is, with the GPS points where photos and scans were taken. Click a building for its spaces (each
-  room or area members tagged), and a space for how good a splat to expect, how that number was reached, its photos
-  by light, the splats built from it with a link to the viewer, and what would make it better; *Ask members for
-  photos* turns that into a mission. Above the map: the spaces ready for a good splat, campus coverage, buildings
-  started, photos, splats and members. Below it, each with a table view: **How good a splat to expect** (the rule of
-  thumb for rooms, hallways and large spaces against photo count, with the club's spaces and finished splats on
-  it), **Buildings by completion**, **Light coverage** (photos per building, or per space, in each kind of light)
-  and **Photos sent per day**, then a sortable table of every building and *How the numbers work*.
+  how much of its floor area is covered, with the GPS points where photos and scans were taken. Click a building
+  for its floors and spaces (each room or area members tagged), and a space for how good a splat to expect, how
+  that number was reached, its size, its photos by light, the splats built from it with a link to the viewer, and
+  what would make it better; *Ask members for photos* turns that into a mission. Above the map: the spaces ready
+  for a good splat, the campus floor area covered, buildings started, photos, splats and members. Below it, each
+  with a table view: **How good a splat to expect** (the rule of thumb for rooms, hallways and large spaces against
+  photo count, with the club's spaces and finished splats on it), **Buildings by floor area covered**, **Light
+  coverage** (photos per building, or per space, in each kind of light) and **Photos sent per day**, then a
+  sortable table of every building and *How the numbers work*.
 
   The numbers are estimates, and the page says so. A space's expected quality comes from its photos (in a room
   about 125 photos in one kind of light make it Good and 208 Excellent; hallways and big lobbies need more; mixed
-  light counts less), from a scan's grade, or from a finished splat (what it promised, less for photos COLMAP
-  couldn't place, a high reprojection error or quick training). A building's completion counts its spaces against
-  a plan: by default the entrance plus 2 spaces per floor (3 in big buildings), floors from OpenStreetMap where
-  known; change it on the building's panel. Your existing splats are filed under their building by name
-  ("Schwada Building" counts for Schwada Classroom Office Building).
+  light counts less), from a scan's grade, or from a finished splat (measured, or what it promised less for photos
+  COLMAP couldn't place, a high reprojection error or quick training). A building's completion is the share of its
+  floor area (footprint from OpenStreetMap × floors) that its spaces cover: each space counts for its own floor
+  area, in proportion to how close it is to Good. A space's area is measured from its scan's outline when the
+  splat was lined up with the phone's AR tracking; otherwise it's typical for its size (small room 20 m², room 60,
+  big room 120, hallway 150, lobby 400, very large space 1,000), guessed from its name until you pick one on the
+  space's panel. Floors come from OpenStreetMap, or 2 until you set them on the building's panel. So one small room
+  in a four-floor library is a fraction of a percent, and the building's panel shows each floor's share. Offices and
+  rooms the club can't enter count too, so a building whose public spaces are all done still shows well under 100%.
+  Photos waiting for review count straight away (rejecting one takes it off), and **Live** checks for new ones every
+  15 seconds and rings each new point on the map, so the map moves with every photo sent. **Start fresh** counts
+  only what arrives from then on, to show a building fill up photo by photo; nothing is deleted, and *Count
+  everything again* switches back. Your existing splats are filed under their building by name ("Schwada
+  Building" counts for Schwada Classroom Office Building).
 
-  **Publish to members** (top of the page) sends the phones' Campus map a summary: each space's expected quality,
-  its accepted photos per kind of light, how many wait for review, and about how many more photos, in which light,
-  would make it Good, plus the building plans you set. The count is worked out with the same rules (so the phone
-  and this page agree, mixed light and scans included). No member names, no GPS points, nothing in off-limits
-  buildings. It also publishes by itself a few seconds after you review photos on the Club page. Needs
-  `crowd/supabase-campus.sql` run once in the Supabase SQL editor.
+  **Publish to members** (top of the page) sends the phones' Campus map a summary: each space's expected quality
+  and floor area, its accepted photos per kind of light, how many wait for review, and about how many more photos,
+  in which light, would make it Good, plus the floor counts you set. The count is worked out with the same rules (so
+  the phone and this page agree, mixed light and scans included). No member names, no GPS points, nothing in
+  off-limits buildings. It also publishes by itself a few seconds after you review photos, change a size or a floor
+  count, or start fresh, and within a minute of new photos arriving while SplatStation runs. Needs
+  `crowd/supabase-campus.sql` run once in the Supabase SQL editor, and `crowd/supabase-campus-2.sql` for sizes and
+  floor counts (until then it publishes without them).
 
 **Quality presets** (choose on the dashboard; you can re-train any finished job with a different preset):
 
@@ -397,11 +410,12 @@ Tested on this PC:
   SplatStation's first opinions on photos, points for the first photo of a room, a new light and missions with
   the daily limit, a rejected photo deleted everywhere, a capture built from accepted photos, members, invites,
   and refusing requests from the Wi-Fi), and the campus view (expected quality from photos, mixed light, scans and
-  finished builds; building plans and completion; photos, splats and queued captures of one room joined into one
+  finished builds; photos waiting for review counted; floor area covered, floor by floor, with sizes guessed, set
+  or measured from a scan; a fresh start and back; photos, splats and queued captures of one room joined into one
   space; campus totals, map points and daily activity), and the phone's campus map (exact photo counts to Good,
   mixed light and scans included; the published summary leaving out names, GPS and off-limits buildings; never
   publishing when the database couldn't be read; members only; building completion on the phone equal to the
-  Campus page's; stale rows removed on the next publish; the last copy kept offline). They run against an in-memory stand-in for Supabase
+  Campus page's, with or without supabase-campus-2.sql; stale rows removed on the next publish; the last copy kept offline). They run against an in-memory stand-in for Supabase
   (`tools/fake-supabase.mjs`; `tools/fake-supabase-server.mjs` serves it so the phone app and SplatStation can be
   tried together; `--demo` fills it with made-up members and photos to try the Campus map). The database rules themselves are tested on a real Postgres with `tools/sql-test.mjs`
   (needs `npm install --no-save @electric-sql/pglite`): who can add what, that points only come from
@@ -496,7 +510,7 @@ app/js/data/      IndexedDB storage, settings, ZIP export, campus (ASU buildings
 app/js/ui/        screens
 app/data/         asu-buildings.json (from OpenStreetMap: node tools/asu-buildings.mjs refreshes it)
 crowd/            supabase-setup.sql + supabase-beta.sql (the club database: tables, private buckets, rules, views),
-                  supabase-campus.sql (the summary behind the phone's Campus map),
+                  supabase-campus.sql + supabase-campus-2.sql (the summary behind the phone's Campus map),
                   ADVISOR-BRIEF.md
 tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs, asu-buildings.mjs,
                   fake-supabase.mjs / fake-supabase-server.mjs (stand-in database), sql-test.mjs (database rules on Postgres)

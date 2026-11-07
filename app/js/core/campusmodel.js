@@ -10,8 +10,9 @@
 //   built    a finished splat: measured when SplatStation held photos back from its training (PSNR on
 //            them), otherwise what its photos promised, discounted for photos COLMAP couldn't place,
 //            a poor reprojection error, or the quick training preset
-// A building's completion counts its spaces against a plan (how many spaces it should have), with a
-// space counting fully once it reaches Good.
+// A building's completion is the share of its floor area (footprint × floors) that its spaces cover: each
+// space covers its own floor area (measured by a scan, set by the club, or typical for its size) in
+// proportion to how close it is to Good. So one small room in a big library is a fraction of a percent.
 
 import { LIGHT_SLOTS } from './clubrules.js';
 
@@ -46,6 +47,32 @@ export function kindOf(room = '') {
   if (/hall ?way|corridor|walkway|passage|stair/i.test(room)) return 'hallway';
   if (/lobby|atrium|commons|concourse|reading room|library|gallery|court ?yard|ballroom|auditorium|\bgym|\bhall\b/i.test(room)) return 'large';
   return 'room';
+}
+
+/**
+ * Sizes of space, for working out how much of a building is covered: a typical floor area (m²) and the kind
+ * of space (which sets how many photos it needs). A space's size is guessed from its name until the club
+ * sets it, or a scan measures its floor.
+ */
+export const SIZES = {
+  small: { label: 'Small room', hint: 'study room, office', area: 20, kind: 'room' },
+  room: { label: 'Room', hint: 'seminar room, lab', area: 60, kind: 'room' },
+  big: { label: 'Big room', hint: 'classroom, studio', area: 120, kind: 'room' },
+  hallway: { label: 'Hallway', hint: 'corridor, stairs', area: 150, kind: 'hallway' },
+  large: { label: 'Large open space', hint: 'lobby, atrium', area: 400, kind: 'large' },
+  huge: { label: 'Very large space', hint: 'reading room, ballroom', area: 1000, kind: 'large' },
+};
+/**
+ * The size a space's name suggests. Kinds and sizes share the names 'room', 'hallway' and 'large'; a name can
+ * also say small ("study room", "office"), big ("classroom", "lecture") or very large ("reading room",
+ * "auditorium", a name ending in "ballroom").
+ */
+export function sizeOf(room = '') {
+  const kind = kindOf(room);
+  if (kind === 'large') return /reading room|auditorium|\bgym|ballroom$/i.test(room.trim()) ? 'huge' : 'large';
+  if (kind === 'room' && /study room|office|closet|restroom|bathroom|\bpods?\b|booth/i.test(room)) return 'small';
+  if (kind === 'room' && /class ?room|lecture|studio|computer lab/i.test(room)) return 'big';
+  return kind;
 }
 
 /** Expected quality from `n` photos taken in one kind of light, in a space of this kind. */
@@ -169,11 +196,12 @@ export function builtEstimate(b, kind = 'room') {
 
 /**
  * A space's expected quality from everything known about it, with what would improve it.
- * @param {object} s {room, photos: {byLight, devices, pending, sinceBuild}, scans: [], builds: []}
+ * @param {object} s {room, kind?, photos: {byLight, devices, pending, sinceBuild}, scans: [], builds: []}
+ *   (kind: from the space's size when the club set one, otherwise guessed from its name)
  * @param {{advice?: boolean}} [o] advice: false skips the advice (photosNeeded tries many photo counts)
  */
 export function spaceEstimate(s, { advice = true } = {}) {
-  const kind = kindOf(s.room);
+  const kind = KINDS[s.kind] ? s.kind : kindOf(s.room);
   const ph = photoEstimate(s.photos || {}, kind);
   const sc = scanEstimate(s.scans || []);
   const builds = (s.builds || []).map((b) => ({ ...b, ...builtEstimate(b, kind) }));
@@ -222,7 +250,7 @@ function advise(s, { score, ph, sc, built, predicted, pending, sinceBuild }) {
   }
   if (ph.n && ph.share < 0.7) out.push(`Photos are spread over several kinds of light. Build from the ${ph.dominant} ones, or add more in that light.`);
   if (sc.score && sc.grade && /[CDF]/.test(sc.grade)) out.push(`The scan graded ${sc.grade}: fill the gaps the coach flagged, or add photos.`);
-  if (pending) out.push(`${pending} photo${pending === 1 ? ' is' : 's are'} waiting for review on the Club page.`);
+  if (pending) out.push(`${pending} photo${pending === 1 ? ' is' : 's are'} waiting for review on the Club page (counted for now).`);
   if (built && sinceBuild) out.push(`${sinceBuild} photo${sinceBuild === 1 ? '' : 's'} accepted since the last build: build it again.`);
   if (built && built.score < predicted - 10) out.push('The last build came out below what the photos promise: check it in the viewer and build again.');
   if (!ph.n && !built && sc.score && sc.score >= GOOD) out.push('The scan looks good: process it on the dashboard to get the splat.');
@@ -230,24 +258,68 @@ function advise(s, { score, ph, sc, built, predicted, pending, sinceBuild }) {
 }
 
 // ------------------------------------------------------------------------------------ buildings
+/** How much of a space counts as covered: all of it once its data is good enough for a Good splat. */
+export const coveredShare = (score) => clamp((score || 0) / GOOD, 0, 1);
+
+/** The footprint used when OpenStreetMap has no outline area for a building (about the median ASU building). */
+export const DEFAULT_FOOTPRINT = 2000;
+
 /**
- * A building's plan: how many spaces it should have before it counts as complete. Without a plan set by
- * the club: the entrance plus 2 spaces per floor (3 in a big building), with floors from OpenStreetMap
- * where it knows them and 2 otherwise.
+ * A building's floor area: its footprint (from its OpenStreetMap outline) times its floors (the club's count
+ * when set, else OpenStreetMap's, else 2). Offices and rooms the club can't enter count too, so a building whose
+ * public spaces are all done still shows well under 100%.
+ * @param {{area?: number, levels?: number}} b
+ * @param {number|null} [floors] the club's own count
  */
-export function defaultPlan(b) {
-  const floors = b.levels || 2;
-  const perFloor = (b.area || 0) >= 4000 ? 3 : 2;
-  return { spaces: 1 + perFloor * floors, floors, perFloor, guessed: !b.levels };
+export function floorArea(b, floors = null) {
+  const set = floors > 0;
+  const n = set ? Math.round(floors) : b.levels || 2;
+  const footprint = b.area > 0 ? b.area : DEFAULT_FOOTPRINT;
+  return { area: footprint * n, footprint, floors: n, set, guessed: !set && !b.levels, footprintGuessed: !(b.area > 0) };
 }
 
-/** How complete a building is, from its spaces' scores and its planned number of spaces. */
-export function buildingProgress(scores, planned) {
-  const credit = scores.reduce((s, q) => s + Math.min(1, q / GOOD), 0);
+/**
+ * How complete a building is: the floor area its spaces cover, out of all of it, overall and floor by floor
+ * (a floor's share is of the footprint; spaces with no floor given are listed apart).
+ * @param {{score: number, area: number, floor?: string}[]} spaces
+ * @param {{area: number, footprint: number}} fa from floorArea()
+ */
+export function buildingCoverage(spaces, fa) {
+  const floors = new Map();
+  let covered = 0;
+  for (const x of spaces) {
+    const c = (x.area || 0) * coveredShare(x.score);
+    covered += c;
+    const k = (x.floor || '').trim();
+    if (!floors.has(k)) floors.set(k, { floor: k, covered: 0, spaces: 0, good: 0 });
+    const f = floors.get(k);
+    f.covered += c;
+    f.spaces++;
+    if (x.score >= GOOD) f.good++;
+  }
+  const byFloor = [...floors.values()]
+    .map((f) => ({ ...f, share: fa.footprint > 0 ? Math.min(1, f.covered / fa.footprint) : 0 }))
+    .sort((a, b) => (!a.floor ? 1 : !b.floor ? -1 : a.floor.localeCompare(b.floor, undefined, { numeric: true })));
   return {
-    completion: planned > 0 ? Math.min(1, credit / planned) : 0,
-    credit: Math.min(credit, planned),
-    good: scores.filter((q) => q >= GOOD).length,
-    started: scores.filter((q) => q > 0).length,
+    completion: fa.area > 0 ? Math.min(1, covered / fa.area) : 0,
+    covered, area: fa.area, byFloor,
+    good: spaces.filter((x) => x.score >= GOOD).length,
+    started: spaces.filter((x) => x.score > 0).length,
   };
+}
+
+/**
+ * Completion as a step of the one-hue map ramp: 0 = no photos yet, then under 1%, 1–5%, 5–20%, 20–50%, and 50%
+ * or more. The steps are narrow at the bottom because real buildings fill up slowly.
+ */
+export const COMPLETION_STEPS = [0.01, 0.05, 0.2, 0.5];
+export const COMPLETION_LABELS = ['No photos yet', 'Under 1%', '1–5%', '5–20%', '20–50%', '50% or more'];
+export const completionBin = (completion, started = completion > 0) => (!started ? 0 : 1 + COMPLETION_STEPS.filter((s) => completion >= s).length);
+
+/** A share as a percentage that still shows small progress: "0.3%", "2.4%", "24%". */
+export function pctText(x) {
+  if (!(x > 0)) return '0%';
+  if (x < 0.001) return '<0.1%';
+  if (x < 0.1) return `${(x * 100).toFixed(1).replace(/\.0$/, '')}%`;
+  return `${Math.round(Math.min(1, x) * 100)}%`;
 }

@@ -1479,7 +1479,7 @@ await (async () => {
 
 // ---------------------------------------------------------------- campus view
 const CM = await import('../app/js/core/campusmodel.js');
-test('campus model: quality bands, photo curve, light mixing, scans, builds, plans and completion', () => {
+test('campus model: quality bands, photo curve, light mixing, scans, builds, sizes and floor area covered', () => {
   assert.deepEqual([0, 24, 25, 49, 50, 74, 75, 89, 90, 100].map((q) => CM.bandOf(q).id), ['none', 'none', 'rough', 'rough', 'fair', 'fair', 'good', 'good', 'excellent', 'excellent']);
   assert.deepEqual(['Main lobby', '2nd floor hallway', 'Room 214', 'Snall', 'Reading room', 'Stairwell B'].map(CM.kindOf), ['large', 'hallway', 'room', 'room', 'large', 'hallway']);
   // A room is Good at about 125 photos in one light and Excellent at about 208; bigger spaces need more.
@@ -1539,12 +1539,28 @@ test('campus model: quality bands, photo curve, light mixing, scans, builds, pla
   const both = CM.spaceEstimate({ room: 'Room 214', photos: { byLight: { morning: 125 } }, scans: [{ grade: 'B', score: 80 }] });
   assert.equal(both.score, Math.round(76 + 0.1 * 75), 'the scan (80, less 5%) and the photos (75) back each other up a little');
 
-  assert.deepEqual(CM.defaultPlan({ levels: 4, area: 5476 }), { spaces: 13, floors: 4, perFloor: 3, guessed: false });
-  assert.deepEqual(CM.defaultPlan({ area: 900 }), { spaces: 5, floors: 2, perFloor: 2, guessed: true });
-  const prog = CM.buildingProgress([80, 37.5, 0], 5);
-  assert.deepEqual([prog.completion, prog.good, prog.started], [0.3, 1, 2]);
-  assert.equal(CM.buildingProgress([90, 90, 90], 2).completion, 1, 'never more than complete');
-  assert.equal(CM.buildingProgress([90], 0).completion, 0, 'a plan of 0 leaves a building out');
+  // Completion by floor area: footprint × floors (the club's count, else OpenStreetMap's, else 2).
+  const hay = CM.floorArea({ levels: 4, area: 5476 });
+  assert.deepEqual(hay, { area: 21904, footprint: 5476, floors: 4, set: false, guessed: false, footprintGuessed: false });
+  assert.deepEqual(CM.floorArea({ area: 900 }), { area: 1800, footprint: 900, floors: 2, set: false, guessed: true, footprintGuessed: false });
+  assert.deepEqual(CM.floorArea({ levels: 4, area: 5476 }, 6), { area: 32856, footprint: 5476, floors: 6, set: true, guessed: false, footprintGuessed: false }, 'the club’s count wins');
+  assert.equal(CM.floorArea({}).area, 2 * CM.DEFAULT_FOOTPRINT);
+  // One small room, Good, in Hayden Library is a fraction of a percent (it was 1 of 13 planned spaces, 8%).
+  const tiny = CM.buildingCoverage([{ score: 80, area: CM.SIZES.small.area, floor: '1' }], hay);
+  assert.ok(tiny.completion > 0 && tiny.completion < 0.001, String(tiny.completion));
+  assert.equal(CM.pctText(tiny.completion), '<0.1%');
+  const cov = CM.buildingCoverage([{ score: 75, area: 400, floor: '1' }, { score: 37.5, area: 60, floor: '1' }, { score: 90, area: 150, floor: '2' }, { score: 0, area: 60, floor: '' }], hay);
+  assert.equal(cov.covered, 400 + 30 + 150, 'a space counts in proportion to how close it is to Good');
+  assert.deepEqual([cov.good, cov.started], [2, 3]);
+  assert.deepEqual(cov.byFloor.map((f) => [f.floor, f.spaces, +(f.share * 100).toFixed(2)]), [['1', 2, 7.85], ['2', 1, 2.74], ['', 1, 0]], 'floor by floor, as a share of the footprint; no floor given goes last');
+  assert.equal(CM.buildingCoverage([{ score: 90, area: 5000 }], CM.floorArea({ area: 1000, levels: 1 })).completion, 1, 'never more than all of it');
+  assert.deepEqual([0, 0.004, 0.01, 0.049, 0.05, 0.2, 0.5, 1].map((x) => CM.completionBin(x)), [0, 1, 2, 2, 3, 4, 5, 5]);
+  assert.equal(CM.completionBin(0, true), 1, 'photos waiting for review count as started');
+  assert.deepEqual([0, 0.0004, 0.0027, 0.024, 0.24, 1.2].map(CM.pctText), ['0%', '<0.1%', '0.3%', '2.4%', '24%', '100%']);
+  assert.equal(CM.SIZES[CM.sizeOf('Main lobby')].area, 400);
+  assert.deepEqual(['Main lobby', 'Room 214', 'Study room 3', 'Classroom 101', 'Reading room', 'Ballroom foyer', 'Arizona Ballroom', '2nd floor hallway'].map(CM.sizeOf),
+    ['large', 'room', 'small', 'big', 'huge', 'large', 'huge', 'hallway'], 'sizes guessed from names');
+  assert.ok(CM.spaceEstimate({ room: 'Room 12', kind: 'large', photos: { byLight: { morning: 125 } } }).score < CM.GOOD, 'a size the club sets changes the photo rule too');
 });
 
 const campusLib = await import('../station/lib/campus.mjs');
@@ -1571,8 +1587,9 @@ await (async () => {
     { path: 'Practice/Demo classroom/2026-10-19_1836', building: 'Practice', room: 'Demo classroom', stamp: '2026-10-19_1836', info: { building: 'Practice', room: 'Demo classroom', photos: 309, placed: 309 } },
   ];
   const jobs = [{ id: 'j1', status: 'waiting', building: 'Old Main', room: 'Main hall', summary: { photos: 140 }, source: { name: 'Old_Main_Main_hall.zip' } }];
-  campusLib.savePlan(workDir, 'hayden-library', 4);
-  assert.deepEqual(campusLib.loadPlans(workDir), { 'hayden-library': 4 });
+  campusLib.saveFloors(workDir, 'hayden-library', 5);
+  assert.deepEqual(campusLib.loadSettings(workDir), { since: null, floors: { 'hayden-library': 5 }, sizes: {} });
+  assert.throws(() => campusLib.saveSize(workDir, 'x|1|y', 'enormous'), /Unknown size/);
 
   const d = await campusLib.campusData({ club: { url: FAKE_URL, key: 'sb_secret_test' }, library, jobs, buildings, workDir });
   assert.deepEqual(d.notes, []);
@@ -1585,10 +1602,14 @@ await (async () => {
   assert.ok(lobby.score > lobby.photos.score);
   assert.ok(lobby.advice.some((a) => /200 photos accepted since the last build/.test(a)), lobby.advice.join(' / '));
   assert.ok(lobby.advice.some((a) => /5 photos are waiting for review/.test(a)));
+  assert.equal(lobby.photos.effective, 165 + 0.25 * 40, 'the 5 waiting for review count already: 165 at noon, 40 in the evening');
   assert.equal(lobby.contributors[0].handle, 'Map_Tester');
   const hayden = d.buildings.find((b) => b.code === 'hayden-library');
-  assert.deepEqual([hayden.plan.spaces, hayden.plan.set, hayden.plan.default], [4, true, 13], 'the club’s own plan wins, the default is kept for reference');
-  assert.ok(Math.abs(hayden.completion - Math.min(1, lobby.score / 75) / 4) < 1e-9);
+  assert.deepEqual([hayden.floorArea.floors, hayden.floorArea.set, hayden.floorArea.area], [5, true, 5476 * 5], 'the club’s own floor count wins');
+  assert.deepEqual([lobby.size, lobby.area, lobby.areaSource], ['large', 400, 'typical'], 'a lobby, by its name');
+  assert.ok(Math.abs(hayden.completion - (400 * Math.min(1, lobby.score / 75)) / (5476 * 5)) < 1e-9);
+  assert.equal(CM.pctText(hayden.completion), '1.5%', 'one big lobby of a five-floor library');
+  assert.deepEqual(hayden.byFloor.map((f) => [f.floor, f.spaces]), [['1', 1]]);
   assert.equal(hayden.photos, 200);
   const mu = d.spaces.find((x) => x.code === 'memorial-union');
   assert.deepEqual([mu.source, mu.scanScore], ['scan', 76]);
@@ -1598,7 +1619,7 @@ await (async () => {
   assert.equal(d.elsewhere[0].building, 'Practice');
   const tempe = d.campuses.find((c) => c.id === 'Tempe');
   assert.equal(tempe.started, 3);
-  assert.ok(tempe.planned > 500 && tempe.completion > 0 && tempe.completion < 0.05);
+  assert.ok(tempe.area > 1e6 && tempe.completion > 0 && tempe.completion < 0.001, `${tempe.area} m², ${tempe.completion}`);
   assert.ok(d.buildings.filter((b) => b.restricted).every((b) => b.completion === 0));
   assert.equal(d.points.length, 205, 'every photo with a GPS reading');
   const day = d.days.find((x) => x.day === '2026-11-03');
@@ -1607,6 +1628,36 @@ await (async () => {
   assert.equal(d.model.kinds.room.good, 125);
   assert.ok(d.model.kinds.room.curve.length > 20);
 
+  // A fresh start: only what arrives from then on counts (nothing is deleted), and it can be undone.
+  const club = { url: FAKE_URL, key: 'sb_secret_test' };
+  campusLib.setSince(workDir, new Date(Date.UTC(2026, 10, 2)).toISOString());
+  const fresh = await campusLib.campusData({ club, library, jobs, buildings, workDir });
+  assert.equal(fresh.since, '2026-11-02T00:00:00.000Z');
+  assert.deepEqual(fresh.hidden, { photos: 0, scans: 0, builds: 2, jobs: 1 }, 'the splats of Oct 19 and Nov 1, and a capture with no date');
+  const freshLobby = fresh.spaces.find((x) => x.code === 'hayden-library');
+  assert.deepEqual([freshLobby.builds.length, freshLobby.source], [0, 'photos']);
+  assert.ok(fresh.buildings.find((b) => b.code === 'hayden-library').completion < hayden.completion);
+  assert.ok(!fresh.elsewhere.length && !fresh.spaces.some((x) => x.code === 'old-main'));
+  campusLib.setSince(workDir, 'now');
+  const blank = await campusLib.campusData({ club, library, jobs, buildings, workDir });
+  assert.deepEqual([blank.spaces.length, blank.points.length, blank.totals.photos, blank.hidden.photos], [0, 0, 0, 205], 'from now on: a blank map');
+  campusLib.setSince(workDir, null);
+  assert.equal((await campusLib.campusData({ club: null, library, jobs: [], buildings, workDir })).hidden.builds, 0, 'and back');
+  assert.throws(() => campusLib.setSince(workDir, 'not a time'), /isn’t a time/);
+
+  // Sizes: the club's choice (the floor area it counts for, and its photo rule), or a scan's measured floor.
+  campusLib.saveSize(workDir, lobby.key, 'huge');
+  const sized = (await campusLib.campusData({ club, library, jobs, buildings, workDir })).spaces.find((x) => x.key === lobby.key);
+  assert.deepEqual([sized.size, sized.sizeSet, sized.area, sized.areaSource, sized.kind], ['huge', true, 1000, 'set', 'large']);
+  campusLib.saveSize(workDir, lobby.key, null);
+  assert.deepEqual(campusLib.loadSettings(workDir).sizes, {});
+  const rect = { areas: [{ poly: [[0, 0], [6, 0], [6, 4], [0, 4]] }] };
+  assert.equal(campusLib.measuredArea({ colmap: { mode: 'sfm-ar' }, crop: rect }), 24, 'lined up with the AR tracking: metres');
+  assert.equal(campusLib.measuredArea({ colmap: { mode: 'sfm' }, crop: rect }), null, 'a COLMAP-only solve has no scale');
+  const scanned = await campusLib.campusData({ club: null, jobs: [], buildings, workDir, library: [{ path: 'Hayden Library/Study room 3/2026-11-05_1200', building: 'Hayden Library', room: 'Study room 3', stamp: '2026-11-05_1200',
+    info: { created: '2026-11-05T19:00:00.000Z', photos: 200, placed: 200, colmap: { mode: 'sfm-ar', reprojError: 0.5 }, training: { preset: 'standard' }, crop: rect } }] });
+  assert.deepEqual([scanned.spaces[0].area, scanned.spaces[0].areaSource, scanned.spaces[0].size], [24, 'measured', 'small'], 'its scan’s floor, not the 20 m² a study room usually is');
+
   // Without the club database: this PC's splats only, and a note saying so.
   const local = await campusLib.campusData({ club: null, library, jobs: [], buildings, workDir });
   assert.match(local.notes[0], /isn’t set up/);
@@ -1614,7 +1665,7 @@ await (async () => {
   assert.equal(local.spaces[0].source, 'built');
   assert.equal(local.totals.photos, 0);
   passed++;
-  console.log('  ok campus view: spaces from photos, scans, splats and queued captures, building plans, campus totals, map points and daily activity');
+  console.log('  ok campus view: spaces from photos (waiting ones too), scans, splats and queued captures, floor area covered, a fresh start, sizes, campus totals, map points and daily activity');
 })();
 
 // ---------------------------------------------------------------- campus map on the phone
@@ -1643,7 +1694,7 @@ await (async () => {
   add('hayden-library', '1', 'Main lobby', 4, noon, { status: 'new', reviewed_at: null });
   add('memorial-union', '1', 'Food court', 150, morning); // Good
   add('cereus-hall', '1', 'Lounge', 30, noon); // a residence hall: never published
-  campusLib.savePlan(workDir, 'memorial-union', 2);
+  campusLib.saveFloors(workDir, 'memorial-union', 1);
 
   const d = await campusLib.campusData({ club: c, library: [], jobs: [], buildings, workDir });
   assert.equal(d.clubError, null);
@@ -1651,7 +1702,7 @@ await (async () => {
   assert.deepEqual([room.more.good, room.more.light], [33, 'evening']);
   assert.ok(room.advice.includes('About 33 more photos in evening light would make it Good.'), 'the Campus page says the same number the phone will');
   // Exact under the model's own rules: that many more in that light reach Good, one fewer doesn't.
-  const lobbyWith = (extra) => CM.spaceEstimate({ room: 'Main lobby', photos: { byLight: { afternoon: 160 + extra, evening: 60 }, devices: 1 } }).score;
+  const lobbyWith = (extra) => CM.spaceEstimate({ room: 'Main lobby', photos: { byLight: { afternoon: 164 + extra, evening: 60 }, devices: 1 } }).score; // 4 of them waiting for review
   assert.equal(lobby.more.light, 'afternoon');
   assert.ok(lobbyWith(lobby.more.good) >= CM.GOOD && lobbyWith(lobby.more.good - 1) < CM.GOOD, `lobby needs ${lobby.more.good}`);
   assert.deepEqual([food.band, food.more.good, food.more.light], ['good', 0, 'morning']);
@@ -1661,10 +1712,10 @@ await (async () => {
   const rows = campusLib.summaryRows(d, '2026-11-05T20:00:00.000Z');
   assert.deepEqual(rows.spaces.map((r) => r.building_code).sort(), ['hayden-library', 'hayden-library', 'memorial-union']);
   const r214 = rows.spaces.find((r) => r.room === 'Room 214');
-  assert.deepEqual([r214.space_key, r214.floor, r214.kind, r214.evening, r214.morning, r214.need_good, r214.need_light, r214.band], ['hayden-library|2|room 214', '2', 'room', 90, 0, 33, 'evening', 'fair']);
-  assert.equal(rows.spaces.find((r) => r.room === 'Main lobby').pending, 4);
+  assert.deepEqual([r214.space_key, r214.floor, r214.kind, r214.area, r214.evening, r214.morning, r214.need_good, r214.need_light, r214.band], ['hayden-library|2|room 214', '2', 'room', 60, 90, 0, 33, 'evening', 'fair']);
+  assert.deepEqual([rows.spaces.find((r) => r.room === 'Main lobby').pending, rows.spaces.find((r) => r.room === 'Main lobby').area], [4, 400]);
   assert.ok(!JSON.stringify(rows).includes('Light_Seeker') && !JSON.stringify(rows).includes(U) && !/"lat"|"lon"/.test(JSON.stringify(rows)), 'no handles, ids or GPS');
-  assert.deepEqual(rows.plans, [{ building_code: 'memorial-union', spaces: 2, updated_at: '2026-11-05T20:00:00.000Z' }]);
+  assert.deepEqual(rows.plans, [{ building_code: 'memorial-union', floors: 1, updated_at: '2026-11-05T20:00:00.000Z' }]);
 
   // A view built without the club's photos is never published (it would wipe the map).
   await assert.rejects(campusLib.publishSummary(c, { ...d, clubError: 'timeout' }), /couldn’t be read/);
@@ -1685,10 +1736,11 @@ await (async () => {
   const phone = campusMap.summarize(asuList, sm);
   for (const b of d.buildings.filter((x) => !x.restricted)) {
     const p = phone.find((x) => x.code === b.code);
-    assert.ok(Math.abs(p.completion - b.completion) < 1e-9 && p.planned === b.plan.spaces && p.good === b.good, `${b.name}: phone ${p.completion}/${p.planned}, station ${b.completion}/${b.plan.spaces}`);
+    assert.ok(Math.abs(p.completion - b.completion) < 1e-9 && Math.abs(p.covered - b.covered) < 1e-9 && p.floorArea.area === b.floorArea.area && p.good === b.good, `${b.name}: phone ${p.completion} of ${p.floorArea.area} m², station ${b.completion} of ${b.floorArea.area} m²`);
   }
   const mu = phone.find((x) => x.code === 'memorial-union'), hl = phone.find((x) => x.code === 'hayden-library'), cereus = phone.find((x) => x.code === 'cereus-hall');
-  assert.deepEqual([mu.planned, mu.planSet, mu.completion, campusMap.completionBin(mu)], [2, true, 0.5, 3], 'the club’s plan of 2 spaces, one of them Good');
+  assert.deepEqual([mu.floorArea.floors, mu.floorArea.set, mu.completion, campusMap.completionBin(mu)], [1, true, 60 / 8061, 1], 'the club’s count of 1 floor; one Good room of 60 m² in 8,061 m²');
+  assert.deepEqual(hl.byFloor.map((f) => f.floor), ['1', '2']);
   assert.ok(cereus.restricted && cereus.completion === 0 && !cereus.spaces.length);
   assert.equal(campusMap.completionBin(phone.find((x) => x.code === 'old-main')), 0, 'no photos yet');
   assert.equal(campusMap.needText(hl.spaces.find((x) => x.room === 'Room 214')), 'About 33 more photos in evening light (4–8 pm) would make it Good.');
@@ -1706,15 +1758,31 @@ await (async () => {
   assert.equal((await crowdApp.api('/rest/v1/campus_spaces', { method: 'POST', body: { ...rows.spaces[0], score: 100 } })).status, 403);
   assert.equal((await crowdApp.api('/rest/v1/campus_spaces?space_key=not.is.null', { method: 'DELETE' })).status, 403);
 
-  // Publishing again replaces it: a space whose photos were all rejected goes, and so does a plan set back to the default.
+  // A club database without supabase-campus-2.sql: the summary goes without sizes or floor counts, and the
+  // phone falls back to typical sizes, which is what SplatStation used for these spaces too.
+  fake.db.campusV1 = true;
+  const old = await campusLib.publishSummary(c, d);
+  fake.db.campusV1 = false;
+  assert.deepEqual([old.legacy, old.spaces, old.plans, fake.db.campus_plans.size], [true, 3, 0, 0]);
+  assert.ok([...fake.db.campus_spaces.values()].every((x) => x.area == null));
+  const oldPhone = campusMap.summarize(asuList, await campusMap.load());
+  assert.ok(Math.abs(oldPhone.find((x) => x.code === 'hayden-library').completion - d.buildings.find((x) => x.code === 'hayden-library').completion) < 1e-9);
+  assert.equal((await campusLib.publishSummary(c, d)).legacy, false, 'once it has run, sizes go again');
+
+  // Publishing again replaces it: a space whose photos were all rejected goes, and so does a floor count set back.
   for (const p of fake.db.photos.values()) if (p.room === 'Room 214') p.status = 'rejected';
-  campusLib.savePlan(workDir, 'memorial-union', null);
+  campusLib.saveFloors(workDir, 'memorial-union', null);
   pub = await campusLib.publishSummary(c, await campusLib.campusData({ club: c, library: [], jobs: [], buildings, workDir }));
   assert.deepEqual([pub.spaces, fake.db.campus_spaces.size, fake.db.campus_plans.size], [2, 2, 0]);
   assert.ok([...fake.db.campus_spaces.values()].every((x) => x.updated_at === pub.at));
   campusLib.savePublished(workDir, { ...pub, by: 'button' });
-  assert.deepEqual(campusLib.loadPlans(workDir), {}, 'campus.json keeps plans and the last publish side by side');
+  assert.deepEqual(campusLib.loadSettings(workDir).floors, {}, 'campus.json keeps the club’s settings and the last publish side by side');
   assert.equal(campusLib.loadPublished(workDir).spaces, 2);
+  // A fresh start empties the members' map too.
+  campusLib.setSince(workDir, 'now');
+  pub = await campusLib.publishSummary(c, await campusLib.campusData({ club: c, library: [], jobs: [], buildings, workDir }));
+  assert.deepEqual([pub.spaces, fake.db.campus_spaces.size], [0, 0]);
+  campusLib.setSince(workDir, null);
 
   // Offline, the phone keeps the copy it last saw.
   const online = globalThis.fetch;
@@ -1723,7 +1791,7 @@ await (async () => {
   globalThis.fetch = online;
   assert.ok(sm.offline && sm.spaces.length === 3, 'the earlier copy, marked offline');
   passed++;
-  console.log('  ok campus map (phone): SplatStation publishes counts and needs per space, members read them, completion matches the Campus page, stale rows go, offline keeps the last copy');
+  console.log('  ok campus map (phone): SplatStation publishes counts, sizes and needs per space, members read them, floor area covered matches the Campus page (with or without campus-2.sql), stale rows go, offline keeps the last copy');
 })();
 
 globalThis.fetch = realFetch;
