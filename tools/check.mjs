@@ -1061,7 +1061,8 @@ const recorded = (() => {
     const a = (i / 200) * Math.PI * 4;
     return { pose: Array.from(poseLookDir([Math.cos(a) * 2.4, 1.4, Math.sin(a) * 1.9], [-Math.cos(a), -0.1, -Math.sin(a)])), intrinsics: INTR_AR, metrics: { relSharp: 0.9 }, flags: [] };
   });
-  return { name: 'practice lap', frames, bounds: { poly: [[-3, -2.5], [3, -2.5], [3, 2.5], [-3, 2.5]], floorY: 0, margin: 0.35, skips: [] } };
+  // Counter-clockwise seen from above, the way the app stores every outline (bounds.js ccw), like a real scan's.
+  return { name: 'practice lap', frames, bounds: { poly: [[-3, -2.5], [-3, 2.5], [3, 2.5], [3, -2.5]], floorY: 0, margin: 0.35, skips: [] } };
 })();
 
 await (async () => {
@@ -1105,7 +1106,11 @@ await (async () => {
   assert.equal(new Set(pairs).size, pairs.length, 'no pair twice');
   assert.ok(pairs.includes(`${name(cut - 1)} ${name(cut)}`) && pairs.includes(`${name(cut - 30)} ${name(cut + 29)}`), 'where part 2 begins, every photo against the end of part 1');
   assert.ok(pairs.includes(`${name(0)} ${name(1)}`) && pairs.includes(`${name(cut + 1)} ${name(cut + 2)}`), 'neighbours within each part');
-  assert.ok(pairs.length < (rec.length * (rec.length - 1)) / 2 * 0.6, `fewer than every pair (${pairs.length}; scans over 700 photos use these)`);
+  // SplatStation matches these pairs only above 700 photos (below that, every photo against every other), and there
+  // they are far fewer than every pair, since the parts meet through thinned sets. A small scan gets nearly all.
+  const big = [0, 1].map((k) => ({ names: Array.from({ length: 400 }, (_, i) => name(k * 400 + i)) }));
+  const bigPairs = segmentPairs(big).length, every = (800 * 799) / 2;
+  assert.ok(bigPairs < every * 0.15, `far fewer than every pair at 800 photos (${bigPairs} of ${every})`);
 
   // The solve: COLMAP placed part 2's first 8 photos (its overlap with part 1) in the main part's coordinates, and
   // a ninth in the wrong place. The fit moves part 2 back, and the rest of its photos follow their AR poses.
