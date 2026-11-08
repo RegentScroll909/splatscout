@@ -49,7 +49,7 @@
       <img src="icon.svg" alt="" class="logo">
       <div>
         <h1>Club <span class="tag new">Beta</span></h1>
-        <div class="sub">Photos from phones, points, missions and members</div>
+        <div class="sub">Scans from members, your review of their splats, points, missions and members</div>
       </div>
     </div>
     <div style="display:flex;gap:8px">
@@ -65,19 +65,16 @@
       <div class="section-head">
         <h2>Overview</h2>
         <span class="grow"></span>
-        <span id="syncText" class="muted small mono"></span>
-        <button class="btn small primary" id="sync" title="Download new photos from the club database and check them">Sync photos</button>
-        <button class="btn small ghost" id="free" title="Delete the cloud copies of accepted photos that are safe here, to free the free plan's storage">Free cloud space</button>
         <button class="btn small ghost" id="refresh">Refresh</button>
       </div>
       <div class="stats" id="stats"></div>
     </section>
 
     <section id="review">
-      <div class="section-head"><h2>Photos</h2><span class="count mono" id="reviewCount"></span></div>
+      <div class="section-head"><h2>Scans</h2><span class="count mono" id="reviewCount"></span></div>
+      <p class="muted small" style="margin:0 0 10px">Members send full scans graded B or better. Import one to build its splat, then look at it, in the viewer and placed in its building, and approve it: approving puts it on the campus map and gives the member their points. If you don't approve it, they're told why.</p>
       <div class="tabs" id="tabs"></div>
-      <div id="places"></div>
-      <div class="bulk hidden" id="bulk"></div>
+      <div id="scans" class="list"></div>
     </section>
 
     <section>
@@ -97,16 +94,15 @@
     </section>
 
     <section>
-      <div class="section-head"><h2>Places that can't be photographed</h2><span class="count mono" id="restrictedCount"></span></div>
+      <div class="section-head"><h2>Places that can't be scanned</h2><span class="count mono" id="restrictedCount"></span></div>
       <div class="panel">
-        <p class="muted small" style="margin:0">Enforced by the club database: phones can't add photos or scans for these buildings. The ASU list marks residence halls, health, police and children's centers; add or remove any building by hand.</p>
+        <p class="muted small" style="margin:0">Enforced by the club database: phones can't send scans of these buildings. The ASU list marks residence halls, health, police and children's centers; add or remove any building by hand.</p>
         <div class="form" id="restrictedForm"></div>
         <div id="restricted"></div>
       </div>
     </section>
   </main>
 
-  <div id="lightbox"></div>
   <script type="module" src="club.js"></script>
 </body>
 </html>

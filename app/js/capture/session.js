@@ -10,8 +10,9 @@ import { heightHint } from '../core/plans.js';
 import { Bounds, polyArea, polyCentroid } from '../core/bounds.js';
 import { Guide } from '../core/guide.js';
 import { Relocalizer } from './relocalizer.js';
-import { spaceOf, boundsFor, mainSpace } from '../core/spaces.js';
+import { spaceOf, boundsFor, mainSpace, framesIn } from '../core/spaces.js';
 import { integrateFrames } from '../core/score.js';
+import { xfPose, xfPoints, xfInverse, xfCompose } from '../core/align.js';
 import { makeKey, liveImage, grayFromBlob } from '../core/photomatch.js';
 import { boundsGeometry, chevronTrail, standMarker, ghostPhone, cursorGeometry } from './guideDraw.js';
 import { crc32 } from '../core/zip.js';
@@ -25,6 +26,7 @@ const ANALYSIS_INTERVAL = 0.1; // s
 const DEPTH_SEEN_INTERVAL = 0.25; // s
 const GUIDE_INTERVAL = 0.5; // s
 const AREA_DONE = 0.85; // weighted surface coverage that counts as a complete scan area
+const OVERLAP_PHOTOS = 8; // a new part starts with this many photos of what was already covered
 
 export class CaptureSession {
   /**
@@ -56,6 +58,15 @@ export class CaptureSession {
     this.segment = (capture.segments || 0) + 1;
     this.space = this.segment * 100; // this session's own coordinates until it's lined up with an earlier one
     this.splits = 0;
+    // Parts (spaces.js): photos are recorded in this part's own coordinates (this.space). The coverage
+    // map may be shown in an earlier part's (viewSpace) once the background search lines them up;
+    // recXf then takes the shown coordinates back to this part's.
+    this.viewSpace = this.space;
+    this.recXf = null;
+    this.frameGen = 0; // counts changes of the coordinates shown: a photo framed before one is dropped
+    this.home = null; // the earlier map being searched for in the background: {voxels, space, bounds, floorY}
+    this.overlap = null; // a new part's first photos, of what was already covered: {need, got, refs}
+    this.partNo = new Set(this.frames.filter((f) => f.tracked && f.pose).map((f) => spaceOf(f, capture))).size + 1;
     this.passIndex = 0;
 
     this.sphere = new DirectionSphere();
@@ -159,31 +170,49 @@ export class CaptureSession {
   }
 
   /**
-   * Continue an earlier scan: rebuild its coverage map, scan area and pass, then search for where
-   * this AR session is in it. Photos wait until it's found (or the user starts a new map).
+   * Continue an earlier scan as a new part: photos start at once, in this AR session's own
+   * coordinates, while the earlier map (with its scan area) is searched for in the background. Once
+   * it's found, its coverage, scan area and path come back on screen. SplatStation joins the parts.
    */
   resume() {
     const r = this.resumable();
     if (!r) return false;
-    this.space = r.space;
-    this.voxels.reset();
-    integrateFrames(this.voxels, r.frames);
+    const vm = new VoxelMap(this.template.voxel, this.template.maxObsDist);
+    integrateFrames(vm, r.frames);
     const b = boundsFor(this.capture, r.space);
-    if (b) {
-      this.bounds = Bounds.from({ ...b, space: r.space });
-      this.voxels.setBounds(this.bounds);
-      if (this.guide) this.guide.bounds = this.bounds;
-    }
-    for (const fr of r.frames) {
-      this.sphere.addView(fr.pose, fr.intr, { pos: posePosition(fr.pose), odo: 0 }, 0);
-    }
+    const bounds = b ? Bounds.from({ ...b, space: r.space }) : null;
+    if (bounds) vm.setBounds(bounds);
     if (this.capture.passIndex != null) this.passIndex = clamp(this.capture.passIndex, 0, this.template.passes.length - 1);
     this.resumed = r;
     this._resetPassGuide();
-    this._emit('searching', { reason: 'resume' });
-    this.reloc.begin('resume', this.lastT || 0);
+    this._watchHome({ voxels: vm, space: r.space, bounds, guide: null });
+    this.overlap = { need: OVERLAP_PHOTOS, got: 0, refs: [], reason: 'resume' };
+    this._emit('newPart', { reason: 'resume', part: this.partNo });
     this._keysFromThumbs(r.frames, r.space);
     return true;
+  }
+
+  /** Search for an earlier map in the background (relocalizer.watch); found, it's shown again (_linkHome). */
+  _watchHome(home) {
+    this.home = { ...home, floorY: home.bounds && home.bounds.poly ? home.bounds.floorY : home.voxels.floorY() };
+    if (this.reloc) this.reloc.watch(this.home, this.lastT || 0);
+  }
+
+  /** Tracked photos taken in this part so far. */
+  partPhotos() {
+    let n = 0;
+    for (const f of this.frames) if (f.tracked && spaceOf(f, this.capture) === this.space) n++;
+    return n;
+  }
+
+  /** Tracked photos that belong on the map shown, with their poses in its coordinates (cached). */
+  shownFrames() {
+    const key = `${this.frames.length}|${this.viewSpace}|${(this.capture.links || []).length}`;
+    if (this._shownKey !== key) {
+      this._shownKey = key;
+      this._shownList = framesIn(this.frames, this.capture, this.viewSpace, undefined, { points: false });
+    }
+    return this._shownList;
   }
 
   /** Photo keys from saved thumbnails, a few at a time so the AR view keeps running. */
@@ -201,25 +230,91 @@ export class CaptureSession {
     }
   }
 
-  /** Stop trying to line up: this session gets its own coordinates and a fresh map. */
-  startNewMap() {
+  /**
+   * Keep scanning as a new part (tracking was lost and the view didn't line up again): a new segment
+   * in the AR frame as it is now, with its own coordinates and an empty coverage map. Its first photos
+   * should overlap what was already covered: SplatStation joins the parts from those. The map so far
+   * keeps its scan area (the crop outline stays in its coordinates) and is searched for in the
+   * background; once it's found, the coverage map is put back together on screen.
+   * @param {boolean} [o.watch] search for the earlier map in the background (default true)
+   */
+  startNewPart({ watch = true } = {}) {
     if (!this.reloc) return;
-    this.reloc.abandon();
-    // A space id no photo uses yet.
-    this.space = this.segment * 100 + ++this.splits;
+    const shown = { voxels: this.voxels, space: this.viewSpace, bounds: this.bounds, guide: this.guide };
+    // The map to search for: the one shown, or the earlier one this part was still looking for when
+    // that's bigger (a short part that never lined up is left to SplatStation).
+    const solid = (m) => m.voxels.stats().solid;
+    const home = this.home && this.home.space !== shown.space && solid(this.home) > solid(shown) ? this.home : shown;
+    const refs = this.frames.filter((f) => f.tracked && spaceOf(f, this.capture) === this.space).slice(-3).map((f) => f.id);
+    this.reloc.newPart();
+    this.reloc.unwatch();
+    this.home = null;
+    this.segment++;
+    this.capture.segments = Math.max(this.capture.segments || 0, this.segment);
+    this.space = this.segment * 100;
     while (this.frames.some((fr) => spaceOf(fr, this.capture) === this.space)) this.space++;
+    this.viewSpace = this.space;
+    this.recXf = null;
+    this.partNo++;
     this.resumed = null;
-    this.voxels.reset();
-    // The earlier map keeps its scan area; this one starts without.
+    this.voxels = new VoxelMap(this.template.voxel, this.template.maxObsDist);
     this.bounds = null;
-    this.voxels.setBounds(null);
-    if (this.guide) this.guide.setBounds(null);
+    this.guide = this.sixdof ? new Guide({ template: this.template, bounds: null, voxels: this.voxels }) : null;
+    this._newFrame();
+    if (watch && solid(home) >= 50) this._watchHome(home);
+    this.overlap = { need: OVERLAP_PHOTOS, got: 0, refs, reason: 'lost' };
+    this._emit('newPart', { reason: 'lost', part: this.partNo, refs });
+  }
+
+  /** What depends on the coordinates shown starts again (they just changed). */
+  _newFrame() {
+    this.frameGen++;
+    this.floorHits = [];
+    this.floorY = null;
+    this.startY = null;
+    this.prevPose = null;
+    this.lastAnalysis = null;
+    this._center = null;
+    this._voxVersion = -1;
     this._boundsDirty = true;
+    this._overlayKeyframesDirty = true;
+    this._shownKey = null;
     this.areaDone = false;
-    this._resetPassGuide();
     this.sphere.reset();
     this.passSpheres.clear();
-    this._overlayKeyframesDirty = true;
+    for (const f of this.shownFrames()) this.sphere.addView(f.pose, f.intr, { pos: posePosition(f.pose), odo: 0 }, 0);
+    this.flow.reset();
+    this.keyframer.cancel();
+    this._resetPassGuide();
+  }
+
+  /**
+   * The background search found this part in the earlier map: show that map again, with this part's
+   * coverage added. Photos keep being recorded in this part's own coordinates (recXf); the link is
+   * kept with the capture for the coverage map only (spaces.js).
+   * @param {{yaw, t}} x this part's coordinates → the earlier map's
+   */
+  _linkHome(x) {
+    const home = this.home;
+    if (!home || !this.reloc) return;
+    const link = { from: this.space, to: home.space, xf: { yaw: +x.yaw.toFixed(5), t: x.t.map((v) => +v.toFixed(4)) }, at: Date.now() };
+    this.capture.links = [...(this.capture.links || []).filter((l) => l.from !== this.space), link];
+    const mine = this.frames.filter((f) => f.tracked && f.pose && spaceOf(f, this.capture) === this.space);
+    integrateFrames(home.voxels, mine.map((f) => ({ ...f, pose: xfPose(x, f.pose), pts: f.pts && f.pts.length ? xfPoints(x, f.pts) : null })));
+    this.reloc.xf = xfCompose(x, this.reloc.xf);
+    this.reloc.lastGood = null;
+    this.reloc.clock = [];
+    this.reloc.pendingDrift = null;
+    this.recXf = xfInverse(x);
+    this.viewSpace = home.space;
+    this.voxels = home.voxels;
+    this.bounds = home.bounds || null;
+    this.voxels.setBounds(this.bounds);
+    this.guide = home.guide || new Guide({ template: this.template, bounds: this.bounds, voxels: this.voxels });
+    this.guide.bounds = this.bounds;
+    this.home = null;
+    this._newFrame();
+    this._emit('partsLinked', { part: this.partNo, area: !!(this.bounds && this.bounds.poly) });
   }
 
   pause() {
@@ -344,7 +439,7 @@ export class CaptureSession {
     const c = this.boundsDraft && this.boundsDraft.corners;
     if (!c || c.length < 3) return false;
     const skips = this.bounds ? this.bounds.skips : [];
-    this.setBounds(new Bounds({ poly: c, floorY: this.floorHeight(), margin: this.template.boundsMargin || 0.35, skips, segment: this.segment, space: this.space }));
+    this.setBounds(new Bounds({ poly: c, floorY: this.floorHeight(), margin: this.template.boundsMargin || 0.35, skips, segment: this.segment, space: this.viewSpace }));
     this.boundsDraft = null;
     this.boundsCursor = null;
     this.unpause();
@@ -372,7 +467,7 @@ export class CaptureSession {
   skipSpot(p, r = 0.5) {
     if (!p) return false;
     if (!this.bounds) {
-      this.bounds = new Bounds({ poly: null, floorY: null, segment: this.segment, space: this.space });
+      this.bounds = new Bounds({ poly: null, floorY: null, segment: this.segment, space: this.viewSpace });
       this.voxels.setBounds(this.bounds);
       if (this.guide) this.guide.bounds = this.bounds;
     }
@@ -391,11 +486,11 @@ export class CaptureSession {
     return true;
   }
 
-  /** Remember the scan area with the capture, per coordinate space. */
+  /** Remember the scan area with the capture, per coordinate space (the one it's shown in). */
   _saveBounds() {
     const json = this.bounds ? this.bounds.toJSON() : null;
     this.capture.bounds = json;
-    this.capture.boundsBySpace = { ...(this.capture.boundsBySpace || {}), [this.space]: json };
+    this.capture.boundsBySpace = { ...(this.capture.boundsBySpace || {}), [this.viewSpace]: json };
   }
 
   /** Skip the spot the guide is currently pointing at. */
@@ -504,8 +599,18 @@ export class CaptureSession {
     if (this.reloc && this.recording) {
       const ev = this.reloc.tick(t);
       if (ev) this._onRelocEvent(ev);
+      // The coordinates just changed: this frame's pose is still in the old ones, so it frames no photo.
+      if (ev && /^(partsLinked|realigned|corrected|trackingBack)$/.test(ev.type)) {
+        this.live.reloc = null;
+        return;
+      }
     }
     this.live.reloc = this.reloc && this.reloc.mode ? this._relocState() : null;
+    const bg = this.reloc && this.reloc.bg;
+    this.live.part = this.sixdof ? {
+      no: this.partNo, linked: this.viewSpace !== this.space, searching: !!bg, confidence: bg ? bg.confidence : 0,
+      overlap: this.overlap && !this.overlap.done ? { got: this.overlap.got, need: this.overlap.need, reason: this.overlap.reason } : null,
+    } : null;
 
     // Marking the scan area: the floor cursor follows the centre dot.
     if (this.boundsDraft) {
@@ -552,7 +657,7 @@ export class CaptureSession {
           rotSpeed: this.rotSpeed, linSpeed: this.linSpeed, depthMed: this.depthMed,
           odo: this.par3 ? this.par3.odo : 0, height: this.live.height,
           depth: fi.depth && tracked6 ? fi.depth.grid(40, 30) : null,
-          manual: this.manualPending, pass: this.pass.id,
+          manual: this.manualPending, pass: this.pass.id, gen: this.frameGen,
         };
         this.manualPending = false;
         this.candidatePending = true;
@@ -588,7 +693,11 @@ export class CaptureSession {
   }
 
   _onRelocEvent(ev) {
-    if (ev.type === 'searching') this.keyframer.cancel();
+    if (ev.type === 'searching' || ev.type === 'newPartOffer') this.keyframer.cancel();
+    if (ev.type === 'partsLinked') {
+      this._linkHome(ev.xf);
+      return;
+    }
     if (ev.type === 'realigned' || ev.type === 'trackingBack' || ev.type === 'corrected') {
       this._boundsDirty = true;
       this._overlayKeyframesDirty = true;
@@ -605,7 +714,7 @@ export class CaptureSession {
     return {
       mode: r.mode, reason: st.reason, status: st.status, confidence: st.confidence || 0, preview: !!st.preview,
       manual: !!st.manual, hint: st.mapHint || null, since: this.lastT - (st.t0 || this.lastT), frames: st.frames ? st.frames.length : 0,
-      metrics: st.metrics || null, photos: this.photoKeys.filter((k) => k.space === this.space).length,
+      metrics: st.metrics || null, photos: this.photoKeys.filter((k) => k.space === this.viewSpace).length,
     };
   }
 
@@ -624,6 +733,13 @@ export class CaptureSession {
     if (!this.reloc || this.reloc.mode !== 'search') return;
     const ev = this.reloc.acceptPreview(this.lastT);
     if (ev) this._onRelocEvent(ev);
+  }
+
+  /** Instead of the new part on offer: search the scan for where the phone is (photos wait meanwhile). */
+  findPlace() {
+    if (!this.reloc || this.reloc.mode !== 'offer') return;
+    const st = this.reloc.state || {};
+    this._onRelocEvent(this.reloc.begin(st.reason || 'lost', this.lastT, { priors: st.priors || [] }));
   }
 
   /** "I'm standing where this photo was taken." */
@@ -713,8 +829,10 @@ export class CaptureSession {
 
   // ------------------------------------------------------------------ analysis tick
   _onAnalysis(a, snap) {
-    // While the position is checked or searched for, the camera image is compared with earlier photos.
+    // While the position is checked or searched for, the camera image is compared with earlier photos
+    // (the background search works in this part's coordinates, as shown).
     if (this.reloc && this.reloc.mode && snap.raw && snap.intr) this.reloc.addImage(liveImage(a.gray, a.w, a.h, snap.intr, snap.raw));
+    else if (this.reloc && this.reloc.bg && snap.intr) this.reloc.addBgImage(liveImage(a.gray, a.w, a.h, snap.intr, snap.pose));
     const A = analyzeImage(a.gray, a.w, a.h);
     const relSharp = this.sharpRef.update(A.sharp, snap.t);
     const q = downsample2(a.gray, a.w, a.h);
@@ -776,6 +894,7 @@ export class CaptureSession {
       clipHi: A.clipHi,
       clipLo: A.clipLo,
       texture: A.texture,
+      spread: A.textureSpread,
       rotInPlace: this.recording && !this.paused && this.motionWin.rotatingInPlace(this.sixdof),
       depthMed: this.depthMed,
       orientationChanged: this.orientationChanged,
@@ -818,7 +937,9 @@ export class CaptureSession {
     const A = analyzeImage(c.gray, c.w, c.h);
     const relSharp = this.sharpRef.update(A.sharp, snap.t);
     const data = { c, snap, A, relSharp, release: () => c.image.release() };
-    if (!this.recording || this.paused) {
+    // Framed before the coordinates changed (a new part, or lined up with the earlier map): its pose
+    // would be recorded in the wrong part.
+    if (!this.recording || this.paused || snap.gen !== this.frameGen) {
       data.release();
       return;
     }
@@ -834,10 +955,13 @@ export class CaptureSession {
   _commit(data, rushed, forcedTrigger) {
     const { c, snap, A, relSharp } = data;
     this.keyframer.committed({ t: snap.t, pose: snap.pose, odo: snap.odo });
-    const pos = posePosition(snap.pose);
+    const pos = posePosition(snap.pose); // in the coordinates shown
+    // Recorded in this part's own coordinates: the map shown may be an earlier part's (recXf).
+    const rec = this.recXf;
+    const recPose = rec ? xfPose(rec, snap.pose) : snap.pose;
     const prev = lastOfSegment(this.frames, this.segment);
-    const baseline = this.sixdof && prev && prev.tracked && snap.tracked ? v3.dist(posePosition(prev.pose), pos) : null;
-    const rotFromPrev = prev ? rotationDelta(prev.pose, snap.pose) / DEG : 0;
+    const baseline = this.sixdof && prev && prev.tracked && snap.tracked ? v3.dist(posePosition(prev.pose), posePosition(recPose)) : null;
+    const rotFromPrev = prev ? rotationDelta(prev.pose, recPose) / DEG : 0;
     const odoFromPrev = prev ? Math.abs((snap.odo || 0) - (prev.odo || 0)) : 0;
 
     const flags = [];
@@ -851,7 +975,7 @@ export class CaptureSession {
 
     const trigger = forcedTrigger || (!prev ? 'first' : this.sixdof ? (baseline != null && baseline >= 0.08 ? 'trans' : 'rot') : odoFromPrev > 0.04 ? 'trans' : 'rot');
     this.seq++;
-    const [az, el] = dirToAzEl(poseForward(snap.pose));
+    const [az, el] = dirToAzEl(poseForward(recPose));
     const meta = {
       id: uid(),
       captureId: this.capture.id,
@@ -862,7 +986,7 @@ export class CaptureSession {
       createdAt: Date.now(),
       tracking: this.tracking,
       tracked: this.sixdof ? snap.tracked : false,
-      pose: Array.from(snap.pose),
+      pose: Array.from(recPose),
       intr: snap.intr,
       odo: snap.odo || 0,
       az, el,
@@ -882,8 +1006,9 @@ export class CaptureSession {
     // Depth points (flying pixels already removed) with their colours, and the photo's coarse depth
     // image, which lets coverage be rebuilt later exactly as it was measured live.
     const dg = snap.depth;
-    meta.pts = dg && dg.xyz.length ? dg.xyz : null;
-    meta.rgb = meta.pts ? c.image.sampleColors(dg.uv) : null;
+    const pts = dg && dg.xyz.length ? dg.xyz : null; // in the coordinates shown
+    meta.pts = pts && rec ? xfPoints(rec, pts) : pts;
+    meta.rgb = pts ? c.image.sampleColors(dg.uv) : null;
     meta.dimg = dg ? Uint16Array.from(dg.d, (v) => Math.round(v * 1000)) : null;
     meta.dnx = dg ? dg.nx : 0;
     meta.dny = dg ? dg.ny : 0;
@@ -897,12 +1022,18 @@ export class CaptureSession {
     if (vp.pos) {
       const center = this._roomCenter();
       if (center) ps.sectors.add(Math.floor(((Math.atan2(pos[0] - center[0], -(pos[2] - center[2])) / DEG + 360) % 360) / 30));
-      if (meta.pts) this.voxels.integrate(meta.pts, pos);
+      if (pts) this.voxels.integrate(pts, pos);
       if (dg) this.voxels.observeView(snap.pose, snap.intr, dg);
       if (this.guide) this.guide.onPhoto(snap.pose);
       if (dg) {
         const key = makeKey(c.gray, c.w, c.h, snap.pose, snap.intr, dg);
-        if (key) this.photoKeys.push({ ...key, id: meta.id, space: this.space });
+        if (key) this.photoKeys.push({ ...key, id: meta.id, space: this.viewSpace });
+      }
+      // A new part's first photos: of what was already covered, so the parts can be joined.
+      const ov = this.overlap;
+      if (ov && !ov.done && ++ov.got >= ov.need) {
+        ov.done = true;
+        this._emit('overlapDone', { part: this.partNo });
       }
     }
     this.frames.push(meta);
@@ -941,7 +1072,7 @@ export class CaptureSession {
     let c = null;
     if (n > 50) c = [sx / n, 0, sz / n];
     else {
-      const ps = this.frames.filter((f) => f.tracked && spaceOf(f, this.capture) === this.space).map((f) => posePosition(f.pose));
+      const ps = this.shownFrames().map((f) => posePosition(f.pose));
       if (ps.length > 5) c = [ps.reduce((s, p) => s + p[0], 0) / ps.length, 0, ps.reduce((s, p) => s + p[2], 0) / ps.length];
     }
     this._center = c;
@@ -989,13 +1120,18 @@ export class CaptureSession {
       this.live.passProgress = 0;
       return;
     }
+    // A new part's first photos are of what was already covered (the overlap card says where): no path yet.
+    if (this.overlap && !this.overlap.done) {
+      this.live.passProgress = this.passProgress();
+      return;
+    }
     const vs = this.voxels.stats();
     const g = this.guide;
     if (g && tracked6) {
       if (this.guidePending) {
         g.setPass(this.pass, pos);
-        // Spots already photographed (earlier passes, earlier sessions in this space) count.
-        for (const fr of this.frames) if (fr.tracked && fr.pose && spaceOf(fr, this.capture) === this.space) g.onPhoto(fr.pose);
+        // Spots already photographed (earlier passes, earlier sessions and parts on this map) count.
+        for (const fr of this.shownFrames()) g.onPhoto(fr.pose);
         this.guidePending = false;
       }
       let gs = null;
@@ -1067,7 +1203,8 @@ export class CaptureSession {
       ov.setVoxels(r.pos, r.qual, this.voxels.size);
     }
     // While searching for the scan, only show it once there's a plausible guess (it then settles in place).
-    const searching = !!(this.reloc && this.reloc.mode === 'search');
+    // While a new part is offered the view no longer lines up with it: hidden too.
+    const searching = !!(this.reloc && (this.reloc.mode === 'search' || this.reloc.mode === 'offer'));
     const showMap = !searching || !!(this.reloc.state && this.reloc.state.preview);
     ov.visible.voxels = this.settings.overlayVoxels !== false && showMap;
     ov.visible.guide = showMap;
@@ -1075,11 +1212,7 @@ export class CaptureSession {
     if (this._overlayKeyframesDirty) {
       this._overlayKeyframesDirty = false;
       if (this.sixdof) {
-        ov.setKeyframes(
-          this.frames
-            .filter((f) => f.tracked && spaceOf(f, this.capture) === this.space)
-            .map((f) => ({ pos: posePosition(f.pose), fwd: poseForward(f.pose), flagged: f.flags.includes('blurry') || f.flags.includes('rushed') })),
-        );
+        ov.setKeyframes(this.shownFrames().map((f) => ({ pos: posePosition(f.pose), fwd: poseForward(f.pose), flagged: f.flags.includes('blurry') || f.flags.includes('rushed') })));
       }
     }
     if (!this.sixdof || (this.voxels.stats().solid <= 50 && !(this.bounds && this.bounds.poly))) {

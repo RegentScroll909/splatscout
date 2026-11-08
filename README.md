@@ -10,12 +10,15 @@ building interiors well enough to make **clean Gaussian splats**. While you scan
   skips spots that can't be reached. The last pass sends you to the spots that still need angles, sweeping
   along in one direction at the height you hold the phone, and says it's done at 93% (2.3). A skipped spot
   never comes back.
-- **Keeps its place in your scan (2.1, 2.2)**: when tracking is lost, the position jumps, or the AR session
-  stops (screen off, app closed, another day), the next view is matched against the surfaces already scanned,
-  so the scan area, coverage and path come back instead of starting over. Along a hallway, where plain walls
-  fit anywhere, the camera image is compared with your earlier photos (signs, posters, door numbers) to tell
-  where along it you are. If it takes a while, tap your spot on the map; or fine-tune by hand, or start a new
-  map if a room has changed.
+- **Survives losing tracking (2.7)**: when tracking is lost and a quick check doesn't line the view up again,
+  tap **Keep scanning (new part)** and carry on at once: no searching while photos wait. A new part starts with
+  a few photos of what you scanned just before (the app shows them and counts to 8), and SplatStation joins the
+  parts from those photos into one splat. Meanwhile the app keeps looking for your earlier scan in the
+  background; when it recognises the place, the earlier coverage, scan area and path come back on screen (for
+  the map on the phone only: the export keeps each part in its own AR coordinates). *Continue in AR* on
+  another day works the same way. The search that holds photos (2.1, 2.2) is still there as **Find my place**
+  and the **Align** tool, and a slow, steady sweep now actually feeds it (it used to wait for views that never
+  came).
 - **Scan bounds (2.0, 2.2)**: only what's inside the outline counts (half a hallway, one end of a lobby), and
   you can tap Skip to leave out spots you can't capture well, like windows and mirrors. SplatStation crops the
   finished splat to the same outline. A rough rectangle is enough: the path keeps clear of the walls the
@@ -29,7 +32,10 @@ building interiors well enough to make **clean Gaussian splats**. While you scan
 - **Coaches you live**, one instruction at a time: slow down, you're turning in place, too close, blank
   wall, window blowing out, tracking lost, gap in overlap, wrong height for this pass… Optional voice coaching.
   In front of a plain wall it asks for slower turns, and it warns "Tracking is slipping" (and holds photos)
-  before tracking is lost (2.3).
+  before tracking is lost (2.3). From the AR camera image it says "Plain wall: get the corner or the floor in
+  view" when too little detail is in view (or it's bunched in one corner of the frame), and "Plain wall: turn
+  slowly" when you turn fast in front of one; the gap pass looks at long walls at an angle rather than head-on
+  (2.7). The capture guide has a page on temporary markers for long blank walls.
 - **Walks you through a capture plan** for the type of space (room, hallway, large hall, stairwell,
   object, freestyle), pass by pass (eye level, overhead, low, cross, details), with progress for each pass.
 - **Points you at what's missing** with an AR beacon and the centre arrow, and shows a live floor-plan map
@@ -109,10 +115,10 @@ mode automatically.
    to stop. Each pass moves on to the next by itself.
 4. **Fill the gaps**: the last pass puts a ring on the floor where to stand and a ring on the surface to aim at.
    The capture is complete at about **Area 85%**. Use **Skip** (left) for windows, mirrors or unreachable corners.
-5. If **Re-aligning** appears (tracking was lost), sweep the phone over something you scanned before until it
-   says *Found it*. In a hallway, aim at something that only appears once (a sign, a poster, a door number).
-   If it takes a while, tap **Show me on the map** and tap where you're standing. To continue another time:
-   **Capture more → Continue in AR**.
+5. If tracking is lost and the view doesn't line up again, tap **Keep scanning (new part)**, step back to where
+   it was lost and photograph what you scanned just before (the panel shows those photos and counts to 8), then
+   carry on. SplatStation joins the parts. To continue another time: **Capture more → Continue in AR** (a new
+   part too: start near one of the photos shown).
 6. **Done** grades the capture on the spot: *Keep capturing* or *Finish & review*.
 7. In Review: check the fixes, then **Export**, choose what to include, and **Save ZIP**. Or **Upload** it to
    the club database (below).
@@ -120,73 +126,62 @@ mode automatically.
 The in-app **Capture guide** is the full field manual: golden rules, technique for each type of space,
 lighting, tricky surfaces, and a "splat symptom → capture fix" table.
 
-### The club (beta): photos and scans from many people
+### The club (beta): full scans from many people
 
-Anyone invited can add to one shared dataset, filed by building, floor and room, for SplatStation to turn into
-splats (and merge, when several people covered the same room). It is a **closed beta**: you join with an invite
-code, a handle (shown on the leaderboard) and by agreeing to the rules, and the club database accepts nothing
-from anyone else. **[crowd/ADVISOR-BRIEF.md](crowd/ADVISOR-BRIEF.md)** explains what it does, the safeguards, and
-what is still open (permission, consent wording, faces); it also has a five-minute demo script.
+Anyone invited can add scans to one shared map of campus, filed by building, floor and room. The club takes **full
+scans only**: one member scanning one space in one go, so its splat has one lighting and one arrangement of the
+furniture. (Single photos from many people and times were tried and retired: their mixed light and moved
+furniture make blotchy, ghosted splats, and photos taken here and there rarely cover a space well.) It is a
+**closed beta**: you join with an invite code, a handle (shown on the leaderboard) and by agreeing to the rules,
+and the club database accepts nothing from anyone else. **[crowd/ADVISOR-BRIEF.md](crowd/ADVISOR-BRIEF.md)**
+explains what it does, the safeguards, and what is still open (permission, consent wording, faces); it also has a
+five-minute demo script.
 
-- **Club** (home screen): join, your points and rank, missions, the leaderboard (this week / all time) and the
-  photos you sent with what the club made of each. *Leave the club* deletes everything you sent.
-- **Take photos** (single photos, no full scan needed): pick the building, floor and room, then shoot. Each photo
-  is checked on the spot and a bad one isn't kept: motion blur (compared with what the camera just saw), too dark
-  or washed out, or almost the same view as a photo you just took. The shutter ring turns green when the camera is
-  steady. Photos are saved on the phone first and sent in the background, so it works without a signal; once
-  sent, only a thumbnail stays on the phone. Camera only: there is no gallery upload.
-- **Track position (AR)** (Take photos → *Camera*): the photos are taken inside an AR session (the scan's WebXR
-  tracking, without depth) and each one keeps where the phone was: its AR pose (position and direction, in metres),
-  the AR camera's lens and the AR session it belongs to. Within one session the poses agree to centimetres, so
-  SplatStation starts COLMAP from them (below): the photos line up faster and the splat comes out in metres, so the
-  Campus page gets the space's real floor area. AR photos are the AR camera's own frames, smaller than ordinary
-  ones (860×1920, about 1.7 MP, on the club's Pixel; ordinary photos are kept at about 2–3 MP), so which makes the
-  better splat is for **Measure quality** on SplatStation to settle (the held-back PSNR of splats of the same
-  space). No photo while AR is unsure of its position (the ring turns amber). Going up or down the stairs, the
-  height change suggests the new floor ("You went up about 4.2 m. Now on floor 2?"): one tap confirms it, *Same
-  floor* counts from there. A new AR session starts whenever tracking starts over somewhere else.
+- **Club** (home screen): join, your points and rank, **Start a scan**, missions (each with *Scan here*), the
+  leaderboard (this week / all time) and **My scans**: each scan you sent, waiting for the club, being built and
+  reviewed, approved (with its points) or not approved (with the reason). *Leave the club* deletes everything you
+  sent.
+- **Sending a scan:** on its review screen, **Upload to the club** is there once the capture coach grades the scan
+  **B or better** (the database refuses anything lower too); below that, the screen says to fix what's listed with
+  *Capture more* first. It uploads as your handle, one photo at a time, so a dropped connection resumes with
+  **Resume upload**; *Remove from club database* deletes your upload again. Photos carry no GPS or camera metadata
+  (they come from the canvas); the GPS reading is stored with the scan's details instead.
 - **Which building:** *Find my building* uses GPS to pick from ASU's buildings (outlines from OpenStreetMap, all
   four campuses). It only picks by itself when the fix is good to 40 m and inside one building; indoors GPS is
   often off by 10–50 m, so it offers the nearby buildings to tap instead. Typed names are matched to the same
-  list ("Schwada Building" → Schwada Classroom Office Building), so everyone's photos of a building land together.
+  list ("Schwada Building" → Schwada Classroom Office Building), so everyone's scans of a building land together.
   Floor and room come from you (the sign by the door).
 - **Off limits:** residence halls and housing, health, police and courts, and children's centers can't be picked,
-  and the club database refuses photos and scans for them (the list is from OpenStreetMap's building types, and
-  SplatStation's Club page can add or remove any building).
-- **Points** (decided by SplatStation after a person has looked at the photo): 1 per accepted photo (up to 100 a
-  day), +5 for the first photo of a room, +3 for the first photo of a room in morning, afternoon, evening or night
-  light, a mission's bonus on top, and 30–130 for a full scan. Light slots are what the dataset needs most: a
-  splat built from one lighting condition is much cleaner than one built from a mix.
-- **Missions:** the club asks for a view in a kind of light ("Hayden lobby in evening light, +3 each"). A mission
-  asking for evening light only scores in the evening.
-- **Campus map** (Club → *Campus map*): ASU's buildings coloured by how much of their floor area the club's photos
-  cover (one blue, darker = less done; dark grey = off limits), with you on it when location is allowed. Under the map:
-  the buildings *near you*, the spaces that are *good to shoot now* (they need the light it is now) and the ones
-  closest to Good. Tap a building for its spaces: each has its quality band, its accepted photos in each kind of
-  light, and "about 33 more photos in evening light (4–8 pm) would make it Good"; *Take photos here* opens Snap
-  with the building, floor and room filled in and says whether it's the right light now. The list of buildings
-  under the map has the same information without the map. The numbers come from SplatStation's Campus page,
-  which publishes them for members (counts only, no names or GPS points); the phone keeps the last copy for
-  places with no signal.
-- **Scans** work as before (Upload on the review screen), but now need membership and upload as your handle.
-  Photos go one by one, so a dropped connection resumes with **Resume upload**. *Remove from club database*
-  deletes your upload again. Photos carry no GPS or camera metadata (they come from the canvas); the GPS reading
-  is stored with the capture's details instead.
-- **Where it goes:** a Supabase project (free plan: about 1 GB, roughly 3–6 scans or 1,500–2,500 single photos;
-  SplatStation's *Free cloud space* moves accepted photos off it). Single photos land in the private
-  `club-photos` bucket as `<building>/<floor-room>/<photo id>.jpg`, scans in `captures`, with one row per
-  photo or scan. Each phone signs in anonymously and the database rules let it add, finish and delete only its
-  own uploads (at most 400 photos a day), never see anyone else's, and never set its own points.
+  and the club database refuses scans of them (the list is from OpenStreetMap's building types, and SplatStation's
+  Club page can add or remove any building).
+- **Points** (decided on SplatStation when the club approves the splat built from your scan): 30 for a scan graded
+  A, 20 for B, +1 for every 10 m² of floor it adds to the campus map (up to 30), and a mission's bonus. A new scan
+  of a space the map already has as Good earns 5, unless a mission asks for one. A scan the club doesn't approve
+  earns nothing, and you see why.
+- **Missions:** the club asks for a scan of a space ("Scan the Hayden reading room, +15"), in one kind of light if
+  it likes; *Scan here* opens the scan setup with the building, floor and room filled in.
+- **Campus map** (Club → *Campus map*): ASU's buildings coloured by how much of their floor area the club's
+  approved splats cover (one blue, darker = less done; dark grey = off limits), with you on it when location is
+  allowed. Under the map: the buildings *near you*, and the spaces on the map that aren't Good yet. Tap a building
+  for its spaces: each has its quality band (or *In review*), where it stands ("On the map, but fair: a new scan
+  graded A or B would make it better") and **Scan here**. The list of buildings under the map has the same
+  information without the map. The numbers come from SplatStation's Campus page, which publishes them for members
+  (counts and sizes only, no names or GPS points); the phone keeps the last copy for places with no signal.
+- **Where it goes:** a Supabase project (free plan: about 1 GB, roughly 3–6 scans at a time; import scans onto
+  SplatStation and delete their cloud copies to make room). Scans land in the private `captures` bucket under
+  `<building>/<floor-room>/<scan id>/`, with one row per scan. Each phone signs in anonymously and the database
+  rules let it add, finish and delete only its own uploads, never see anyone else's, and never set its own points
+  or review note.
 - **Set up** (once, in the Supabase SQL Editor, each in a *new* query): turn on anonymous sign-ins, run
   [`crowd/supabase-setup.sql`](crowd/supabase-setup.sql), then [`crowd/supabase-beta.sql`](crowd/supabase-beta.sql),
   then [`crowd/supabase-campus.sql`](crowd/supabase-campus.sql) (the Campus map's summary: members read it, only
-  SplatStation writes it) and [`crowd/supabase-campus-2.sql`](crowd/supabase-campus-2.sql) (each space's floor
-  area and the floor counts the club sets; without it phones use typical sizes), and
-  [`crowd/supabase-snap-pose.sql`](crowd/supabase-snap-pose.sql) (photo positions from Track position: a `pose`
-  column members write only with their own new photo, in a checked shape; without it AR photos are sent without
-  their position). Each ends with a one-row result saying it was installed; "Success. No rows returned"
-  means an older saved query ran instead. The project URL and publishable key are in `app/js/data/crowd.js`;
-  make invite codes on SplatStation's Club page.
+  SplatStation writes it), [`crowd/supabase-campus-2.sql`](crowd/supabase-campus-2.sql) (each space's floor area
+  and the floor counts the club sets; without it phones use typical sizes) and
+  [`crowd/supabase-scans-only.sql`](crowd/supabase-scans-only.sql) (full scans only: no new single photos, scans
+  graded A or B, the review note members read, and a leaderboard and missions that count approved scans).
+  `crowd/supabase-snap-pose.sql` belonged to the retired single photos and isn't needed. Each ends with a one-row
+  result saying it was installed; "Success. No rows returned" means an older saved query ran instead. The project
+  URL and publishable key are in `app/js/data/crowd.js`; make invite codes on SplatStation's Club page.
 
 ## 3. Use the export in your pipeline
 
@@ -196,9 +191,16 @@ Building_Room_YYYYMMDD/
   splatscout.json              per-photo metrics, flags, poses, capture metadata, scan area ("bounds")
   poses/transforms.json        AR camera poses (Nerfstudio / Instant-NGP, OpenGL convention)
   poses/colmap/sparse/0/       same poses as a COLMAP text model (cameras/images/points3D + rigs/frames)
+  poses/parts/<k>/colmap/sparse/0/  a scan in parts: each other part's poses, in its own AR coordinates
   poses/points.ply             coloured AR depth points on confirmed surfaces inside the scan area
   coverage.png, README.txt
 ```
+
+- **A scan in parts** (tracking was lost and it carried on as a new part): `splatscout.json` lists the `parts`
+  (part number, AR coordinate space, segments, photos, where its poses are, its own scan outline) and gives
+  every photo its `part` and `segment`. The main part (the most photos) is the one in `transforms.json` and
+  `colmap/sparse/0`, and top-level `bounds` is its own outline; each part starts with photos overlapping the one
+  before. `phoneLink` is how the phone lined a part up for its coverage map: approximate, not used for poses.
 
 - The photos are already sharp, well-spaced keyframes, so skip any "extract frames from video" step. Treat them as a
   single camera (`--ImageReader.single_camera 1` in COLMAP).
@@ -253,63 +255,91 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   upload. Put that address in SplatScout → Settings → *SplatStation address* to get an "Open SplatStation" button
   after each export. Campus Wi-Fi often blocks phone-to-PC traffic; use USB there.
 - **Copy files** into `%USERPROFILE%\SplatStation\inbox`.
-- **Club uploads:** put the Supabase project's secret key in `%USERPROFILE%\SplatStation\crowd.json`
+- **Club scans:** put the Supabase project's secret key in `%USERPROFILE%\SplatStation\crowd.json`
   (`{"url": "https://….supabase.co", "secretKey": "sb_secret_…"}`; it never leaves this PC, and the club tools only
-  answer requests from this PC, not from the Wi-Fi). *Club uploads* on the dashboard then lists the scans phones
+  answer requests from this PC, not from the Wi-Fi). *Club scans* on the dashboard then lists the scans members
   sent, by building. **Import** downloads one into *Ready to process* as a normal SplatScout ZIP filed under the
-  shared building name and awards the member their points; **Delete** removes it from the club database for good.
-- **Club photos & members** (the button on that section, or `/club.html`): **Sync photos** downloads new photos and
-  checks each one (size, sharpness against the rest of the outing, light, near-duplicates of the same member's
-  photos, GPS far from the building, a wrong phone clock). Each gets a first opinion (*ok*, *review*, *reject*) and
-  you look through the thumbnails and **Accept** or **Reject**. Accepting awards the points. **Rejecting deletes
-  the photo** here and in the cloud (it may show a person), with the reason shown to the member. Accepted photos
-  stay on this PC; *Free cloud space* removes their cloud copies. For a room with 10 or more accepted photos,
-  **Build a capture** puts them into *Ready to process* like a camera-mode capture, so they become a splat the
-  usual way. Photos taken with *Track position (AR)* bring their AR poses: the AR session with the most photos of
-  the room (10 or more) sets the coordinates, its photos go first, and its poses go into the ZIP as the same COLMAP
-  model a scan carries, so COLMAP starts from them (with 20 or more) and the splat is in metres. Every AR photo,
-  from any session, shares its exact lens; COLMAP places the other photos (other AR sessions, ordinary photos,
-  other phones) in rounds, each round triangulating what the last one added (see *What was tested*).
-  The page also makes **missions**, **invite codes** (who can join and how many times), pauses, renames
-  or removes members (removing deletes everything they sent), and edits the list of off-limits buildings.
+  shared building name (no points yet: they come with your approval); **Delete** removes it from the club database
+  for good.
+- **Review scans & members** (that section's button, or `/club.html`): the **Scans** queue, in tabs: *Splats to
+  review*, *Not on this PC yet* (**Import and build**), *Being built*, *Approved* and *Not approved*. Once a scan's
+  splat is built, **View the splat** opens it in the viewer and **Place it in the building** opens it among the
+  building's other splats (below). **Approve** puts it on the campus map and gives the member their points (the
+  button says how many; hover it for why: grade, new floor area, mission); **Don't approve** asks for a reason the
+  member reads in the app (people in view, too blurry or patchy, not a public area, a screen or document, the wrong
+  place). The splat stays on this PC either way. The page also makes **missions** (scan a space; a bonus when a scan
+  of it is approved), **invite codes** (who can join and how many times), pauses, renames or removes members
+  (removing deletes everything they sent), and edits the list of off-limits buildings.
 - **Campus map** (dashboard header, or `/campus.html`, this PC only): every ASU building on a map, coloured by
-  how much of its floor area is covered, with the GPS points where photos and scans were taken. Click a building
-  for its floors and spaces (each room or area members tagged), and a space for how good a splat to expect, how
-  that number was reached, its size, its photos by light, the splats built from it with a link to the viewer, and
-  what would make it better; *Ask members for photos* turns that into a mission. Above the map: the spaces ready
-  for a good splat, the campus floor area covered, buildings started, photos, splats and members. Below it, each
-  with a table view: **How good a splat to expect** (the rule of thumb for rooms, hallways and large spaces against
-  photo count, with the club's spaces and finished splats on it), **Buildings by floor area covered**, **Light
-  coverage** (photos per building, or per space, in each kind of light) and **Photos sent per day**, then a
-  sortable table of every building and *How the numbers work*.
+  how much of its floor area is covered, with the GPS points where scans were made. Click a building for its floors
+  and spaces (each room or area a scan was tagged with), and a space for its quality, how that number was reached,
+  its size, the splats built from it (on the map, or waiting for your review) with a link to the viewer, and what
+  would make it better; *Ask members for a scan* turns that into a mission. Above the map: the spaces Good or
+  better, the campus floor area covered, buildings started, splats on the map, what's waiting for you, and members.
+  Below it, each with a table view: **How good a splat to expect** (the rule of thumb for rooms, hallways and large
+  spaces against the photos in a scan, with the club's splats on it), **Buildings by floor area covered**, **Light
+  coverage** (scans per building in each kind of light) and **Scans sent per day**, then a sortable table of every
+  building and *How the numbers work*.
 
-  The numbers are estimates, and the page says so. A space's expected quality comes from its photos (in a room
-  about 125 photos in one kind of light make it Good and 208 Excellent; hallways and big lobbies need more; mixed
-  light counts less), from a scan's grade, or from a finished splat (measured, or what it promised less for photos
-  COLMAP couldn't place, a high reprojection error or quick training). A building's completion is the share of its
-  floor area (footprint from OpenStreetMap × floors) that its spaces cover: each space counts for its own floor
-  area, in proportion to how close it is to Good. A space's area is measured when its splat was lined up with the
-  phone's AR tracking (so is in metres): from its scan's outline, or, for club photos taken with Track position,
-  from the floor the splat shows where the photos were taken (the walk map's floor reachable from the phone's
-  path, and the furniture it surrounds; through an open door it runs on up to 3 m); otherwise it's typical for its size (small room 20 m², room 60,
-  big room 120, hallway 150, lobby 400, very large space 1,000), guessed from its name until you pick one on the
-  space's panel. Floors come from OpenStreetMap, or 2 until you set them on the building's panel. So one small room
-  in a four-floor library is a fraction of a percent, and the building's panel shows each floor's share. Offices and
-  rooms the club can't enter count too, so a building whose public spaces are all done still shows well under 100%.
-  Photos waiting for review count straight away (rejecting one takes it off), and **Live** checks for new ones every
-  15 seconds and rings each new point on the map, so the map moves with every photo sent. **Start fresh** counts
-  only what arrives from then on, to show a building fill up photo by photo; nothing is deleted, and *Count
-  everything again* switches back. Your existing splats are filed under their building by name ("Schwada
-  Building" counts for Schwada Classroom Office Building).
+  A space is on the map once a splat of it is: a member's after you approve it on the Club page, or one made on this
+  PC from your own scan. Its quality is its best splat's: measured, or what its scan's grade promised less for photos
+  COLMAP couldn't place, a high reprojection error or quick training (the page says which). A building's completion
+  is the share of its floor area (footprint from OpenStreetMap × floors) that its spaces cover: each space counts for
+  its own floor area, in proportion to how close it is to Good. A space's area is measured when its splat was lined
+  up with the phone's AR tracking (so is in metres): from its scan's outline, or else from the floor the splat shows
+  where the photos were taken (the walk map's floor reachable from the phone's path, and the furniture it surrounds;
+  through an open door it runs on up to 3 m); otherwise it's typical for its size (small room 20 m², room 60, big
+  room 120, hallway 150, lobby 400, very large space 1,000), guessed from its name until you pick one on the space's
+  panel. Floors come from OpenStreetMap, or 2 until you set them on the building's panel. So one small room in a
+  four-floor library is a fraction of a percent, and the building's panel shows each floor's share. Offices and rooms
+  the club can't enter count too, so a building whose public spaces are all done still shows well under 100%. Scans
+  waiting for your review show on the map and in their space, but count only once approved; **Live** checks for new
+  scans every 15 seconds and rings each new point on the map. **Start fresh** counts only what arrives from then on,
+  to show a building fill up scan by scan; nothing is deleted, and *Count everything again* switches back. Your
+  existing splats are filed under their building by name ("Schwada Building" counts for Schwada Classroom Office
+  Building).
 
-  **Publish to members** (top of the page) sends the phones' Campus map a summary: each space's expected quality
-  and floor area, its accepted photos per kind of light, how many wait for review, and about how many more photos,
-  in which light, would make it Good, plus the floor counts you set. The count is worked out with the same rules (so
-  the phone and this page agree, mixed light and scans included). No member names, no GPS points, nothing in
-  off-limits buildings. It also publishes by itself a few seconds after you review photos, change a size or a floor
-  count, or start fresh, and within a minute of new photos arriving while SplatStation runs. Needs
+  **Publish to members** (top of the page) sends the phones' Campus map a summary: each space's quality and floor
+  area, how many splats of it are on the map and how many of its scans wait for review, plus the floor counts you
+  set, worked out with the same rules (so the phone and this page agree). No member names, no GPS points, nothing in
+  off-limits buildings. It also publishes by itself a few seconds after you review a scan, change a size or a floor
+  count, or start fresh, and within a minute of a new scan arriving while SplatStation runs. Needs
   `crowd/supabase-campus.sql` run once in the Supabase SQL editor, and `crowd/supabase-campus-2.sql` for sizes and
   floor counts (until then it publishes without them).
+
+  **Where photos were taken (beta).** Every splat built on this PC knows where each of its photos was taken: its
+  COLMAP model holds the camera positions, the way each photo looked and the points it reconstructed. A building's
+  panel draws them on its OpenStreetMap footprint, one floor at a time: a dot where each photo was taken with a
+  faint cone the way it looked, the scan's outline, and the points (walls show as lines; plain white walls give few,
+  so the cameras are the main sign). The parts of a floor without dots are the gaps. Under the plan: how much of
+  that floor was photographed (the footprint within 1.5 m of a photo, or inside a scan's outline).
+
+  **Open in 3D** (or `/building.html?code=<building code>`) shows the footprint extruded by the building's floors
+  (4 m apart, as many as the Campus page counts), each capture's points in its own colour, a small frustum where
+  each photo was taken, and a floor picker; *Photo colours* shows the points as the photos saw them, *Plan* the
+  floor from above. A phone's AR session doesn't know which way north is, so each capture is placed on the
+  footprint once: its **Place** button opens the plan, where you drag it, turn it (Shift + drag, the turn buttons,
+  or `[` and `]`), pick its floor, or **Line up two points**: click a point of the room you can also find on the
+  outline (a corner, the end of an outside wall), then where it is on the outline, then the same for a second point.
+  Captures lined up with the phone's AR tracking are in metres, so only their turn and position change; a
+  COLMAP-only solve also takes its scale from the two points (or type it). Until a capture is placed it is drawn
+  dashed at a guess and doesn't count: at its GPS fix (captures from SplatScout 2.4 on), moved inside the outline,
+  else spread along the building, turned so its walls run with the building's (which quarter turn is up to you).
+  Placements are saved in `campus.json` under `placements`, by library folder. The first time a building is opened,
+  SplatStation reads each splat's model from its job folder and keeps what it needs beside the splat
+  (`scene.cameras.json` and `scene.points.bin`, up to about 1 MB); it also does that when a job finishes and before
+  a job is deleted, so camera positions outlive the job folder. A splat whose job was deleted before this existed
+  shows its own points but no cameras (process its ZIP again to get them back).
+
+  **Reviewing a new splat in place (beta):** `/building.html?code=<building>&review=<library path>` opens the
+  building with that splat, and the placed splats nearest it, shown as real splats (lighter copies made once and kept
+  beside each splat: `scene.lod-near.splat`, up to 800,000 splats, for the one under review, and `scene.lod-far.splat`,
+  250,000, for its neighbours). Move it like a jigsaw piece (Shift + drag in 3D, drag on the plan, arrow keys, the turn
+  buttons), then **Snap to neighbours**: it turns, shifts and rises it (never tilts or scales) until its points sit on
+  its placed neighbours' where they overlap, a shared doorway or wall (point-to-plane ICP). A box says how well it fits
+  (how far apart, over what share of its points), before and after; **Undo** (Ctrl + Z) steps back. **Approve** saves
+  where it sits and approves the member's scan, as on the Club page (its points, and the splat on the campus map);
+Reject asks for a reason, which the member reads in the app (`station/web/review.js`).
 
 **Quality presets** (choose on the dashboard; you can re-train any finished job with a different preset):
 
@@ -401,6 +431,16 @@ the result in the AR coordinates of the capture with the most AR positions. So t
 level floor, every phone's scan area is used for cropping (moved into those coordinates), and walk mode works.
 The original captures stay as they are. 360° videos can't be merged yet.
 
+**Scans in parts (2.7).** A scan whose tracking was lost on the phone arrives in parts, each in its own AR
+coordinates. The part with the most photos sets the coordinates (metres, level floor), as one capture would.
+COLMAP matches photos within each part and across them (every photo against every other where one part ends and
+the next begins, when the scan is too big to match everything). Once a few of another part's photos are placed,
+they say where the whole part sits, so all its photos go in where its own AR poses put them, plain walls
+included; a photo COLMAP had matched to a look-alike spot far from there goes back to its AR pose. Rounds of
+registration and triangulation place the rest, then one adjustment refines it all. The crop uses the main
+part's outline, and any outline marked in another part is moved in by where that part's photos ended up. The job
+log says how much of each part was joined.
+
 **What it needs:** an NVIDIA GPU, plus the following, all found automatically. Paths can be changed in
 `%USERPROFILE%\SplatStation\station.config.json`.
 - COLMAP 4.x with CUDA (`C:\Tools\COLMAP`).
@@ -411,7 +451,7 @@ The original captures stay as they are. 360° videos can't be merged yet.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (58 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (64 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
@@ -419,35 +459,34 @@ Tested on this PC:
   kept off the walls when the outline is drawn around the door recesses, the gap pass (spots you can reach at
   the height you hold the phone, a skipped spot never coming back, everywhere you've walked counting as
   reachable), lined-up sessions sharing one map, photos while walking, coaching priority/hysteresis (slower
-  turns at plain walls, slipping tracking first), scoring, COLMAP/transforms export, ZIP validity,
+  turns at plain walls, slipping tracking first), scans in parts (a loss that doesn't line up offers a new part
+  at once and the earlier map is found in the background; a slow sweep gathers views; a recorded scan with a
+  simulated loss exports two parts, and SplatStation's pairs, part fit, look-alike rejection and outline move put
+  them back together), plain-wall warnings and angled views of long walls, scoring, COLMAP/transforms export, ZIP validity,
   splat cropping (big background splats kept, a crop changed and undone without losing anything), and walk mode (floor, walls, a plain wall of big flat splats, a table, a doorway, floor holes,
   floaters, sliding along walls, an upside-down splat of unknown size, COLMAP text and binary camera files), and the
   360° camera rig (each cut view turned the way ffmpeg cuts it), and merging phones (pairs within and across
   captures; each phone's scan area moved into the main phone's coordinates), and the club (GPS picking a
   building only when sure, typed names matched to the ASU list, housing and health off limits; joining with an
-  invite code; the on-phone photo queue sending in the background, waiting out a busy server, stopping on a
-  refusal and resuming; leaving deleting everything; scan uploads resuming without sending anything twice;
-  SplatStation's first opinions on photos, points for the first photo of a room, a new light and missions with
-  the daily limit, a rejected photo deleted everywhere, a capture built from accepted photos, members, invites,
-  and refusing requests from the Wi-Fi), and the campus view (expected quality from photos, mixed light, scans and
-  finished builds; photos waiting for review counted; floor area covered, floor by floor, with sizes guessed, set
-  or measured from a scan; a fresh start and back; photos, splats and queued captures of one room joined into one
-  space; campus totals, map points and daily activity), and the phone's campus map (exact photo counts to Good,
-  mixed light and scans included; the published summary leaving out names, GPS and off-limits buildings; never
-  publishing when the database couldn't be read; members only; building completion on the phone equal to the
-  Campus page's, with or without supabase-campus-2.sql; stale rows removed on the next publish; the last copy kept offline),
-  and Track position (the pose saved with an AR photo and the shape the database takes, poses the PC can use or
-  must refuse, the floor suggested from the height change; AR photos sent with their pose, and without it to a
-  database that doesn't take positions yet; a capture built from AR photos with the biggest session's poses as
-  COLMAP's model, numbered as COLMAP numbers the files, every AR session sharing its exact lens; the AR model
-  renumbered to COLMAP's database; the floor area measured on a walk map, a stray camera kilometres off
-  changing nothing). They run against an in-memory stand-in for Supabase
+  invite code; leaving deleting everything; a scan graded C or a single photo refused; scan uploads resuming
+  without sending anything twice; SplatStation importing a scan without awarding points; the review list with what
+  approving each splat would earn (grade, new floor area, a mission's bonus), approving once only, turning one
+  down with a reason the member reads, members, invites, missions, and refusing requests from the Wi-Fi), and the
+  campus view (quality from scans and finished builds; approved and your own splats on the map, members' scans and
+  splats waiting for review shown but not counted; floor area covered, floor by floor, with sizes guessed, set or
+  measured from a scan; a fresh start and back; scans, splats and queued captures of one room joined into one
+  space; campus totals, map points and daily activity), and the phone's campus map (the published summary leaving
+  out names, GPS and off-limits buildings; never publishing when the database couldn't be read; members only;
+  building completion on the phone equal to the Campus page's, with or without supabase-campus-2.sql; stale rows
+  removed on the next publish; the last copy kept offline), and COLMAP starting from AR poses for some photos
+  only (a capture's photos numbered as COLMAP numbers the files, the AR model renumbered to COLMAP's database; the
+  floor area measured on a walk map, a stray camera kilometres off changing nothing). They run against an in-memory stand-in for Supabase
   (`tools/fake-supabase.mjs`; `tools/fake-supabase-server.mjs` serves it so the phone app and SplatStation can be
-  tried together; `--demo` fills it with made-up members and photos to try the Campus map). The database rules themselves are tested on a real Postgres with `tools/sql-test.mjs`
+  tried together; `--demo` fills it with made-up members and scans to try the Campus and Club pages). The database rules themselves are tested on a real Postgres with `tools/sql-test.mjs`
   (needs `npm install --no-save @electric-sql/pglite`): who can add what, that points only come from
-  SplatStation, members-only views, the daily limit, bans, leaving, the campus summary (members read it,
-  strangers and the bare public key see nothing, only the secret key writes it), and photo positions (written
-  only with your own new photo, in the right shape, never changed afterwards; restricted places still refused).
+  SplatStation, members-only views, bans, leaving, the campus summary (members read it, strangers and the bare
+  public key see nothing, only the secret key writes it), and scans only (no new single photos, scans graded A or
+  B, points and missions from approved scans, the review note).
 - **The guide loop (2.3)**, with a simulated person following every pass of the Practice hallway and room
   (walking, turning, taking the photos the app asks for, pressing Skip when it offers). Before: the last pass
   never ended (in the hallway, still going after 15 minutes with 83 turn reversals and 96 trips back), and since
@@ -459,8 +498,9 @@ Tested on this PC:
   Library tile and the Campus map), then six of the club's captures trained on Quick and Standard with every 12th
   photo held back. The renders of the held-back views were checked by eye against the photos to set the PSNR
   thresholds: see the table under *Measure quality*. Brush prints nothing to a pipe unless `RUST_LOG` is set.
-- **Track position on SplatStation**, with the real Schwada "Dd" scan's 233 photos (860×1920) made into club
-  photos: 120 from one AR session (their real AR poses), 80 from a second session in other coordinates (turned 70°
+- **Track position on SplatStation** (single photos are retired since; the COLMAP side, several AR sessions solved
+  into one model in metres, stays for joining a scan's parts), with the real Schwada "Dd" scan's 233 photos
+  (860×1920) made into club photos: 120 from one AR session (their real AR poses), 80 from a second session in other coordinates (turned 70°
   and moved 6 m) and 33 ordinary photos (smaller, no pose), built by *Build a capture*'s code and processed by the
   usual pipeline (Quick, *Measure quality* on). The AR-pose solve placed 232 of 233 photos at 0.41 px and in
   metres (distances between photos 0.98 of the AR tracking's), the second session's photos a median 10 cm and the
@@ -472,6 +512,15 @@ Tested on this PC:
   or with another kind of camera; `image_registrator` never triangulates, so one pass placed only 207 photos; each
   of the second session's photos started from COLMAP's default lens guess (2,304 px for 1,374) and one settled 9 m
   off; and adjusting one outing's poses freely let a weakly linked stretch slide (18 photos over a metre in one run).
+- **Building view (beta)** on Schwada Classroom Office Building's four splats: Snall's model (1,052 photos and
+  420,640 points) read from COLMAP's binary files in a quarter of a second and thinned to 54,554 points, its photo
+  positions identical to COLMAP's own text export; all four read in 0.6 s the first time and 20 ms after that; drawn
+  in 3D on the footprint and on the floor plans; one placed by dragging and by lining up two points, saved and read
+  back. The guesses turned Snall's and Dd's walls square to the building's. "Hehd dueh" lost its job folder before
+  this existed, so it shows the splat's own points and no cameras. The self-checks cover the model reader (text and
+  binary, two lenses, a photo's 1,500 2-D points skipped), thinning, the placement maths (never mirrored, two pairs
+  fit exactly, the scale kept for AR captures, guesses inside the outline, floors, how much of a floor was
+  photographed) and the whole building view on a made-up library, cameras outliving their job folder.
 - **Cropping** on the Schwada "Snall" splat (2.2 million splats), whose plain white walls came out dark and
   see-through. The walls sat right on the outline and the crop removed only 0.1% of the solid splats at wall
   height, but cropping at 0.5, 1 or 2 m all left them dark: 73,000 large faint splats 7–28 m away outweighed
@@ -507,6 +556,19 @@ Tested on this PC:
   (photo matching now uses walls, doors and signs only), from middling photo matches (now "not sure"), and
   from the quick post-loss check correcting over a narrow view (it now only confirms an unchanged position;
   anything else gets the full search).
+- **Scans in parts (2.7)**, end to end with COLMAP 4.2 and Brush on the RTX 5080: the real Schwada "Jfbbch" scan
+  (414 photos, plain walls) split as if tracking had been lost after 55%, part 2 in AR coordinates turned 70° and
+  moved 3.6 m, exported by the app's own export code and built by the usual pipeline (Quick, *Measure quality* on).
+  411 of 414 photos in one model at 0.76 px; lined up with the original one-part solve on part 1's photos, part 2's
+  sit a median 9 cm from where that solve put them. Held-back photos: PSNR 23.9 dB, SSIM 0.930, against 22.9 dB
+  and 0.917 for the same scan unsplit through the same pipeline. 2 minutes, training included. With the
+  part-aware pairs used above 700 photos instead of matching everything: 414 of 414 at 0.73 px, part 2 a median
+  8.5 cm from the one-part solve, matching in 10 s instead of 33. The first run
+  exposed COLMAP placing a run of 23 plain-wall photos 1–4 m off on hundreds of points each, where their AR
+  poses were right: those now go back to their AR poses. In the Practice room: a 2 s loss with a 1.6 m / 45° jump
+  offered the new part at once, its 8 overlap photos were counted, the background search found the earlier map
+  within seconds (45.3°, 1.63 m), the scan area came back, and the export had both parts with the outline in
+  part 1's entry.
 - **Re-alignment in the Practice room**, which now starts every later session in shifted, turned coordinates
   like a real AR session: resuming a capture found its place within 2 cm about 10 s after starting; a simulated
   60 cm / 12° tracking jump and a 2 s tracking loss were both put back within 6 cm; lining up by hand from 9 cm
@@ -535,35 +597,41 @@ Not yet tested, because it needs real hardware: a live ARCore session on your Pi
 - Photo matching (2.2) was tuned on rendered scenes. Real hallways have exposure changes, motion blur and
   identical doors. If re-aligning in a real hallway still struggles, the capture's `alignLog` in the export
   records each lock with its photo score, which says whether the threshold needs moving.
-- **Track position (AR)** on Snap ran against a simulated WebXR session in a desktop browser (poses, a test
-  picture, a 4.2 m climb), not yet in a real AR session. On the Pixel: the AR view behind the Snap screen, the ring
-  going green, AR photos the right way up, and whether the floor suggestion holds up on real stairs (in a lift,
-  ARCore usually loses tracking, and a new AR session starts with no suggestion). Then process one room shot in AR
-  and one in ordinary photos with *Measure quality* on, to see which makes the better splat.
+- **Scans in parts on the Pixel**: lose tracking on purpose at a blank wall (or cover the camera for a few
+  seconds and turn), tap *Keep scanning (new part)*, take the overlap photos, and check that SplatStation's log
+  says both parts were joined. Also how often "Plain wall: get the corner or the floor in view" shows in a plain
+  hallway: its thresholds come from saved photos, not from live tracking losses, so they may need moving.
+- **Scans only (2.7)** was tried against the stand-in database, not yet with a real member's scan: send one from a
+  phone (graded B or better), import and build it on SplatStation, then approve it on the Club page and check the
+  points on the leaderboard and the space on both campus maps.
 
 ## 5. For developers
 
 ```
 app/js/core/      platform-independent logic (analysis, coverage, depth filter, scan bounds, guide, walkable floor
                   plan, re-alignment + photo matching, keyframes, coaching, plans, scoring, export formats,
-                  clubrules: club points and checks, campusmodel: expected quality and building completion,
-                  snappose: the AR pose kept with a Snap photo, and the floor from the height change)
+                  clubrules: the club's rules and points for an approved scan, campusmodel: splat quality and
+                  building completion)
 app/js/sources/   xrSource (WebXR/ARCore), cameraSource (getUserMedia + orientation), demoSource/demoScene (practice room, hallway)
 app/js/capture/   session engine, 3D overlay (+ guide geometry), minimap, audio
 app/js/data/      IndexedDB storage, settings, ZIP export, campus (ASU buildings + GPS), crowd (club uploads),
-                  club (membership, leaderboard, missions), snaps (the on-phone photo queue),
+                  club (membership, your scans and what the club made of them, leaderboard, missions),
                   campusmap (the published campus summary, kept offline; completion by campusmodel's rules)
 app/js/ui/        screens
 app/data/         asu-buildings.json (from OpenStreetMap: node tools/asu-buildings.mjs refreshes it)
 crowd/            supabase-setup.sql + supabase-beta.sql (the club database: tables, private buckets, rules, views),
                   supabase-campus.sql + supabase-campus-2.sql (the summary behind the phone's Campus map),
-                  supabase-snap-pose.sql (photo positions from Track position),
+                  supabase-scans-only.sql (full scans only, points and missions from approved scans),
+                  supabase-snap-pose.sql (positions for the retired single photos; not needed),
                   ADVISOR-BRIEF.md
 tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs, asu-buildings.mjs,
                   fake-supabase.mjs / fake-supabase-server.mjs (stand-in database), sql-test.mjs (database rules on Postgres)
 station/          SplatStation: station.mjs (server, queue, inbox, merges), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb,
-                  crowd + club + clubapi: the club, campus: the campus view's data),
-                  web/ (dashboard, viewer, walk.js: walk-mode collision shared with the self-checks, club, campus)
+                  crowd + club + clubapi: the club, campus: the campus view's data, colmapmodel: COLMAP models read
+                  as text or binary, placement: the building view's data and placements),
+                  web/ (dashboard, viewer, walk.js: walk-mode collision shared with the self-checks, club, campus,
+                  building: the building view, place.js: placing captures on a footprint (shared with the
+                  self-checks), plan.js: floor plans of where photos were taken)
 ```
 
 - `npm start`: local server on http://localhost:8080

@@ -1,265 +1,60 @@
-// Club beta, PC side: bring the photos phones sent onto this PC, check them, award points, run missions,
-// invites and members, and turn the accepted photos of a room into a capture for the usual pipeline.
-// Talks to the club's Supabase project with the secret key (see crowd.mjs and crowd/supabase-beta.sql).
-// Photos that are accepted stay on this PC; rejected ones are deleted at once (they may show people).
+// Club beta, PC side: the scans members send, the club's review of the splats built from them (approving
+// one awards its points and puts it on the campus map), missions, invites, members and off-limits places.
+// Talks to the club's Supabase project with the secret key (see crowd.mjs, crowd/supabase-beta.sql and
+// supabase-scans-only.sql). The club takes full scans only; single photos were retired.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, createWriteStream } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { randomInt } from 'node:crypto';
-import { Readable } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
 import { call, listAll, deleteUpload } from './crowd.mjs';
-import { analyzeImage } from '../../app/js/core/analyzer.js';
-import { ZipWriter } from '../../app/js/core/zip.js';
-import { distanceTo } from '../../app/js/data/campus.js';
-import { dhash, hamming, NEAR_DUPLICATE, photoChecks, scorePhoto, lightSlot, phoenixDay, POINTS, validHandle } from '../../app/js/core/clubrules.js';
-import { usablePose } from '../../app/js/core/snappose.js';
-import { colmapText } from '../../app/js/core/formats.js';
+import { validHandle } from '../../app/js/core/clubrules.js';
 
-const BUCKET = 'club-photos';
-const run = promisify(execFile);
 const chunks = (a, n) => Array.from({ length: Math.ceil(a.length / n) }, (_, i) => a.slice(i * n, (i + 1) * n));
-const inList = (ids) => `in.(${ids.join(',')})`;
+/** Errors from a club database that hasn't had supabase-scans-only.sql: no review notes yet. */
+const noNotes = (e) => /review_note/.test(e.message);
 
-// ------------------------------------------------------------------------------------ local copies
-export function clubDir(workDir) {
-  const d = join(workDir, 'club');
-  for (const s of ['photos', 'thumbs']) mkdirSync(join(d, s), { recursive: true });
-  return d;
+// ------------------------------------------------------------------------------------ scans
+const SCAN_COLS = 'id,user_id,created_at,building_code,building_name,floor,room,photo_count,grade,status,points,reviewed_at,contributor,lat,lon,gps_accuracy_m';
+
+/** Every scan members sent (not those still uploading), newest first, with the sender's handle. */
+export async function listScans(c) {
+  const rows = await listAll(c, `/rest/v1/captures?select=${SCAN_COLS},review_note&status=neq.uploading&order=created_at.desc`)
+    .catch((e) => (noNotes(e) ? listAll(c, `/rest/v1/captures?select=${SCAN_COLS}&status=neq.uploading&order=created_at.desc`) : Promise.reject(e)));
+  const handles = new Map((await listAll(c, '/rest/v1/profiles?select=user_id,handle')).map((p) => [p.user_id, p.handle]));
+  return rows.map((r) => ({ review_note: null, ...r, handle: handles.get(r.user_id) || r.contributor || 'former member' }));
 }
-export const photoFile = (dir, id) => join(dir, 'photos', id + '.jpg');
-export const thumbFile = (dir, id) => join(dir, 'thumbs', id + '.jpg');
-const indexFile = (dir) => join(dir, 'index.json');
 
-/** What was measured when each photo was downloaded: {id: {w, h, sharp, mean, clipHi, texture, phash, bytes}}. */
-export function loadIndex(dir) {
+async function patchScan(c, id, body) {
+  const send = (b) => call(c, `/rest/v1/captures?id=eq.${encodeURIComponent(id)}`, { method: 'PATCH', body: b, headers: { Prefer: 'return=minimal' } });
   try {
-    return JSON.parse(readFileSync(indexFile(dir), 'utf8'));
-  } catch {
-    return {};
+    await send(body);
+  } catch (e) {
+    if (!noNotes(e)) throw e;
+    const { review_note, ...rest } = body;
+    await send(rest);
   }
 }
-const saveIndex = (dir, idx) => writeFileSync(indexFile(dir), JSON.stringify(idx));
 
-/** Decode a photo to a 640-wide grayscale picture with ffmpeg, and read its real size. */
-async function decodeGray(ffmpeg, file, W = 640) {
-  const { stdout, stderr } = await run(ffmpeg, ['-hide_banner', '-v', 'info', '-i', file, '-frames:v', '1', '-vf', `scale=${W}:-2,format=gray`, '-f', 'rawvideo', '-'], { encoding: 'buffer', maxBuffer: 64 << 20 });
-  const m = /Video:[^\n]*?, (\d{2,5})x(\d{2,5})/.exec(stderr.toString('latin1'));
-  const gray = new Uint8Array(stdout.buffer, stdout.byteOffset, stdout.length);
-  return { gray, w: W, h: Math.floor(gray.length / W), srcW: m ? +m[1] : 0, srcH: m ? +m[2] : 0 };
-}
+/** Approve a scan: its points go to the member (the leaderboard counts approved scans). */
+export const approveScan = (c, id, points) =>
+  patchScan(c, id, { status: 'approved', points: Math.max(0, Math.min(1000, Math.round(points))), reviewed_at: new Date().toISOString(), review_note: null });
 
-/** Measure a downloaded photo the same way the phone did (sharpness, light, hash), plus its real size. */
-export async function measure(ffmpeg, file) {
-  const g = await decodeGray(ffmpeg, file);
-  const a = analyzeImage(g.gray, g.w, g.h);
-  return { w: g.srcW || g.w, h: g.srcH || g.h, sharp: +a.sharp.toFixed(2), mean: +a.mean.toFixed(1), clipHi: +a.clipHi.toFixed(3), texture: +a.texture.toFixed(3), phash: dhash(g.gray, g.w, g.h) };
-}
-
-const makeThumb = (ffmpeg, src, dst) => run(ffmpeg, ['-y', '-v', 'error', '-i', src, '-vf', 'scale=360:-2', '-q:v', '5', dst]);
-
-// ------------------------------------------------------------------------------------ syncing
-/**
- * Download new photos (and measure them), so reviewing and building work from local copies.
- * @returns {Promise<{total:number, downloaded:number, failed:number}>}
- */
-export async function sync(c, cfg, { say = () => {}, onProgress = () => {} } = {}) {
-  const ffmpeg = cfg.tools && cfg.tools.ffmpeg;
-  if (!ffmpeg) throw new Error('ffmpeg was not found: it is needed to check the photos. Set tools.ffmpeg in station.config.json.');
-  const dir = clubDir(cfg.workDir), idx = loadIndex(dir);
-  const rows = await listAll(c, '/rest/v1/photos?select=id,storage_path&status=in.(new,accepted)&file_removed=eq.false');
-  const todo = rows.filter((r) => !(idx[r.id] && existsSync(photoFile(dir, r.id))));
-  let next = 0, downloaded = 0, failed = 0;
-  const worker = async () => {
-    while (next < todo.length) {
-      const r = todo[next++];
-      try {
-        const resp = await call(c, `/storage/v1/object/${BUCKET}/${r.storage_path}`, { raw: true });
-        const buf = Buffer.from(await resp.arrayBuffer());
-        const file = photoFile(dir, r.id);
-        writeFileSync(file, buf);
-        idx[r.id] = { ...(await measure(ffmpeg, file)), bytes: buf.length };
-        await makeThumb(ffmpeg, file, thumbFile(dir, r.id));
-        downloaded++;
-      } catch (e) {
-        failed++;
-        say(`Club photo ${r.id.slice(0, 8)}: ${String(e.message).split('\n')[0]}`);
-      }
-      onProgress((downloaded + failed) / todo.length, `${downloaded + failed}/${todo.length}`);
-    }
-  };
-  await Promise.all([worker(), worker(), worker()]);
-  saveIndex(dir, idx);
-  return { total: rows.length, downloaded, failed };
-}
-
-// ------------------------------------------------------------------------------------ checking
-/** The time a photo was taken, trusting the phone's clock only when it's believable. */
-export function effectiveTaken(p) {
-  const t = Date.parse(p.taken_at), c = Date.parse(p.created_at);
-  return !t || t > c + 10 * 60e3 || t < c - 3 * 864e5 ? c : t;
-}
-export const effectiveLight = (p) => lightSlot(effectiveTaken(p));
-const placeKey = (p) => [p.building_code, p.floor, p.room].join('|').toLowerCase();
+/** Don't approve a scan; the note tells the member why (people in view, too blurry, ...). */
+export const rejectScan = (c, id, note = '') =>
+  patchScan(c, id, { status: 'rejected', points: 0, reviewed_at: new Date().toISOString(), review_note: String(note || '').trim().slice(0, 400) || null });
 
 /**
- * A first opinion on each new photo, for a human to confirm.
- * @param {object[]} rows photo rows
- * @param {object} idx local measurements by photo id
- * @param {Map} buildings ASU buildings by code (for the GPS sanity check)
- * @returns {Map<string, {level: 'accept'|'review'|'reject', reasons: string[]}>}
+ * The club's verdict on a splat, kept in its info.json: {status: 'approved'|'rejected', at, points, parts, note}.
+ * Only approved club splats go on the campus map (splats made on this PC from your own scans always do).
+ * @param {string} dir the splat's library folder
  */
-export function autoVerdicts(rows, idx, buildings = new Map()) {
-  // Sharpness is judged against the same outing: the 75th percentile of that session's photos.
-  const bySession = new Map();
-  for (const r of rows) if (idx[r.id] && r.session) (bySession.get(r.session) || bySession.set(r.session, []).get(r.session)).push(idx[r.id].sharp);
-  const refOf = (s) => {
-    const v = (bySession.get(s) || []).sort((a, b) => a - b);
-    return v.length >= 6 ? v[Math.floor(v.length * 0.75)] : null;
-  };
-  const sameRoom = new Map();
-  for (const r of rows) if (idx[r.id]) (sameRoom.get(placeKey(r)) || sameRoom.set(placeKey(r), []).get(placeKey(r))).push(r);
-
-  const out = new Map();
-  for (const r of rows) {
-    const m = idx[r.id];
-    if (!m) {
-      out.set(r.id, { level: 'review', reasons: ['not downloaded yet'] });
-      continue;
-    }
-    const ref = refOf(r.session);
-    const pc = photoChecks({ w: m.w, h: m.h, mean: m.mean, clipHi: m.clipHi, rel: ref ? Math.min(1.2, m.sharp / ref) : null });
-    const reasons = [...pc.reasons];
-    let level = pc.level === 'ok' ? 'accept' : pc.level;
-    const raise = (to, why) => {
-      reasons.push(why);
-      if (to === 'reject' || (to === 'review' && level === 'accept')) level = to;
-    };
-    for (const o of sameRoom.get(placeKey(r)) || []) {
-      if (o.id === r.id) continue;
-      const d = hamming(idx[o.id].phash, m.phash);
-      if (o.user_id === r.user_id && d <= NEAR_DUPLICATE && (o.status === 'accepted' || o.created_at < r.created_at)) raise('reject', 'near-duplicate of their other photo');
-      else if (o.user_id !== r.user_id && d <= 2) raise('review', 'almost identical to another member’s photo');
-    }
-    const b = buildings.get(r.building_code);
-    if (b && r.lat != null && r.gps_accuracy_m != null && r.gps_accuracy_m <= 100) {
-      const d = distanceTo(b, r.lat, r.lon);
-      if (d > Math.max(150, 3 * r.gps_accuracy_m)) raise('review', `GPS puts it ${Math.round(d)} m from the building`);
-    }
-    const t = Date.parse(r.taken_at), cr = Date.parse(r.created_at);
-    if (t > cr + 10 * 60e3 || t < cr - 3 * 864e5) raise('review', 'the phone’s clock looks wrong');
-    if (b && b.restricted) raise('reject', 'restricted building');
-    out.set(r.id, { level, reasons });
-  }
-  return out;
-}
-
-// ------------------------------------------------------------------------------------ points
-/**
- * Points for photos about to be accepted, given the ones already accepted: the first photo of a room,
- * the first in each light slot, a mission's bonus, and the daily limit on base points.
- * @returns {{id: string, points: number, note: string}[]}
- */
-export function planAwards(toAccept, accepted, missions = new Map()) {
-  const rooms = new Set(accepted.map(placeKey));
-  const lights = new Set(accepted.map((p) => placeKey(p) + '|' + effectiveLight(p)));
-  const used = new Map();
-  const dayKey = (p) => p.user_id + '|' + phoenixDay(effectiveTaken(p));
-  for (const p of accepted) used.set(dayKey(p), (used.get(dayKey(p)) || 0) + 1);
-  const out = [];
-  for (const p of [...toAccept].sort((a, b) => (a.created_at < b.created_at ? -1 : 1))) {
-    const light = effectiveLight(p), k = placeKey(p), n = used.get(dayKey(p)) || 0;
-    const m = p.mission_id ? missions.get(p.mission_id) : null;
-    const s = scorePhoto({
-      firstInRoom: !rooms.has(k), newLight: !lights.has(k + '|' + light), mission: m ? { bonus: m.bonus, light: m.light } : null,
-      light, baseLeft: Math.max(0, POINTS.dailyBase - n * POINTS.photo),
-    });
-    rooms.add(k);
-    lights.add(k + '|' + light);
-    used.set(dayKey(p), n + 1);
-    out.push({ id: p.id, points: s.points, note: s.parts.filter((x) => x[1]).map(([l, v]) => `${l} +${v}`).join(' · ') });
-  }
-  return out;
-}
-
-// ------------------------------------------------------------------------------------ reviewing
-const SELECT = 'id,user_id,created_at,taken_at,building_code,building_name,floor,room,session,mission_id,lat,lon,gps_accuracy_m,width,height,bytes,device,camera,light,status,points,review_note,reviewed_at,storage_path,file_removed';
-
-/** Everything the review page shows: photos still to review plus accepted ones, with first opinions. */
-export async function reviewList(c, cfg, buildings = new Map()) {
-  const dir = clubDir(cfg.workDir), idx = loadIndex(dir);
-  const [rows, profiles, missions] = await Promise.all([
-    listAll(c, `/rest/v1/photos?select=${SELECT}&status=in.(new,accepted)&order=created_at.asc`),
-    listAll(c, '/rest/v1/profiles?select=user_id,handle'),
-    listAll(c, '/rest/v1/missions?select=id,title'),
-  ]);
-  const handle = new Map(profiles.map((p) => [p.user_id, p.handle]));
-  const mission = new Map(missions.map((m) => [m.id, m.title]));
-  const verdicts = autoVerdicts(rows, idx, buildings);
-  return rows.map((r) => ({
-    ...r, handle: handle.get(r.user_id) || '?', mission: r.mission_id ? mission.get(r.mission_id) || null : null,
-    lightSlot: effectiveLight(r), local: !!idx[r.id], meta: idx[r.id] || null, verdict: r.status === 'new' ? verdicts.get(r.id) : null,
-  }));
-}
-
-/**
- * Accept, reject or reopen photos. Accepting awards points; rejecting deletes the photo (here and in the
- * club database), because a rejected photo may well show a person.
- * @param {{ids: string[], action: 'accept'|'reject'|'reopen', note?: string}} o
- */
-export async function review(c, cfg, { ids, action, note = '' }) {
-  const dir = clubDir(cfg.workDir), idx = loadIndex(dir), now = new Date().toISOString();
-  const rows = [];
-  for (const part of chunks(ids, 50)) rows.push(...(await call(c, `/rest/v1/photos?select=${SELECT}&id=${inList(part)}`)));
-  const patch = (list, body) => Promise.all(chunks(list.map((r) => r.id), 50).map((part) => call(c, `/rest/v1/photos?id=${inList(part)}`, { method: 'PATCH', body, headers: { Prefer: 'return=minimal' } })));
-
-  if (action === 'accept') {
-    const todo = rows.filter((r) => r.status === 'new');
-    if (!todo.length) return { changed: 0 };
-    const [accepted, missions] = await Promise.all([
-      listAll(c, '/rest/v1/photos?select=id,user_id,created_at,taken_at,building_code,floor,room&status=eq.accepted'),
-      listAll(c, '/rest/v1/missions?select=id,bonus,light'),
-    ]);
-    const plan = planAwards(todo, accepted, new Map(missions.map((m) => [m.id, m])));
-    const groups = new Map(); // same points and note: one request
-    for (const p of plan) (groups.get(`${p.points}|${p.note}`) || groups.set(`${p.points}|${p.note}`, { points: p.points, note: p.note, ids: [] }).get(`${p.points}|${p.note}`)).ids.push(p.id);
-    for (const g of groups.values()) await patch(g.ids.map((id) => ({ id })), { status: 'accepted', points: g.points, review_note: g.note || null, reviewed_at: now });
-    return { changed: plan.length, points: plan.reduce((s, p) => s + p.points, 0) };
-  }
-  if (action === 'reject') {
-    const todo = rows.filter((r) => r.status === 'new' || r.status === 'accepted');
-    const files = todo.filter((r) => !r.file_removed).map((r) => r.storage_path);
-    for (const part of chunks(files, 100)) await call(c, `/storage/v1/object/${BUCKET}`, { method: 'DELETE', body: { prefixes: part } });
-    await patch(todo, { status: 'rejected', points: 0, review_note: note || null, reviewed_at: now, file_removed: true });
-    for (const r of todo) {
-      rmSync(photoFile(dir, r.id), { force: true });
-      rmSync(thumbFile(dir, r.id), { force: true });
-      delete idx[r.id];
-    }
-    saveIndex(dir, idx);
-    return { changed: todo.length };
-  }
-  if (action === 'reopen') {
-    const todo = rows.filter((r) => r.status === 'accepted');
-    await patch(todo, { status: 'new', points: 0, review_note: null, reviewed_at: null });
-    return { changed: todo.length };
-  }
-  throw new Error('Unknown action');
-}
-
-/** Delete the cloud copies of photos already reviewed and kept here: frees the free plan's 1 GB. */
-export async function freeCloud(c, cfg) {
-  const dir = clubDir(cfg.workDir), idx = loadIndex(dir);
-  const rows = (await listAll(c, '/rest/v1/photos?select=id,storage_path&status=eq.accepted&file_removed=eq.false')).filter((r) => idx[r.id] && existsSync(photoFile(dir, r.id)));
-  let bytes = 0;
-  for (const part of chunks(rows, 100)) {
-    await call(c, `/storage/v1/object/${BUCKET}`, { method: 'DELETE', body: { prefixes: part.map((r) => r.storage_path) } });
-    await call(c, `/rest/v1/photos?id=${inList(part.map((r) => r.id))}`, { method: 'PATCH', body: { file_removed: true }, headers: { Prefer: 'return=minimal' } });
-    bytes += part.reduce((s, r) => s + (idx[r.id].bytes || 0), 0);
-  }
-  return { photos: rows.length, bytes };
+export function setReview(dir, review) {
+  const f = join(dir, 'info.json');
+  if (!existsSync(f)) return null;
+  const info = JSON.parse(readFileSync(f, 'utf8'));
+  info.review = review ? { ...review, at: review.at || new Date().toISOString() } : undefined;
+  writeFileSync(f, JSON.stringify(info, null, 2));
+  return info.review || null;
 }
 
 // ------------------------------------------------------------------------------------ missions
@@ -267,11 +62,12 @@ const LIGHTS = ['any', 'morning', 'afternoon', 'evening', 'night'];
 
 export const listMissions = (c) => listAll(c, '/rest/v1/missions?select=*&order=created_at.desc');
 
+/** A mission: "scan this space" (optionally in one kind of light), worth `bonus` points when a scan of it is approved. */
 export async function createMission(c, m) {
   const body = {
     title: String(m.title || '').trim(), detail: String(m.detail || '').trim().slice(0, 400),
     building_code: m.building_code || null, floor: String(m.floor || '').trim().slice(0, 20), room: String(m.room || '').trim().slice(0, 80),
-    light: LIGHTS.includes(m.light) ? m.light : 'any', bonus: Math.max(0, Math.min(50, Math.round(+m.bonus || 0))), wanted: Math.max(1, Math.min(5000, Math.round(+m.wanted || 20))),
+    light: LIGHTS.includes(m.light) ? m.light : 'any', bonus: Math.max(0, Math.min(50, Math.round(+m.bonus || 0))), wanted: 1,
     ends_at: m.ends_at || null,
   };
   if (body.title.length < 3 || body.title.length > 80) throw new Error('Give the mission a title of 3 to 80 characters');
@@ -303,9 +99,9 @@ export async function createInvite(c, { label = '', max_uses = 25 } = {}) {
 export const setInviteActive = (c, code, active) => call(c, `/rest/v1/invites?code=eq.${encodeURIComponent(code)}`, { method: 'PATCH', body: { active: !!active }, headers: { Prefer: 'return=minimal' } });
 
 export async function listMembers(c) {
-  const [profiles, board] = await Promise.all([listAll(c, '/rest/v1/profiles?select=*&order=created_at.desc'), call(c, '/rest/v1/leaderboard?select=handle,points,photos,scans')]);
+  const [profiles, board] = await Promise.all([listAll(c, '/rest/v1/profiles?select=*&order=created_at.desc'), call(c, '/rest/v1/leaderboard?select=handle,points,scans')]);
   const pts = new Map(board.map((r) => [r.handle.toLowerCase(), r]));
-  return profiles.map((p) => ({ ...p, ...(pts.get(p.handle.toLowerCase()) || { points: 0, photos: 0, scans: 0 }) }));
+  return profiles.map((p) => ({ ...p, ...(pts.get(p.handle.toLowerCase()) || { points: 0, scans: 0 }) }));
 }
 
 /** Rename or pause a member. */
@@ -319,22 +115,20 @@ export async function setMember(c, userId, { handle, banned }) {
   await call(c, `/rest/v1/profiles?user_id=eq.${encodeURIComponent(userId)}`, { method: 'PATCH', body, headers: { Prefer: 'return=minimal' } });
 }
 
-/** Remove a member and everything they sent (on request): files and rows in the cloud, copies here, profile. */
+/**
+ * Remove a member and everything they sent (on request): their scans' files and rows in the cloud, any single
+ * photos from before the club took scans only (and this PC's copies of them), and the profile.
+ */
 export async function purgeMember(c, cfg, userId) {
-  const dir = clubDir(cfg.workDir), idx = loadIndex(dir);
   const uid = encodeURIComponent(userId);
   const photos = await listAll(c, `/rest/v1/photos?select=id,storage_path,file_removed&user_id=eq.${uid}`);
-  for (const part of chunks(photos.filter((p) => !p.file_removed), 100)) await call(c, `/storage/v1/object/${BUCKET}`, { method: 'DELETE', body: { prefixes: part.map((p) => p.storage_path) } });
-  for (const p of photos) {
-    rmSync(photoFile(dir, p.id), { force: true });
-    rmSync(thumbFile(dir, p.id), { force: true });
-    delete idx[p.id];
-  }
-  saveIndex(dir, idx);
-  await call(c, `/rest/v1/photos?user_id=eq.${uid}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
-  for (const cap of await listAll(c, `/rest/v1/captures?select=id&user_id=eq.${uid}`)) await deleteUpload(c, cap.id);
+  for (const part of chunks(photos.filter((p) => !p.file_removed), 100)) await call(c, '/storage/v1/object/club-photos', { method: 'DELETE', body: { prefixes: part.map((p) => p.storage_path) } });
+  for (const p of photos) for (const sub of ['photos', 'thumbs']) rmSync(join(cfg.workDir, 'club', sub, p.id + '.jpg'), { force: true });
+  if (photos.length) await call(c, `/rest/v1/photos?user_id=eq.${uid}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+  const scans = await listAll(c, `/rest/v1/captures?select=id&user_id=eq.${uid}`);
+  for (const cap of scans) await deleteUpload(c, cap.id);
   await call(c, `/rest/v1/profiles?user_id=eq.${uid}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
-  return { photos: photos.length };
+  return { photos: photos.length, scans: scans.length };
 }
 
 // ------------------------------------------------------------------------------------ restricted places
@@ -350,96 +144,4 @@ export async function syncRestricted(c, buildings) {
   const rows = [...buildings.values()].filter((b) => b.restricted).map((b) => ({ code: b.code, reason: b.restricted }));
   for (const part of chunks(rows, 100)) await call(c, '/rest/v1/restricted_buildings', { method: 'POST', body: part, headers: { Prefer: 'resolution=merge-duplicates,return=minimal' } });
   return rows.length;
-}
-
-// ------------------------------------------------------------------------------------ photos → a capture
-const slug = (s) => (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'capture';
-const LENS_FOV = 68; // degrees across the long side: a phone's main camera
-export const AR_MIN = 10; // photos one AR session needs to set the coordinates (the pipeline starts COLMAP from 20 or more)
-const lensKey = (i) => [i.w, i.h, i.fx.toFixed(1), i.fy.toFixed(1), i.cx.toFixed(1), i.cy.toFixed(1)].join('|');
-
-/**
- * Put the accepted photos of one room into a ZIP in the inbox, so the usual pipeline can make a splat from
- * them. Photos taken with Track position (AR) carry their AR pose: the AR session with the most photos here
- * sets the coordinates, its photos come first, and its poses go in as a COLMAP model (poses/colmap/sparse/0)
- * like a scan's, so COLMAP starts from them: it solves faster, and in metres. Photos from other outings, or
- * without a pose, are placed by COLMAP. AR photos bring their exact lens; ordinary photos from one phone in
- * one orientation share a camera; otherwise COLMAP works out each photo's lens by itself.
- */
-export async function buildCapture(c, cfg, { building_code, floor = '', room = '' }, inbox, version = '2.5.0') {
-  const dir = clubDir(cfg.workDir), idx = loadIndex(dir);
-  const where = `status=eq.accepted&building_code=eq.${encodeURIComponent(building_code)}&floor=eq.${encodeURIComponent(floor)}&room=eq.${encodeURIComponent(room)}`;
-  const [rows, profiles] = await Promise.all([
-    // With their AR poses, once the club database has them (crowd/supabase-snap-pose.sql).
-    listAll(c, `/rest/v1/photos?select=${SELECT},pose&${where}`).catch((e) => {
-      if (!/\bpose\b/.test(e.message)) throw e;
-      return listAll(c, `/rest/v1/photos?select=${SELECT}&${where}`);
-    }),
-    listAll(c, '/rest/v1/profiles?select=user_id,handle'),
-  ]);
-  const have = rows.filter((r) => idx[r.id] && existsSync(photoFile(dir, r.id)));
-  if (have.length < 10) throw new Error(`Only ${have.length} accepted photos of this room are on this PC (sync first); at least 10 are needed, 100 or more make a good splat.`);
-  const handle = new Map(profiles.map((p) => [p.user_id, p.handle]));
-
-  // AR poses that fit their photo, by AR session. The session with the most photos sets the coordinates.
-  const pose = new Map();
-  for (const r of have) {
-    const p = r.pose ? usablePose(r.pose, idx[r.id]) : null;
-    if (p) pose.set(r.id, p);
-  }
-  const perSession = new Map();
-  for (const p of pose.values()) perSession.set(p.session, (perSession.get(p.session) || 0) + 1);
-  const [best, bestN] = [...perSession].sort((a, b) => b[1] - a[1])[0] || [null, 0];
-  const arSession = bestN >= AR_MIN ? best : null;
-  const inAr = (r) => !!arSession && pose.has(r.id) && pose.get(r.id).session === arSession;
-  have.sort((a, b) => inAr(b) - inAr(a) || (a.session || '').localeCompare(b.session || '') || effectiveTaken(a) - effectiveTaken(b));
-
-  // Lenses: AR photos bring their own, exactly; ordinary ones get a shared guess when they're all one camera
-  // (one phone, one orientation). The pipeline gives each lens one camera.
-  const plainCams = new Set(have.filter((r) => !pose.has(r.id)).map((r) => `${r.device}|${idx[r.id].w}x${idx[r.id].h}`));
-  const guess = (m) => {
-    const f = Math.max(m.w, m.h) / 2 / Math.tan((LENS_FOV / 2) * (Math.PI / 180));
-    return { w: m.w, h: m.h, fx: +f.toFixed(2), fy: +f.toFixed(2), cx: m.w / 2, cy: m.h / 2 };
-  };
-  const lens = (r) => (pose.has(r.id) ? pose.get(r.id).intr : plainCams.size === 1 ? guess(idx[r.id]) : null);
-  const lenses = have.map(lens);
-  const sharedCamera = lenses.every((l) => l && lensKey(l) === lensKey(lenses[0]));
-  const names = have.map((_, i) => `${String(i + 1).padStart(4, '0')}.jpg`);
-  const first = have[0];
-  const day = new Date(effectiveTaken(first) - 7 * 3600e3).toISOString().slice(0, 10).replace(/-/g, '');
-  const base = `${slug(first.building_name)}_${slug(room || 'photos')}_${day}_club-photos`;
-  const outings = new Set(have.map((r) => r.session)).size;
-  const arInfo = pose.size ? { session: arSession, photos: arSession ? bestN : 0, posed: pose.size, sessions: perSession.size } : null;
-  const manifest = {
-    app: 'SplatScout club photos', version, exportedAt: new Date().toISOString(),
-    capture: { building: first.building_name, buildingCode: building_code, room, floor, tracking: arSession ? '6dof' : 'none', engine: 'club-photos', createdAt: new Date(effectiveTaken(first)).toISOString(), author: null,
-      notes: `${have.length} single photos from ${new Set(have.map((r) => r.user_id)).size} contributor(s), in ${outings} outing(s)${arSession ? `; AR positions for ${bestN} of them (one AR session) set the coordinates` : ''}` },
-    club: { contributors: [...new Set(have.map((r) => handle.get(r.user_id) || '?'))], lightSlots: [...new Set(have.map(effectiveLight))], photos: have.map((r) => r.id), ar: arInfo },
-    conventions: { pose: 'camera-to-world 4x4, column-major, OpenGL camera (x right, y up, looks down -z), world y-up, metres', intrinsics: 'pixels, top-left origin',
-      arPose: 'a pose in another AR session’s coordinates (club.ar.session sets the capture’s)' },
-    frames: have.map((r, i) => {
-      const p = pose.get(r.id);
-      return { file: `images/${names[i]}`, seq: i + 1, session: r.session, pass: 'club', takenAt: new Date(effectiveTaken(r)).toISOString(), light: effectiveLight(r), device: r.device,
-        ...(lenses[i] ? { intrinsics: lenses[i], lens: p ? 'exact' : 'guess' } : {}),
-        ...(p ? { arSession: p.session, tracked: inAr(r), ...(inAr(r) ? { pose: p.m } : { arPose: p.m }) } : {}) };
-    }),
-  };
-  const zip = new ZipWriter();
-  for (let i = 0; i < have.length; i++) await zip.add(`${base}/images/${names[i]}`, readFileSync(photoFile(dir, have[i].id)));
-  await zip.add(`${base}/splatscout.json`, JSON.stringify(manifest, null, 1));
-  if (arSession) {
-    // The same COLMAP model a scan's export carries: the pipeline triangulates from these cameras.
-    const posed = have.map((r, i) => (inAr(r) ? { name: names[i], pose: pose.get(r.id).m, intr: pose.get(r.id).intr } : null)).filter(Boolean);
-    const col = colmapText(posed, null);
-    for (const k of ['cameras', 'images', 'points3D', 'rigs', 'frames']) await zip.add(`${base}/poses/colmap/sparse/0/${k}.txt`, col[k]);
-  }
-  const dest = join(inbox, base + '.zip'), tmp = join(inbox, '.club-' + base + '.zip');
-  try {
-    await pipeline(Readable.fromWeb(zip.finish().stream()), createWriteStream(tmp));
-    renameSync(tmp, dest);
-  } catch (e) {
-    rmSync(tmp, { force: true });
-    throw e;
-  }
-  return { file: dest, photos: have.length, contributors: manifest.club.contributors, sharedCamera, lightSlots: manifest.club.lightSlots, ar: arInfo };
 }

@@ -3,6 +3,8 @@
 //   splatscout.json               capture metadata, per-photo quality metrics and poses
 //   poses/transforms.json         AR camera poses (Nerfstudio / Instant-NGP format)
 //   poses/colmap/sparse/0/*.txt   the same poses as a COLMAP text model (PINHOLE)
+//   poses/parts/<k>/colmap/sparse/0/*.txt  a scan in parts (tracking was lost): each other part's poses,
+//                                 in its own AR coordinates (SplatStation joins the parts)
 //   poses/points.ply              coloured AR depth points (splat initialisation), mid-air noise removed
 //   coverage.png                  coverage map snapshot
 //   README.txt
@@ -11,9 +13,10 @@ import { ZipWriter } from '../core/zip.js';
 import { transformsJson, colmapText, mergePoints, plyBlob } from '../core/formats.js';
 import { analyzeCapture } from '../core/score.js';
 import { drawTopDown, drawPanorama } from '../capture/minimap.js';
-import { mainSpace, spaceOf, spaceCount } from '../core/spaces.js';
+import { spaceOf, boundsFor, partsOf } from '../core/spaces.js';
+import { Bounds } from '../core/bounds.js';
 
-export const APP_VERSION = '2.6.0';
+export const APP_VERSION = '2.7.0';
 
 export function slugify(s) {
   return (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'capture';
@@ -57,6 +60,21 @@ export async function exportFiles(capture, frames, { includePoses = true, select
 
   onProgress(0.1, 'Writing metadata');
   const analysis = analyzeCapture(frames, capture);
+  // A scan in parts (tracking was lost and it carried on as a new part, see spaces.js): each part keeps
+  // its own AR coordinates, and the main part (the most photos) sets SplatStation's. What the phone
+  // lined up for its coverage map (capture.links) isn't used for the poses.
+  const sixdof = capture.tracking === '6dof';
+  const posed = (f) => f.tracked && f.pose && f.intr;
+  const parts = sixdof ? partsOf(frames, capture) : [];
+  const main = parts.find((p) => p.main) || null;
+  const partNo = new Map(parts.map((p) => [p.space, p.part]));
+  const posedIn = (p) => p.frames.filter(posed).length;
+  const withPoses = (p) => includePoses && !!main && posedIn(main) >= 3 && posedIn(p) >= 3;
+  const ownBounds = (space) => {
+    const b = Bounds.from(boundsFor(capture, space));
+    return b ? b.toJSON() : null;
+  };
+  const mainBounds = main ? ownBounds(main.space) : null;
   const manifest = {
     app: 'SplatScout',
     version: APP_VERSION,
@@ -81,7 +99,23 @@ export async function exportFiles(capture, frames, { includePoses = true, select
     },
     // Scan area in the AR session's coordinates (same frame as the poses below): a floor-plan
     // polygon [[x, z], ...] at floorY, plus skipped spots [x, y, z, radius]. Useful to crop splats.
-    bounds: analysis.bounds ? { ...analysis.bounds.toJSON(), poseFrame: 'poses/transforms.json' } : null,
+    // In a scan in parts, the main part's own outline (an outline marked in another part is in that
+    // part's entry below, in its coordinates).
+    bounds: sixdof ? (mainBounds ? { ...mainBounds, poseFrame: 'poses/transforms.json' } : null)
+      : analysis.bounds ? { ...analysis.bounds.toJSON(), poseFrame: 'poses/transforms.json' } : null,
+    // The scan's parts: one per set of AR coordinates. Tracking was lost before each new part, and its
+    // first photos overlap what was covered before; SplatStation joins the parts from the photos.
+    parts: parts.length ? parts.map((p) => {
+      const link = (capture.links || []).find((l) => l.from === p.space && partNo.has(l.to));
+      return {
+        part: p.part, space: p.space, segments: p.segments, main: p.main,
+        photos: frames.filter((f) => spaceOf(f, capture) === p.space).length, posed: posedIn(p),
+        poses: withPoses(p) ? (p.main ? 'poses/colmap/sparse/0' : `poses/parts/${p.part}/colmap/sparse/0`) : null,
+        bounds: ownBounds(p.space),
+        // Lined up on the phone (approximately, for its coverage map only): this part's coordinates → that part's.
+        ...(link ? { phoneLink: { to: partNo.get(link.to), xf: link.xf } } : {}),
+      };
+    }) : undefined,
     selection: selection || { total: frames.length, left: {} },
     score: { score: analysis.score, grade: analysis.grade, verdict: analysis.verdict, parts: analysis.parts.map(({ id, label, value, detail }) => ({ id, label, value: +value.toFixed(3), detail })), fixes: analysis.fixes },
     conventions: {
@@ -93,6 +127,7 @@ export async function exportFiles(capture, frames, { includePoses = true, select
       seq: f.seq,
       segment: f.segment,
       space: spaceOf(f, capture),
+      part: partNo.get(spaceOf(f, capture)) ?? null,
       pass: f.pass,
       t: f.t,
       tracked: f.tracked,
@@ -106,27 +141,39 @@ export async function exportFiles(capture, frames, { includePoses = true, select
   };
   add('splatscout.json', JSON.stringify(manifest, null, 1), 'application/json');
 
-  // Poses from the main space: AR sessions that were lined up with each other share coordinates.
+  // Poses, part by part: the main part's in poses/ (what other tools read), each other part's in
+  // poses/parts/<k>/, in its own AR coordinates. AR sessions lined up with each other share a part.
   let posedNote = 'No AR poses (camera mode or tracking unavailable).';
-  if (includePoses && capture.tracking === '6dof') {
-    const posed = (f) => f.tracked && f.pose && f.intr;
-    const ms = mainSpace(frames, capture, posed);
-    const main = ms ? frames.map((f, i) => ({ ...f, name: names[i] })).filter((f) => posed(f) && spaceOf(f, capture) === ms.space) : [];
-    const others = spaceCount(frames, capture) - 1;
-    if (main.length >= 3) {
-      onProgress(0.4, 'Writing poses');
-      // Keep only points on confirmed surfaces (seen by several depth frames, never seen through)
-      // and inside the scan area: no floaters to seed the splat with.
-      const vm = analysis.voxels, b = analysis.bounds;
-      const pts = mergePoints(main, 0.03, (x, y, z) => vm.isSolidAt(x, y, z) && (!b || b.contains(x, y, z)));
-      const hasPts = pts.xyz.length > 0;
-      add('poses/transforms.json', transformsJson(main.map((f) => ({ name: `images/${f.name}`, pose: f.pose, intr: f.intr })), hasPts ? 'points.ply' : null), 'application/json');
-      const col = colmapText(main.map((f) => ({ name: f.name, pose: f.pose, intr: f.intr })), hasPts ? pts : null);
-      for (const k of ['cameras', 'images', 'points3D', 'rigs', 'frames']) add(`poses/colmap/sparse/0/${k}.txt`, col[k], 'text/plain');
-      if (hasPts) add('poses/points.ply', new Uint8Array(await plyBlob(pts).arrayBuffer()), 'application/octet-stream');
-      const sessions = new Set(main.map((f) => f.segment)).size;
-      posedNote = `AR poses for ${main.length} of ${frames.length} photos` + (sessions > 1 ? ` (${sessions} AR sessions lined up into one map)` : '') + (others > 0 ? `; ${others} other map(s) not included because they weren't lined up with this one.` : '.');
+  if (main && withPoses(main)) {
+    onProgress(0.4, 'Writing poses');
+    const named = new Map(frames.map((f, i) => [f, { ...f, name: names[i] }]));
+    const inPart = (p) => p.frames.filter(posed).map((f) => named.get(f)).filter(Boolean);
+    const mf = inPart(main);
+    // Keep only points on confirmed surfaces (seen by several depth frames, never seen through)
+    // and inside the scan area: no floaters to seed the splat with.
+    const vm = analysis.voxels, b = Bounds.from(mainBounds);
+    const pts = mergePoints(mf, 0.03, (x, y, z) => vm.isSolidAt(x, y, z) && (!b || b.contains(x, y, z)));
+    const hasPts = pts.xyz.length > 0;
+    add('poses/transforms.json', transformsJson(mf.map((f) => ({ name: `images/${f.name}`, pose: f.pose, intr: f.intr, segment: f.segment })), hasPts ? 'points.ply' : null), 'application/json');
+    const n = parts.length;
+    const header = (p) => (n > 1 ? `# SplatScout part ${p.part} of ${n} (segment${p.segments.length > 1 ? 's' : ''} ${p.segments.join(', ')})${p.main ? ': the main part, which sets the coordinates' : ': in its own AR coordinates (tracking was lost before it); poses/colmap/sparse/0 is the main part'}\n` : '');
+    const col = colmapText(mf.map((f) => ({ name: f.name, pose: f.pose, intr: f.intr })), hasPts ? pts : null);
+    col.images = header(main) + col.images;
+    for (const k of ['cameras', 'images', 'points3D', 'rigs', 'frames']) add(`poses/colmap/sparse/0/${k}.txt`, col[k], 'text/plain');
+    if (hasPts) add('poses/points.ply', new Uint8Array(await plyBlob(pts).arrayBuffer()), 'application/octet-stream');
+    let written = mf.length;
+    for (const p of parts) {
+      if (p.main || !withPoses(p)) continue;
+      const pf = inPart(p);
+      const pc = colmapText(pf.map((f) => ({ name: f.name, pose: f.pose, intr: f.intr })), null);
+      pc.images = header(p) + pc.images;
+      for (const k of ['cameras', 'images', 'points3D', 'rigs', 'frames']) add(`poses/parts/${p.part}/colmap/sparse/0/${k}.txt`, pc[k], 'text/plain');
+      written += pf.length;
     }
+    const sessions = main.segments.length;
+    posedNote = n > 1
+      ? `AR poses for ${written} of ${frames.length} photos, in ${n} parts (tracking was lost and the scan carried on as a new part): part ${main.part}, the main one, is in transforms.json and colmap/sparse/0; the others are in parts/<k>/colmap/sparse/0, each in its own AR coordinates. Join them from the photos where they overlap, as SplatStation does.`
+      : `AR poses for ${mf.length} of ${frames.length} photos` + (sessions > 1 ? ` (${sessions} AR sessions lined up into one map).` : '.');
   }
 
   onProgress(0.8, 'Rendering coverage map');
@@ -145,7 +192,7 @@ async function coveragePng(analysis, frames, capture) {
     ctx.fillStyle = '#101418';
     ctx.fillRect(0, 0, 1024, 1024);
     if (capture.tracking === '6dof' && analysis.vstats.solid > 50) {
-      drawTopDown(c, { voxels: analysis.voxels, frames, pose: null, target: null, space: analysis.mainSpace, capture, bounds: analysis.bounds });
+      drawTopDown(c, { voxels: analysis.voxels, frames: analysis.shown || frames, pose: null, target: null, space: analysis.mainSpace, capture, bounds: analysis.bounds });
     } else {
       c.height = 512;
       ctx.fillStyle = '#101418';
@@ -182,6 +229,10 @@ poses/   (${posedNote})
   colmap/sparse/0/       COLMAP text model with the AR poses (PINHOLE cameras) + depth points
   points.ply             coloured AR depth points, for splat initialisation (only points on
                          confirmed surfaces inside the scan area)
+  parts/<k>/colmap/sparse/0/
+                         only in a scan in parts (tracking was lost and it carried on): each other
+                         part's poses, in that part's own AR coordinates. splatscout.json lists the
+                         parts and each photo's part; the parts overlap where each one starts.
   The AR poses are approximate (phone tracking drifts by centimetres). Use them as a starting
   point, e.g. COLMAP point_triangulator + bundle_adjuster, or simply ignore them and run
   normal structure-from-motion on images/.

@@ -12,7 +12,12 @@ const TEXTURE = { warn: 0.06, bad: 0.025 };
 // In front of a plain wall AR tracking has little to hold on to, and fast turns are what lose it:
 // the turn limits tighten there.
 const PLAIN_TURN = 0.6;
-const plain = (s) => s.texture != null && s.texture < TEXTURE.warn;
+// A view AR tracking struggles with: few corners in the camera image (texture: the share of small
+// cells with one), or a few bunched in one corner of the frame (spread: the share of a 4 x 3 grid
+// with some). Real scans: a detailed room's photos sit at 0.15-0.8; a plain-walled one's lowest at 0.04.
+const PLAIN = { tex: 0.05, bunched: 0.08, spread: 0.34 };
+const plainView = (s) => s.texture != null && (s.texture < PLAIN.tex || (s.texture < PLAIN.bunched && s.spread != null && s.spread <= PLAIN.spread));
+const plain = (s) => s.texture != null && (s.texture < TEXTURE.warn || plainView(s));
 
 /**
  * Rule table, highest priority first.
@@ -44,7 +49,7 @@ const RULES = [
   {
     id: 'fast', level: 'bad', on: 0.25, off: 0.8, voice: 'Slow down',
     test: (s, L) => {
-      if (s.rotSpeed > L.rotBad && plain(s)) return { title: 'Turn slowly here', detail: 'This wall is plain: turn slowly or tracking slips. Keep a door, corner or the floor\'s edge in view.' };
+      if (s.rotSpeed > L.rotBad && plain(s)) return { title: 'Plain wall: turn slowly', detail: 'Turning fast in front of a plain wall is how tracking gets lost. Turn slowly, with a corner or the floor in view.' };
       if (s.rotSpeed > L.rotBad) return { title: 'Slow down — turning too fast', detail: 'Turn about a quarter as fast. Fast turns smear every frame.' };
       if (s.linSpeed != null && s.linSpeed > L.linBad) return { title: 'Slow down — walking too fast', detail: 'Take slow, small steps. Think "museum walk".' };
       if (s.linSpeed == null && s.flowSpeed > L.flowBad) return { title: 'Slow down', detail: 'The view is sliding past too quickly for sharp, overlapping photos.' };
@@ -59,11 +64,11 @@ const RULES = [
     },
   },
   {
-    // Ahead of blur and the rest: a blank view is how tracking gets lost.
-    id: 'lowtex', level: 'warn', on: 0.8, off: 1.0, voice: 'Include more detail in the frame',
-    test: (s) => (s.texture < TEXTURE.bad || (plain(s) && s.depthMed > 0 && s.depthMed < 1.0)) && {
-      title: 'Blank surface — nothing to match',
-      detail: 'Step back or tilt so edges, corners, trim or furniture are in frame. Plain walls on their own can\'t be matched, and tracking can slip.',
+    // Ahead of blur and the rest: a plain view is how tracking gets lost, so say so before it slips.
+    id: 'lowtex', level: 'warn', on: 0.5, off: 1.0, voice: 'Plain wall. Get the corner or the floor in view',
+    test: (s) => (s.texture < TEXTURE.bad || plainView(s) || (plain(s) && s.depthMed > 0 && s.depthMed < 1.0)) && {
+      title: 'Plain wall: get the corner or the floor in view',
+      detail: 'AR tracking has nothing to hold on to here. Turn or step back until a corner, a door frame or the floor is in view, and pass long plain walls at an angle, not head-on.',
     },
   },
   {
@@ -228,8 +233,8 @@ export class Coach {
     };
     chips.detail = {
       label: 'Detail',
-      level: s.texture < TEXTURE.bad ? 'bad' : s.texture < TEXTURE.warn ? 'warn' : 'good',
-      value: s.texture < TEXTURE.bad ? 'blank' : s.texture < TEXTURE.warn ? 'low' : 'ok',
+      level: s.texture < TEXTURE.bad ? 'bad' : plain(s) ? 'warn' : 'good',
+      value: s.texture < TEXTURE.bad ? 'blank' : plain(s) ? 'plain' : 'ok',
     };
     chips.parallax = {
       label: 'Depth',

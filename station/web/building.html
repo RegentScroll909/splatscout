@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090b0e">
+  <title>SplatStation · Building</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    body { height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+    main.bview { flex: 1; min-height: 0; max-width: none; margin: 0; padding: 0; gap: 0; display: grid; grid-template-columns: minmax(0, 1fr) 360px; }
+    @media (max-width: 900px) { body { height: auto; overflow: auto; } main.bview { grid-template-columns: 1fr; } .bstage { height: 70vh; } main.bview { padding: 0; } }
+    .bstage { position: relative; min-height: 0; background: #0c0f13; border-right: 1px solid var(--line); overflow: hidden; }
+    #three, #plan { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+    #plan { cursor: grab; outline: none; }
+    #plan[hidden] { display: none; }
+    #plan.dragging { cursor: grabbing; }
+    #plan.pick { cursor: crosshair; }
+    #plan.move { cursor: move; }
+    .bstage .vbar { position: absolute; left: 10px; top: 10px; right: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; z-index: 3; pointer-events: none; }
+    .bstage .vbar > * { pointer-events: auto; }
+    .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 8px; overflow: hidden; background: rgba(12, 15, 19, 0.92); }
+    .seg button { font: inherit; font-size: 0.82rem; color: var(--muted); background: transparent; border: 0; padding: 5px 10px; cursor: pointer; }
+    .seg button + button { border-left: 1px solid var(--line-2); }
+    .seg button.on { color: var(--text); background: var(--surface-2); }
+    .seg button:focus-visible, .btn:focus-visible, .tbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--muted); background: rgba(12, 15, 19, 0.92); border: 1px solid var(--line-2); border-radius: 8px; padding: 4px 9px; cursor: pointer; user-select: none; }
+    .pill input { margin: 0; }
+    .pill[hidden] { display: none; }
+    #status { position: absolute; right: 10px; bottom: 10px; z-index: 3; max-width: min(420px, calc(100% - 20px)); font-size: 0.76rem; color: var(--text); background: rgba(12, 15, 19, 0.92); border: 1px solid var(--line-2); border-radius: 8px; padding: 5px 9px; }
+    #status[hidden] { display: none; }
+    #labels { position: absolute; inset: 0; pointer-events: none; z-index: 2; overflow: hidden; }
+    #labels .lab { position: absolute; transform: translate(-50%, -100%); white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--text); text-shadow: 0 0 3px #0c0f13, 0 0 3px #0c0f13, 0 0 6px #0c0f13; display: flex; align-items: center; gap: 5px; }
+    #labels .lab i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    #labels .lab.dim { opacity: 0.35; }
+    .help { position: absolute; left: 10px; bottom: 10px; font-size: 0.76rem; color: var(--muted); background: rgba(12, 15, 19, 0.88); border: 1px solid var(--line); border-radius: 8px; padding: 5px 9px; z-index: 3; max-width: calc(100% - 20px); }
+    .step { position: absolute; left: 50%; top: 52px; transform: translateX(-50%); z-index: 4; background: rgba(12, 15, 19, 0.96); border: 1px solid var(--accent); color: var(--text); border-radius: 10px; padding: 8px 14px; font-size: 0.88rem; max-width: min(560px, calc(100% - 24px)); text-align: center; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); }
+    .step[hidden] { display: none; }
+    #msg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); z-index: 1; pointer-events: none; text-align: center; padding: 20px; }
+    #tip { position: fixed; z-index: 30; pointer-events: none; background: rgba(12, 15, 19, 0.97); border: 1px solid var(--line-2); border-radius: 8px; padding: 7px 10px; font-size: 0.8rem; max-width: 300px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); display: none; }
+    #tip .v { font-weight: 650; color: var(--text); }
+    #tip .r { color: var(--muted); }
+
+    .side { overflow: auto; padding: 14px 16px 40px; display: flex; flex-direction: column; gap: 12px; background: var(--surface); }
+    .side > * { flex-shrink: 0; }
+    .side .note, .side .err { overflow-wrap: anywhere; } /* messages can hold long paths */
+    .side h2 { margin: 6px 0 0; }
+    .side h3 { color: var(--text); font-size: 1.05rem; text-transform: none; letter-spacing: 0; margin: 0; }
+    .kicker { font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); }
+    .tbtn { font: inherit; font-size: 0.76rem; color: var(--muted); background: transparent; border: 1px solid var(--line-2); border-radius: 6px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
+    .tbtn:hover { color: var(--text); }
+    .tbtn.on { color: var(--text); background: var(--surface-2); }
+    .tbtn:disabled { opacity: 0.45; cursor: default; }
+    .caps { display: flex; flex-direction: column; }
+    .cap { display: grid; grid-template-columns: 12px 1fr auto; gap: 3px 9px; padding: 9px 0; border-top: 1px solid var(--line); cursor: pointer; align-items: center; }
+    .cap:hover .nm, .cap.on .nm { color: var(--accent); }
+    .cap .sw { width: 12px; height: 12px; border-radius: 3px; }
+    .cap .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cap .cmeta { grid-column: 2 / -1; color: var(--muted); font-size: 0.78rem; }
+    .cap .acts { grid-column: 2 / -1; display: flex; gap: 6px; flex-wrap: wrap; }
+    .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 0.74rem; padding: 1px 8px 1px 6px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--text); white-space: nowrap; }
+    .chip .ic2 { width: 13px; height: 13px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 0.6rem; font-weight: 700; color: #0b0b0b; }
+    .cov { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 10px; align-items: center; font-size: 0.8rem; }
+    .cov .fb { height: 8px; background: rgba(255, 255, 255, 0.06); border-radius: 2px; overflow: hidden; display: flex; }
+    .cov .fb i { display: block; height: 100%; background: var(--accent); }
+    .cov .fb i.g { background: repeating-linear-gradient(135deg, rgba(61, 220, 255, 0.45) 0 3px, transparent 3px 6px); }
+    .cov .n { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); text-align: right; white-space: nowrap; }
+    .cov .fl { cursor: pointer; }
+    .cov .fl.on { color: var(--accent); font-weight: 600; }
+    .note { color: var(--muted); font-size: 0.8rem; margin: 0; }
+    .err { color: var(--bad); font-size: 0.85rem; }
+    .edit { display: flex; flex-direction: column; gap: 10px; }
+    .edit .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 0.84rem; color: var(--muted); }
+    .edit input[type=number], .edit select { font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 6px; width: 90px; }
+    .edit select { width: auto; }
+    .edit .readout { font-family: var(--mono); font-size: 0.76rem; color: var(--dim); }
+    .fitbox { font-size: 0.82rem; color: #cdd6df; background: var(--surface-2); border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 10px; }
+    .fitbox .ok { color: var(--good); }
+    .fitbox .warn { color: var(--warn); }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
+        "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <img src="icon.svg" alt="" class="logo">
+      <div>
+        <h1 id="title">Building <span class="tag new">Beta</span></h1>
+        <div class="sub" id="subtitle">Where the club’s photos were taken, on the building’s footprint</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <a class="btn small ghost" id="back" href="campus.html">← Campus</a>
+      <a class="btn small ghost" href="/">Dashboard</a>
+    </div>
+  </header>
+  <main class="bview">
+    <div class="bstage" id="stage">
+      <div id="three"></div>
+      <canvas id="plan" hidden aria-label="Floor plan: the building's footprint with the captures on this floor"></canvas>
+      <div id="labels"></div>
+      <div id="msg">Loading…</div>
+      <div class="vbar" role="toolbar" aria-label="View">
+        <div class="seg" id="modeSeg" aria-label="View"></div>
+        <div class="seg" id="floorSeg" aria-label="Floor"></div>
+        <label class="pill" title="Show the splats themselves (lighter copies): the one you picked, and the placed ones nearest it"><input type="checkbox" id="showSplats"> Splats</label>
+        <label class="pill"><input type="checkbox" id="showPoints" checked> Points</label>
+        <label class="pill"><input type="checkbox" id="showCams" checked> Cameras</label>
+        <label class="pill" title="Colour points by what the photos saw instead of by capture"><input type="checkbox" id="rgb"> Photo colours</label>
+        <button class="tbtn pill" id="fit" title="See the whole building">⤢ Whole building</button>
+      </div>
+      <div class="step" id="step" hidden aria-live="polite"></div>
+      <div class="help" id="help"></div>
+      <div id="status" hidden aria-live="polite"></div>
+    </div>
+    <aside class="side" id="side" aria-live="polite"></aside>
+  </main>
+  <div id="tip" role="tooltip"></div>
+  <script type="module" src="building.js"></script>
+</body>
+</html>

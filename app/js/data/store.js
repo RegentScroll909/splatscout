@@ -86,11 +86,7 @@ export async function getFrames(captureId) {
   return all.sort((a, b) => a.seq - b.seq);
 }
 
-// ---- snaps: single photos taken for the club, waiting to be sent (or already sent; then only the thumbnail is kept)
-export const putSnap = (s) => tx('snaps', 'readwrite', (st) => st.put(s));
-export const getSnap = (id) => tx('snaps', 'readonly', (st, set) => req2p(st.get(id)).then(set));
-export const listSnaps = () => tx('snaps', 'readonly', (st, set) => req2p(st.getAll()).then(set));
-export const deleteSnap = (id) => tx('snaps', 'readwrite', (st) => st.delete(id));
+// ---- snaps: single photos from before the club took full scans only (kept so leaving the club can clear them)
 export const clearSnaps = () => tx('snaps', 'readwrite', (st) => st.clear());
 
 export async function storageEstimate() {

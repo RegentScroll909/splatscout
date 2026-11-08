@@ -34,15 +34,28 @@ const SECTIONS = [
   {
     title: 'If tracking is lost or the AR session stops',
     body: `
-<p>Phone AR sometimes loses its place: in the dark, in front of a blank wall, or when the phone goes to sleep and AR has to start again. SplatScout notices and puts you back in your scan instead of starting over:</p>
+<p>Phone AR sometimes loses its place: in the dark, in front of a blank wall, or when the phone goes to sleep and AR has to start again. You don't have to find your place again by hand: the scan carries on in parts, and SplatStation joins them on the PC.</p>
 <ul>
-<li><b>Tracking lost or the position jumps:</b> photos pause for a moment while the view is checked against what you already scanned. If it still lines up, you carry on. If not, the <b>Re-aligning</b> panel appears.</li>
-<li><b>Re-aligning:</b> sweep the phone slowly over walls and furniture you scanned before. The app compares what the depth sensor sees with the scan, and the camera image with your earlier photos. When it matches, the dots settle back onto the surfaces and you carry on where you left off.</li>
-<li><b>In hallways</b>, plain walls look the same all along, so the photos do the work: aim at something that only appears once, like a sign, a poster, a noticeboard or a door number. Showing the floor for a moment helps too.</li>
-<li><b>Show me on the map:</b> if it takes a while, tap it, tap where you're standing on the floor plan (the dots are where earlier photos were taken), and drag from your dot the way the phone faces. The search then looks only there. When the dots sit on the real walls, tap <b>Use this position</b>.</li>
-<li><b>Coming back later</b> (screen off, app closed, another day): open the capture and tap <b>Capture more → Continue in AR</b>. Stand roughly where one of the photos shown was taken and aim the same way, which makes the match faster. Tap <b>I'm here</b> to tell the app.</li>
-<li>If the room changed (furniture moved), use the map, then <b>Fine-tune</b> to drag the dots onto the walls by hand. Or <b>Start a new map</b>: that session gets its own coordinates and its photos are still exported.</li>
-<li>Think the dots don't sit on the surfaces any more? Tap <b>Align</b> (left) to check.</li>
+<li><b>Tracking lost or the position jumps:</b> photos pause for a moment while the view is checked against what you already scanned. If it still lines up, you carry on as if nothing happened.</li>
+<li><b>If it doesn't line up:</b> tap <b>Keep scanning (new part)</b>. The scan carries on at once as a new part, with its own coverage map.</li>
+<li><b>First, overlap.</b> A new part starts with a few photos of what you scanned just before tracking was lost (the panel shows those photos and counts to 8). Step back to that spot, keep a corner or the floor in view, and move slowly. These photos are what SplatStation uses to join the parts, so don't skip them unless there's nothing to overlap.</li>
+<li><b>Then carry on</b> as usual. Meanwhile the app keeps looking for your earlier scan in the background. When it recognises the place, the earlier coverage, scan area and path come back on screen. If it never does, nothing is lost: it only affects the map on the phone.</li>
+<li><b>Coming back later</b> (screen off, app closed, another day): open the capture and tap <b>Capture more → Continue in AR</b>. That session is a new part too: stand near one of the photos shown, aim the same way, and take its first photos there.</li>
+<li><b>Find my place</b> (on the new-part panel) and <b>Align</b> (left) still search for where you are while photos wait, if you'd rather line it up on the phone.</li>
+<li>When exporting, the parts are listed under <b>Parts</b>. Keep them all: SplatStation puts them into one splat, in the coordinates of the part with the most photos.</li>
+</ul>`,
+  },
+  {
+    title: 'Markers for blank walls',
+    body: `
+<p>Long blank walls are where tracking gets lost, and where the photos have nothing to match. A few temporary markers fix both.</p>
+<ul>
+<li><b>What:</b> sticky notes, strips of painter's tape (crosses and zigzags rather than plain lines), or printed sheets of random black-and-white blocks. Every marker should look different: identical ones can be mistaken for each other.</li>
+<li><b>Where:</b> one every 1–2 m along the blank stretch, placed low (knee to hip height) and on the floor's edge, so they stay in view when you tilt down and stay out of the way of what matters.</li>
+<li><b>How:</b> put them up before you start, and leave them until the whole scan is done. Moving one mid-scan is worse than having none.</li>
+<li><b>They show in the splat.</b> Markers end up in the result, so keep them small and low, and leave out the walls you want spotless.</li>
+<li><b>Afterwards:</b> take every one down. Check the building's rules first: some places don't allow anything stuck to walls, and painter's tape is the safest choice on paint.</li>
+<li>Also: pass long plain walls at an angle, not head-on, with a corner, a door frame or the floor in view. The coach says <i>"Plain wall: get the corner or the floor in view"</i> when the view is too plain, and asks you to turn slowly there.</li>
 </ul>`,
   },
   {
@@ -101,7 +114,7 @@ const SECTIONS = [
     title: 'Tricky surfaces',
     body: `
 <ul>
-<li><b>Blank walls.</b> Nothing to match, and the phone's tracking has nothing to hold on to either. Keep edges, trim, outlets or furniture in every frame, step back rather than pointing at a plain wall from close up, and turn slowly there: fast turns in front of a plain wall are the usual way tracking gets lost. The coach asks for slower turns when the view is plain, says "Tracking is slipping" before it's lost, and holds photos until it steadies.</li>
+<li><b>Blank walls.</b> Nothing to match, and the phone's tracking has nothing to hold on to either. Keep edges, trim, outlets or furniture in every frame, step back rather than pointing at a plain wall from close up, pass it at an angle, and turn slowly there: fast turns in front of a plain wall are the usual way tracking gets lost. The coach says "Plain wall" when the view is too plain, asks for slower turns there, says "Tracking is slipping" before it's lost, and holds photos until it steadies. For long blank stretches, see <b>Markers for blank walls</b>.</li>
 <li><b>Glass, mirrors, glossy floors, screens.</b> Splats can't fully represent reflections. Capture them at angles from several positions, and turn monitors off.</li>
 <li><b>Thin things</b> (railings, chair legs, plants) need many close, overlapping views from all around.</li>
 <li><b>Dark corners and under tables</b>: low pass, tilted up and in.</li>

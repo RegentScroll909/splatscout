@@ -18,8 +18,9 @@ fake.db.invites.set('CLUB-DEMO', { code: 'CLUB-DEMO', label: 'demo', max_uses: 5
 if (process.argv.includes('--demo')) demo();
 
 /**
- * --demo: made-up members ("Demo_…"), photos and scans around a few Tempe buildings, so the Campus page has
- * something to show. Rows only (no photo files), spread over the last four weeks and all four kinds of light.
+ * --demo: made-up members ("Demo_…") and the scans they sent around a few Tempe buildings, so the Campus and
+ * Club pages have something to show: some approved, some waiting for the club, one turned down. Rows only (no
+ * files), spread over the last four weeks and all four kinds of light.
  */
 function demo() {
   const list = JSON.parse(readFileSync(new URL('../app/data/asu-buildings.json', import.meta.url), 'utf8')).buildings;
@@ -29,52 +30,37 @@ function demo() {
   const users = ['Demo_Fox', 'Demo_Owl', 'Demo_Hawk', 'Demo_Gecko'].map((handle, i) => {
     const id = `de000000-0000-4000-8000-00000000000${i}`;
     fake.db.profiles.set(id, { user_id: id, handle, banned: false, created_at: new Date(Date.now() - 30 * 864e5).toISOString() });
-    return id;
+    return [id, handle];
   });
   const HOURS = { morning: 9, afternoon: 13, evening: 18, night: 21 };
   const day = 864e5, now = Date.now();
-  // [building, floor, room, {light: [accepted, waiting]}]
+  // [building, floor, room, grade, photos, status, days ago, light, points when approved]
   const plan = [
-    ['Hayden Library', '1', 'Main lobby', { afternoon: [150, 6], evening: [30, 0] }],
-    ['Hayden Library', '2', 'Reading room', { morning: [70, 12] }],
-    ['Hayden Library', '3', 'Hallway', { afternoon: [24, 0], night: [10, 0] }],
-    ['Memorial Union', '1', 'Food court', { evening: [95, 0], afternoon: [40, 4] }],
-    ['Old Main', '1', 'Main hall', { morning: [210, 0] }],
-    ['Old Main', '2', 'Ballroom', { afternoon: [40, 8] }],
-    ['Biodesign Institute Building A', '1', 'Atrium', { afternoon: [35, 0], evening: [35, 0], night: [30, 0] }],
-    ['Armstrong Hall', '1', 'Lobby', { morning: [12, 9] }],
+    ['Hayden Library', '1', 'Main lobby', 'A', 420, 'approved', 12, 'afternoon', 60],
+    ['Hayden Library', '2', 'Reading room', 'B', 380, 'processed', 3, 'morning', 0],
+    ['Hayden Library', '3', 'Hallway', 'B', 260, 'new', 1, 'evening', 0],
+    ['Memorial Union', '1', 'Food court', 'A', 350, 'approved', 9, 'evening', 42],
+    ['Memorial Union', '2', 'Ballroom foyer', 'B', 380, 'new', 2, 'afternoon', 0],
+    ['Old Main', '1', 'Main hall', 'A', 410, 'approved', 20, 'morning', 51],
+    ['Biodesign Institute Building A', '1', 'Atrium', 'B', 300, 'rejected', 6, 'night', 0],
+    ['Armstrong Hall', '1', 'Lobby', 'A', 280, 'new', 0, 'morning', 0],
   ];
   let k = 0;
-  for (const [bname, floor, room, lights] of plan) {
+  for (const [bname, floor, room, grade, photos, status, daysAgo, light, points] of plan) {
     const b = at(bname);
     if (!b) continue;
-    const session = () => `5e550000-0000-4000-8000-${String(Math.floor(rnd() * 1e6)).padStart(12, '0')}`;
-    for (const [light, [accepted, waiting]] of Object.entries(lights)) {
-      const s1 = session(), user = users[Math.floor(rnd() * users.length)];
-      for (let i = 0; i < accepted + waiting; i++) {
-        const id = `d0000000-0000-4000-8000-${String(++k).padStart(12, '0')}`;
-        const dayAgo = Math.floor(rnd() * 26) + (i >= accepted ? 0 : 2);
-        const base = new Date(now - dayAgo * day);
-        const t = Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), HOURS[light] + 7, Math.floor(rnd() * 50));
-        const ok = i < accepted;
-        fake.db.photos.set(id, {
-          id, user_id: user, created_at: new Date(t + 3e5).toISOString(), taken_at: new Date(t).toISOString(),
-          building_code: b.code, building_name: b.name, floor, room, storage_path: `${b.code}/x/${id}.jpg`, session: s1, mission_id: null,
-          lat: b.c[0] + (rnd() - 0.5) * 0.0004, lon: b.c[1] + (rnd() - 0.5) * 0.0004, gps_accuracy_m: Math.round(8 + rnd() * 30),
-          device: 'Pixel 8', status: ok ? 'accepted' : 'new', points: ok ? 1 : 0, reviewed_at: ok ? new Date(t + 864e5).toISOString() : null, file_removed: false,
-        });
-      }
-    }
-  }
-  const scan = (bname, floor, room, grade, photos, daysAgo) => {
-    const b = at(bname);
-    if (!b) return;
+    const [user, handle] = users[Math.floor(rnd() * users.length)];
+    const base = new Date(now - daysAgo * day);
+    const t = Math.min(now - 6e4, Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), HOURS[light] + 7, Math.floor(rnd() * 50)));
     const id = `5ca00000-0000-4000-8000-${String(++k).padStart(12, '0')}`;
-    fake.db.captures.set(id, { id, user_id: users[1], created_at: new Date(now - daysAgo * day).toISOString(), building_code: b.code, building_name: b.name, floor, room, photo_count: photos, grade, status: 'approved', points: 60, reviewed_at: new Date(now - daysAgo * day).toISOString(), lat: b.c[0], lon: b.c[1], gps_accuracy_m: 15, storage_prefix: `${b.code}/x/${id}` });
-  };
-  scan('Memorial Union', '2', 'Ballroom foyer', 'B', 380, 5);
-  scan('Durham Language and Literature Building', '1', 'Lobby', 'C', 210, 9);
-  console.log(`Demo data: ${fake.db.photos.size} photos, ${fake.db.captures.size} scans, ${users.length} demo members`);
+    const done = status === 'approved' || status === 'rejected';
+    fake.db.captures.set(id, {
+      id, user_id: user, created_at: new Date(t).toISOString(), building_code: b.code, building_name: b.name, floor, room, photo_count: photos, grade, status,
+      points: status === 'approved' ? points : 0, reviewed_at: done ? new Date(Math.min(now, t + day)).toISOString() : null, review_note: status === 'rejected' ? 'A person is in the scan' : null,
+      contributor: handle, lat: b.c[0] + (rnd() - 0.5) * 0.0003, lon: b.c[1] + (rnd() - 0.5) * 0.0003, gps_accuracy_m: Math.round(8 + rnd() * 20), storage_prefix: `${b.code}/x/${id}`,
+    });
+  }
+  console.log(`Demo data: ${fake.db.captures.size} scans, ${users.length} demo members`);
 }
 
 createServer(async (req, res) => {

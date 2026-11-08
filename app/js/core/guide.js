@@ -11,6 +11,7 @@ import { offsetPoly, principalAxes, clipLine, polyCentroid, inwardNormal, horiz,
 import { DEG, v3, clamp, angleBetween, poseForward, posePosition } from './math.js';
 import { VoxelMap } from './coverage.js';
 import { FloorGrid } from './floorgrid.js';
+import { voxelNormal } from './align.js';
 
 const SPACING = 0.4; // m between path stations
 const DONE_RADIUS = 0.6; // a photo this close to a station (and aimed about right) completes it
@@ -24,8 +25,20 @@ const AT_GAP = 0.6; // m: standing on a gap marker (the session takes its photo 
 const GAP_AIM = 22; // degrees: aimed closely enough at it for that photo
 const GAP_TIMEOUT = 25; // s on one gap target before trying another
 const GAPS_DONE = 0.93; // surface coverage at which the gap pass counts as done
+const LONG_WALL = 2.5; // m of flat wall around a spot: seen head-on from close up, that's a plain view
 
 export const passHeight = (pass) => HEIGHT[pass && pass.height] || HEIGHT.chest;
+
+// The voxel itself first, then its neighbours.
+const NEAR_CELLS = [[0, 0, 0]];
+for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) if (dx || dy || dz) NEAR_CELLS.push([dx, dy, dz]);
+
+/** How much a view of a long wall is worth by its angle: head-on is a plain view, 30-70° off it is best. */
+export function wallAngleFactor(aim, wall) {
+  const a = horiz(aim);
+  const off = Math.acos(clamp(Math.abs(a[0] * wall.n[0] + a[2] * wall.n[2]), 0, 1)) / DEG;
+  return off < 20 ? 0.3 : off < 30 ? 0.65 : off > 70 ? 0.6 : 1;
+}
 
 /** How far from the walls a pass's path should stay. */
 function wallClearance(spec) {
@@ -589,6 +602,9 @@ export class Guide {
       if (until && t < until) continue;
       if (this.skippedNear.some((p) => v3.dist(p, c.center) < 0.9)) continue;
       if (!(b && b.poly) && v3.dist(c.center, pos) > this.template.maxObsDist) continue;
+      // On a long flat wall: look at it at an angle, so a corner, the floor or what's along it is in
+      // view too (head-on from close up, a plain wall fills the view and AR tracking slips).
+      const wall = this._longWall(c.center);
       for (const r of [reach * 0.75, reach, reach * 1.4]) {
         for (let az = 0; az < 360; az += 30) {
           const cam = [c.center[0] + Math.cos(az * DEG) * r, eye, c.center[2] + Math.sin(az * DEG) * r];
@@ -612,7 +628,7 @@ export class Guide {
           const cost = 4 + walk / 0.6 + angleBetween(fh, horiz(aim)) / DEG / 30;
           // Ahead along the sweep (1) or back where you came from (0); spots underfoot count as ahead.
           const ahead = !this.sweep || walk < 0.5 ? 1 : (1 + ((cam[0] - pos[0]) * this.sweep[0] + (cam[2] - pos[2]) * this.sweep[1]) / walk) / 2;
-          const score = (c.count * Math.min(1, novelty / 45) * (0.3 + 0.7 * ahead)) / cost;
+          const score = (c.count * Math.min(1, novelty / 45) * (0.3 + 0.7 * ahead) * (wall ? wallAngleFactor(aim, wall) : 1)) / cost;
           if (!best || score > best.score) {
             best = { score, pos: cam, aim, target: c.center, key: c.key, deficit0: c.deficit, t0: t, kind: 'gap' };
           }
@@ -620,6 +636,39 @@ export class Guide {
       }
     }
     return best;
+  }
+
+  /**
+   * The flat, upright wall a spot is on, when it runs on for LONG_WALL metres or more: {n} (its
+   * horizontal normal), else null.
+   */
+  _longWall(p) {
+    const vm = this.voxels, s = vm.size;
+    const ix = Math.floor(p[0] / s), iy = Math.floor(p[1] / s), iz = Math.floor(p[2] / s);
+    let v = null;
+    for (const [dx, dy, dz] of NEAR_CELLS) {
+      const u = vm.vox.get(vm.key(ix + dx, iy + dy, iz + dz));
+      if (u && VoxelMap.isSolid(u)) {
+        v = u;
+        break;
+      }
+    }
+    const n = v && voxelNormal(vm, v);
+    if (!n || Math.abs(n[1]) > 0.3) return null;
+    const l = Math.hypot(n[0], n[2]), nx = n[0] / l, nz = n[2] / l;
+    // How far it runs on to either side along the wall (a gap of a voxel or two is fine).
+    const run = (dir) => {
+      let len = 0, miss = 0;
+      for (let k = 1; k * s <= LONG_WALL; k++) {
+        const x = p[0] - nz * dir * k * s, z = p[2] + nx * dir * k * s;
+        if ([-1, 0, 1].some((o) => vm.isSolidAt(x + nx * o * s, p[1], z + nz * o * s))) {
+          len = k * s;
+          miss = 0;
+        } else if (++miss > 2) break;
+      }
+      return len;
+    };
+    return run(1) + run(-1) >= LONG_WALL ? { n: [nx, 0, nz] } : null;
   }
 
   /** Skip the spot the guide points at (the user can't or won't get there): it doesn't come back. */

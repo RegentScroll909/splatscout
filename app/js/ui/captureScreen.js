@@ -30,6 +30,8 @@ const REASON = {
   manual: 'Re-aligning',
 };
 
+const PART_TEXT = 'Carry on now: this becomes a new part of the scan, and SplatStation joins the parts on the PC from the photos where they overlap.';
+
 const ALIGN_TEXT = {
   more: ['Look around slowly', 'Sweep the phone across walls and furniture you scanned before.'],
   new: ['This part isn\'t in the scan', 'Go back to an area you scanned and point the phone at it.'],
@@ -152,8 +154,25 @@ export async function captureScreen(root, { captureId, navigate }) {
     alignDetail,
     h('div.meter', alignMeter),
     refBox,
-    h('div.row.tight.wrap', mapBtn, acceptBtn, manualBtn, rotL, rotR, h('button.btn.small.ghost.hud-interactive', { onclick: () => newMap() }, 'Start a new map')),
+    h('div.row.tight.wrap', mapBtn, acceptBtn, manualBtn, rotL, rotR, h('button.btn.small.hud-interactive', { onclick: () => keepScanning() }, icon('plus'), 'Keep scanning (new part)')),
   );
+
+  // Tracking was lost and the view didn't line up again: carry on as a new part (or search instead).
+  // Then, while a new part's first photos are taken, which part this is and what to overlap.
+  const partKicker = h('div.panel-kicker');
+  const partTitle = h('div.panel-title');
+  const partDetail = h('div.panel-detail');
+  const partRefs = h('div.part-refs');
+  const partCount = h('span.part-count.mono');
+  const offerRow = h('div.row.tight.wrap',
+    h('button.btn.primary.hud-interactive', { onclick: () => keepScanning() }, icon('plus'), 'Keep scanning (new part)'),
+    h('button.btn.small.ghost.hud-interactive', { onclick: () => session && session.findPlace() }, 'Find my place'));
+  const overlapRow = h('div.row.tight', partCount, h('button.btn.small.ghost.hud-interactive', { onclick: () => skipOverlap() }, 'Skip'));
+  const partPanel = h('div.align-panel.part-panel.hidden.hud-interactive',
+    h('div.panel-head', icon('align'), partKicker), partTitle, partDetail, partRefs, offerRow, overlapRow);
+  const recent = []; // the last few photos: {id, url}, to show what a new part should overlap
+  let partRefIds = [];
+  let partUrls = [];
   // Full-screen gesture layer for fine-tuning by hand.
   const alignPad = h('div.align-pad.hidden.hud-interactive', h('div.align-pad-hint', 'Drag to slide the scan · twist with two fingers to turn it'));
 
@@ -179,6 +198,7 @@ export async function captureScreen(root, { captureId, navigate }) {
     ),
     coach,
     alignPanel,
+    partPanel,
     readouts,
     h('div.reticle'),
     ring,
@@ -339,7 +359,7 @@ export async function captureScreen(root, { captureId, navigate }) {
         h('h2', canResume ? 'Continue this scan' : resumed ? 'Add more photos' : `${template.name} capture`),
         canResume
           ? h('div',
-              h('p', `${existing.length} photos so far. Stand near one of these spots and aim the same way. Once AR starts, sweep the phone slowly over what you scanned: the app finds its place and brings back the scan area, coverage and path.`),
+              h('p', `${existing.length} photos so far. This session becomes a new part of the scan: stand near one of these spots and aim the same way, so its first photos overlap the earlier ones (SplatStation joins the parts from those). Photos start at once. When the app recognises the place, the scan area, coverage and path come back too.`),
               h('div.start-ref-row',
                 h('button.icon-btn.small', { onclick: () => { refIdx = (refIdx + refFrames.length - 1) % refFrames.length; refPick.src = refUrls[refIdx]; }, 'aria-label': 'Previous photo' }, icon('chevronLeft')),
                 refPick,
@@ -397,12 +417,16 @@ export async function captureScreen(root, { captureId, navigate }) {
           if (settings.sounds) tick('shot');
           buzz(10);
           const url = URL.createObjectURL(thumbBlob);
-          const old = thumb.src;
           thumb.src = url;
           thumb.classList.remove('flash');
           void thumb.offsetWidth;
           thumb.classList.add('flash');
-          if (old && old.startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(old), 1000);
+          // The last few stay around: a new part starts by overlapping them.
+          recent.push({ id: meta.id, url });
+          while (recent.length > 8) {
+            const old = recent.shift();
+            if (!partRefIds.includes(old.id)) setTimeout(() => URL.revokeObjectURL(old.url), 1000);
+          }
         },
         onSourceEnd: () => {
           if (!running) return;
@@ -423,7 +447,6 @@ export async function captureScreen(root, { captureId, navigate }) {
       const resumed = resumeMode && session.resume();
       if (resumed) {
         showRef();
-        say('Continuing your scan. Look around slowly.');
       } else if (session.sixdof && !(session.bounds && session.bounds.poly)) {
         if (source.kind === 'demo' && capture.tour && !source.sessionXf) {
           setRoomBounds();
@@ -463,7 +486,7 @@ export async function captureScreen(root, { captureId, navigate }) {
     const m = 0.05;
     session.setBounds(new Bounds({
       poly: [[ROOM.min[0] + m, ROOM.min[2] + m], [ROOM.max[0] - m, ROOM.min[2] + m], [ROOM.max[0] - m, ROOM.max[2] - m], [ROOM.min[0] + m, ROOM.max[2] - m]],
-      floorY: 0, segment: session.segment, space: session.space,
+      floorY: 0, segment: session.segment, space: session.viewSpace,
     }));
   }
 
@@ -527,7 +550,7 @@ export async function captureScreen(root, { captureId, navigate }) {
     const w = Math.max(1, Math.round(r.width * dpr)), hh = Math.max(1, Math.round(r.height * dpr));
     if (mapSheetCanvas.width !== w || mapSheetCanvas.height !== hh) [mapSheetCanvas.width, mapSheetCanvas.height] = [w, hh];
     mapView = drawTopDown(mapSheetCanvas, {
-      voxels: session.voxels, frames: session.frames, pose: null, space: session.space, capture, bounds: session.bounds, hint: mapHint, big: true,
+      voxels: session.voxels, frames: session.shownFrames(), pose: null, space: session.viewSpace, capture, bounds: session.bounds, hint: mapHint, big: true,
     });
   }
 
@@ -544,17 +567,62 @@ export async function captureScreen(root, { captureId, navigate }) {
     session.acceptAlignment();
   }
 
-  async function newMap() {
-    if (!session) return;
-    const ok = await confirmDialog('Start a new map? This AR session gets its own coordinates: mark the scan area again. Photos already taken are kept, but coverage starts empty.', 'Start new map');
-    if (!ok) return;
-    session.startNewMap();
+  /** Carry on as a new part of the scan (no confirmation: nothing is lost, SplatStation joins the parts). */
+  function keepScanning() {
+    if (!session || !session.reloc) return;
+    session.startNewPart();
     setManual(false);
     closeMapSheet();
     toggleGhost(false);
-    if (source.kind === 'demo' && capture.tour && !source.sessionXf) setRoomBounds();
-    else if (settings.guide !== false) startBounds();
-    toast('New map started');
+  }
+
+  /** Done overlapping (or there's nothing to overlap): the guide takes over again. */
+  function skipOverlap() {
+    if (!session || !session.overlap) return;
+    session.overlap.done = true;
+    session.lastGuide = 0;
+  }
+
+  /** The new-part offer, or a new part's overlap photos still to take. */
+  function renderPart(R, P, offer) {
+    const ov = P && P.overlap;
+    partPanel.classList.toggle('hidden', !offer && !ov);
+    if (!offer && !ov) return;
+    offerRow.classList.toggle('hidden', !offer);
+    overlapRow.classList.toggle('hidden', !!offer);
+    if (offer) {
+      partKicker.textContent = REASON[R.reason] || 'Tracking was lost';
+      partTitle.textContent = 'Keep scanning as a new part?';
+      partDetail.textContent = R.since > 6
+        ? `${PART_TEXT} Or aim at something you scanned: if it lines up, you carry straight on.`
+        : `The view no longer lines up with your scan. ${PART_TEXT}`;
+      setPartRefs([]);
+      return;
+    }
+    const resume = ov.reason === 'resume';
+    partKicker.textContent = `Part ${P.no}${P.linked ? ' · lined up' : P.searching ? ' · finding your scan' : ''}`;
+    partTitle.textContent = resume ? 'Start where you left off' : 'First, overlap what you scanned';
+    partDetail.textContent = resume
+      ? 'Stand near one of these spots and aim the same way, with a corner or the floor in view. These photos tie this part to the earlier ones.'
+      : 'Step back to where tracking was lost and photograph what you scanned just before (these photos), with a corner or the floor in view. They tie the parts together.';
+    partCount.textContent = `${ov.got} of ${ov.need} photos`;
+    setPartRefs(resume ? refFrames.map((f, i) => ({ id: f.id, url: refUrls[i] })) : partUrls);
+  }
+
+  /** A new part started: keep the photos taken just before it (what it should overlap) on show. */
+  function notePartRefs(ids) {
+    const keep = (ids || []).map((id) => recent.find((r) => r.id === id)).filter(Boolean);
+    for (const u of partUrls) if (!recent.includes(u) && !keep.includes(u)) URL.revokeObjectURL(u.url);
+    partUrls = keep;
+    partRefIds = keep.map((r) => r.id);
+  }
+
+  let shownRefs = '';
+  function setPartRefs(list) {
+    const key = list.map((r) => r.id).join(',');
+    if (key === shownRefs) return;
+    shownRefs = key;
+    mount(partRefs, ...list.map((r) => h('img.part-ref', { src: r.url, alt: '' })));
   }
 
   function realign() {
@@ -665,6 +733,26 @@ export async function captureScreen(root, { captureId, navigate }) {
       if (e.reason === 'resume' && session.sixdof && !(session.bounds && session.bounds.poly) && settings.guide !== false && !(source.kind === 'demo' && capture.tour)) {
         startBounds();
       }
+    } else if (e.type === 'newPartOffer') {
+      buzz([60, 40, 60]);
+      say('Tracking lost. Tap keep scanning to carry on as a new part.');
+    } else if (e.type === 'newPart') {
+      if (e.reason !== 'resume') {
+        notePartRefs(e.refs);
+        toast(`Part ${e.part} started. First, a few photos of what you just scanned.`, 4500);
+        say('New part. First, photograph what you just scanned.');
+      } else {
+        showRef();
+        say('Continuing your scan as a new part. Start where you left off.');
+      }
+    } else if (e.type === 'overlapDone') {
+      if (settings.sounds) chime();
+      buzz([20, 40, 20]);
+      toast('Overlap done: carry on. The parts are joined on the PC.', 4000);
+    } else if (e.type === 'partsLinked') {
+      if (settings.sounds) chime();
+      toast(`Found your earlier scan: its coverage${e.area ? ' and scan area' : ''} ${e.area ? 'are' : 'is'} back on screen.`, 4500);
+      say('Found your earlier scan.');
     } else if (e.type === 'trackingBack') {
       toast('Tracking back: position checked against the scan.');
     } else if (e.type === 'corrected') {
@@ -684,6 +772,7 @@ export async function captureScreen(root, { captureId, navigate }) {
     const L = session.live;
     const R = L.reloc;
     const searching = !!(R && R.mode === 'search');
+    const offer = !!(R && R.mode === 'offer');
     const marking = !!session.boundsDraft;
 
     let pr = L.primary;
@@ -691,9 +780,9 @@ export async function captureScreen(root, { captureId, navigate }) {
     if (R && R.mode === 'check') pr = { level: 'info', title: 'Checking position…', detail: 'Tracking was interrupted. Photos wait a moment while the view is matched against the scan.' };
     // The arrow in the middle already says what the guide wants: the banner is for problems.
     if (pr && pr.id === 'guide' && L.cue && !marking && !skipMode) pr = null;
-    coach.classList.toggle('hidden', searching || !pr);
+    coach.classList.toggle('hidden', searching || offer || !pr);
     if (pr) {
-      coach.className = 'coach ' + pr.level + (searching ? ' hidden' : '');
+      coach.className = 'coach ' + pr.level + (searching || offer ? ' hidden' : '');
       if (coach.dataset.icon !== pr.level) {
         mount(coachIcon, icon(LEVEL_ICON[pr.level] || 'info'));
         coach.dataset.icon = pr.level;
@@ -707,16 +796,17 @@ export async function captureScreen(root, { captureId, navigate }) {
       if (manual) setManual(false);
       if (!mapSheet.classList.contains('hidden')) closeMapSheet();
     }
+    renderPart(R, searching || marking ? null : L.part, offer);
 
     boundsBar.classList.toggle('hidden', !marking);
     hudBottom.classList.toggle('hidden', marking);
-    tools.classList.toggle('hidden', !session.sixdof || marking || searching);
+    tools.classList.toggle('hidden', !session.sixdof || marking || searching || offer);
     capRoot.classList.toggle('aligning', searching);
     if (marking) cornerCount.textContent = `(${session.boundsDraft.corners.length})`;
     mount(readouts, ...Object.values(L.chips || {}).map((c) => h('div.readout.' + c.level, h('span.readout-dot'), h('span.readout-lbl', c.label), h('span.readout-val', c.value))));
     const pass = session.pass;
     passIdx.textContent = marking ? 'AREA' : `${String(session.passIndex + 1).padStart(2, '0')}/${String(template.passes.length).padStart(2, '0')}`;
-    passName.textContent = marking ? 'Marking the scan area' : searching ? 'Re-aligning' : pass.name;
+    passName.textContent = marking ? 'Marking the scan area' : searching ? 'Re-aligning' : offer ? 'Tracking lost' : L.part && L.part.no > 1 ? `${pass.name} · part ${L.part.no}` : pass.name;
     passBar.style.width = Math.round(Math.min(1, L.passProgress || 0) * 100) + '%';
     if (L.coverage) {
       const v = L.coverage.value;
@@ -738,8 +828,8 @@ export async function captureScreen(root, { captureId, navigate }) {
       lastMap = now;
       if (session.sixdof && (session.voxels.vox.size > 0 || session.bounds)) {
         drawTopDown(mapCanvas, {
-          voxels: session.voxels, frames: session.frames, pose: searching && !(session.reloc.state && session.reloc.state.preview) ? null : L.pose,
-          target: session.target && session.target.point, space: session.space, capture, bounds: session.bounds,
+          voxels: session.voxels, frames: session.shownFrames(), pose: searching && !(session.reloc.state && session.reloc.state.preview) ? null : L.pose,
+          target: session.target && session.target.point, space: session.viewSpace, capture, bounds: session.bounds,
           draft: session.boundsDraft && session.boundsDraft.corners,
           guidePath: session.guide && session.guide.hasPath ? session.guide.stations : null,
         });
@@ -757,7 +847,7 @@ export async function captureScreen(root, { captureId, navigate }) {
         `tex ${m.texture.toFixed(3)} spread ${m.textureSpread.toFixed(2)}  rot ${m.rotSpeed.toFixed(1)}°/s  lin ${m.linSpeed == null ? '-' : m.linSpeed.toFixed(2)}\n` +
         `flow ${m.flowSpeed.toFixed(3)}  depth ${m.depthMed ? m.depthMed.toFixed(2) : '-'}m  h ${L.height == null ? '-' : L.height.toFixed(2)}m  floor ${session.floorHeight().toFixed(2)}\n` +
         `vox ${session.voxels.vox.size} solid ${vs.solid} out ${vs.outside}  q ${vs.q0}/${vs.q1}/${vs.q2}/${vs.q3}\n` +
-        (x ? `align ${(x.yaw / DEG).toFixed(1)}° ${x.t.map((v) => v.toFixed(2)).join(' ')}  space ${session.space}` : '') +
+        (x ? `align ${(x.yaw / DEG).toFixed(1)}° ${x.t.map((v) => v.toFixed(2)).join(' ')}  space ${session.space}${session.viewSpace !== session.space ? ` on ${session.viewSpace}` : ''}${session.reloc.bg ? `  bg ${session.reloc.bg.status} ${session.reloc.bg.confidence.toFixed(2)}` : ''}` : '') +
         (R && R.metrics ? `\n${JSON.stringify(R.metrics)}` : '');
     }
   }
@@ -865,7 +955,7 @@ export async function captureScreen(root, { captureId, navigate }) {
       h('div.row',
         h('button.btn.small', { onclick: () => { closeSheet(); redrawBounds(); } }, b && b.poly ? 'Redraw outline' : 'Mark outline'),
         skips ? h('button.btn.small', { onclick: () => { session.undoSkip(); closeSheet(); toast('Last skipped spot restored'); } }, 'Undo last skip') : null,
-        b && b.poly ? h('button.btn.small.ghost', { onclick: () => { session.setBounds(b.skips.length ? new Bounds({ poly: null, floorY: null, skips: b.skips, segment: session.segment, space: session.space }) : null); closeSheet(); toast('Outline removed'); } }, 'Remove outline') : null,
+        b && b.poly ? h('button.btn.small.ghost', { onclick: () => { session.setBounds(b.skips.length ? new Bounds({ poly: null, floorY: null, skips: b.skips, segment: session.segment, space: session.viewSpace }) : null); closeSheet(); toast('Outline removed'); } }, 'Remove outline') : null,
         h('button.btn.small', { onclick: () => { closeSheet(); realign(); } }, icon('align'), 'Re-align'),
       ),
     );
@@ -972,6 +1062,8 @@ export async function captureScreen(root, { captureId, navigate }) {
     keepAwake(false);
     document.body.classList.remove('capturing');
     for (const u of refUrls) URL.revokeObjectURL(u);
+    for (const r of recent) URL.revokeObjectURL(r.url);
+    for (const u of partUrls) if (!recent.includes(u)) URL.revokeObjectURL(u.url);
   }
 
   // Leaving via browser back.

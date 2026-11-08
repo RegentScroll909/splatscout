@@ -7,7 +7,6 @@ import { reviewScreen } from './ui/review.js';
 import { learnScreen } from './ui/learn.js';
 import { settingsScreen } from './ui/settingsScreen.js';
 import { clubScreen } from './ui/clubScreen.js';
-import { snapScreen } from './ui/snapScreen.js';
 import { campusScreen } from './ui/campusScreen.js';
 import { h, mount } from './ui/dom.js';
 
@@ -39,7 +38,7 @@ async function route() {
     else if (parts[0] === 'learn') cleanup = learnScreen(root, ctx);
     else if (parts[0] === 'settings') cleanup = settingsScreen(root, ctx);
     else if (parts[0] === 'club') cleanup = await clubScreen(root, ctx);
-    else if (parts[0] === 'snap') cleanup = await snapScreen(root, ctx);
+    else if (parts[0] === 'snap') navigate('#/club'); // single photos were retired: the club takes full scans
     else if (parts[0] === 'campus') cleanup = await campusScreen(root, ctx);
     else navigate('#/');
   } catch (e) {

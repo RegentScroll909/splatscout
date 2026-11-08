@@ -19,8 +19,9 @@ import { readZipText } from './lib/zipread.mjs';
 import { walkInputs, walkMapFor } from './lib/walkmap.mjs';
 import { cropPly, topDown, CROP_MARGIN } from './lib/crop.mjs';
 import * as crowd from './lib/crowd.mjs';
-import { handleClub, isLocal, awardScan, buildings as asuBuildings } from './lib/clubapi.mjs';
+import { handleClub, isLocal, buildings as asuBuildings } from './lib/clubapi.mjs';
 import { campusData, saveFloors, saveSize, setSince, publishSummary, savePublished, loadPublished } from './lib/campus.mjs';
+import { buildingView, savePlacement, pointsFileOf, libraryFolderOf, keepCameras, splatPreview } from './lib/placement.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 let PKG_VERSION = '0';
@@ -169,6 +170,8 @@ async function pump() {
     job.result = result;
     job.finished = Date.now();
     say(`Done in ${fmtDur(result.totalSec)}: ${result.info.training.splats ? result.info.training.splats.toLocaleString() + ' splats, ' : ''}${result.info.sizeMB} MB → ${result.folder}`, job);
+    // Where its photos were taken, kept beside the splat for the building view (outlives the job folder).
+    keepCameras({ library: library(), libraryDir: cfg.dirs.library, jobId: job.id, jobDir: job.dir }).catch(() => {});
   } catch (e) {
     job.finished = Date.now();
     if (e.cancelled) {
@@ -317,9 +320,9 @@ function library() {
 const crowdBusy = new Set(); // club uploads being imported or deleted
 
 // ------------------------------------------------------------------------------------ campus summary for members
-// The phones' Campus map shows a summary of the Campus page (counts and what each space needs, no names or
+// The phones' Campus map shows a summary of the Campus page (counts and sizes per space, no names or
 // locations), published to the club database with the secret key: from the Campus page's button, and by
-// itself a few seconds after photos are reviewed on the Club page. One publish at a time.
+// itself a few seconds after a scan is reviewed on the Club page. One publish at a time.
 const campusNow = (c) => campusData({
   club: c, library: library(), jobs: jobs.filter((j) => ['waiting', 'queued', 'running'].includes(j.status)),
   buildings: asuBuildings(), workDir: cfg.workDir, jobsDir: cfg.dirs.jobs,
@@ -350,16 +353,16 @@ function schedulePublish(by = 'review') {
     publishCampus(by).catch(() => {});
   }, 5000);
 }
-// New photos or scans from phones: once the members' map is in use, publish again within a minute of them
-// arriving, so phones follow every upload (two one-row requests a minute while SplatStation runs).
+// New scans from phones: once the members' map is in use, publish again within a minute of one arriving, so
+// phones show it as waiting for review (one one-row request a minute while SplatStation runs).
 async function watchUploads() {
   const p = loadPublished(cfg.workDir);
   if (!p) return;
   const c = crowd.crowdConfig(cfg.workDir);
   if (c.error) return;
   try {
-    const newest = (await Promise.all(['photos', 'captures'].map((t) => crowd.call(c, `/rest/v1/${t}?select=created_at&order=created_at.desc&limit=1`))))
-      .flat().reduce((t, r) => Math.max(t, Date.parse(r.created_at) || 0), 0);
+    const rows = await crowd.call(c, '/rest/v1/captures?select=created_at&status=neq.uploading&order=created_at.desc&limit=1');
+    const newest = rows.reduce((t, r) => Math.max(t, Date.parse(r.created_at) || 0), 0);
     if (newest > Date.parse(p.at)) schedulePublish('upload');
   } catch {}
 }
@@ -463,7 +466,10 @@ const server = createServer(async (req, res) => {
     if (path === '/api/library') return sendJson(res, library());
     // The club tools use the database's secret key: only this PC may ask (not a phone on the Wi-Fi).
     if (path.startsWith('/api/club')) {
-      return handleClub({ req, res, path, url, cfg, readBody, sendJson, say, scanInbox, version: PKG_VERSION, onPhotosChanged: schedulePublish });
+      return handleClub({
+        req, res, path, url, cfg, readBody, sendJson, say, scanInbox, version: PKG_VERSION,
+        library, jobs: () => jobs, campus: campusNow, onCampusChanged: schedulePublish,
+      });
     }
     if (path.startsWith('/api/campus')) {
       // The campus view: coverage per building and space, and expected splat quality. It shows where members
@@ -522,6 +528,38 @@ const server = createServer(async (req, res) => {
           return sendJson(res, { error: e.message }, 500);
         }
       }
+      if (path === '/api/campus/building') {
+        // One building's captures on its footprint (floor plans and the 3D view): where each photo was taken,
+        // from its splat's COLMAP model, and where the club placed each capture. ?code=<ASU building code>
+        const code = url.searchParams.get('code') || '';
+        if (!asuBuildings().has(code)) return sendJson(res, { error: 'Unknown building' }, 404);
+        return sendJson(res, await buildingView({ code, buildings: asuBuildings(), library: library(), libraryDir: cfg.dirs.library, jobsDir: cfg.dirs.jobs, workDir: cfg.workDir }));
+      }
+      if (path === '/api/campus/building/points') {
+        // A capture's points, thinned for the browser (binary: count, x y z floats, r g b bytes). ?key=<library path>
+        const f = pointsFileOf(cfg.dirs.library, url.searchParams.get('key') || '');
+        return f ? sendFile(res, f, req) : sendJson(res, { error: 'No points for that capture yet: open its building first.' }, 404);
+      }
+      if (path === '/api/campus/building/splat') {
+        // A lighter copy of a capture's splat for the building view (.splat format, made once and kept beside it).
+        // ?key=<library path>&detail=near (the one being reviewed) | far (its neighbours)
+        try {
+          const f = await splatPreview({ libraryDir: cfg.dirs.library, jobsDir: cfg.dirs.jobs, key: url.searchParams.get('key') || '', detail: url.searchParams.get('detail') === 'near' ? 'near' : 'far' });
+          return sendFile(res, f, req);
+        } catch (e) {
+          return sendJson(res, { error: e.message }, 404);
+        }
+      }
+      if (path === '/api/campus/building/place' && req.method === 'POST') {
+        // Where a capture sits on its building's footprint: {key, placement: {s, theta, e, n, floor}}, or placement null to forget it.
+        const b = await readBody(req);
+        if (!libraryFolderOf(cfg.dirs.library, b.key)) return sendJson(res, { error: 'No such splat in the library' }, 404);
+        try {
+          return sendJson(res, { ok: true, placement: savePlacement(cfg.workDir, b.key, b.placement ?? null) });
+        } catch (e) {
+          return sendJson(res, { error: e.message }, 400);
+        }
+      }
       if (path === '/api/campus') {
         const c = crowd.crowdConfig(cfg.workDir);
         const data = await campusNow(c.error ? null : c);
@@ -552,11 +590,12 @@ const server = createServer(async (req, res) => {
           say('Deleted a club upload from the database.');
           return sendJson(res, { ok: true });
         }
+        // Importing doesn't award points: they come when the club approves the splat (Club page).
         let last = 0;
         const file = await crowd.importUpload(c, id, cfg.dirs.inbox, (p) => {
           if (p - last >= 0.25) say(`Club upload: downloading ${Math.round((last = p) * 100)}%`);
-        }, awardScan);
-        say(`Club upload imported: ${basename(file)}`);
+        });
+        say(`Club upload imported: ${basename(file)}. Review its splat on the Club page once it's built.`);
         setTimeout(scanInbox, 100);
         return sendJson(res, { ok: true, file: basename(file) });
       } catch (e) {
@@ -776,6 +815,8 @@ const server = createServer(async (req, res) => {
         }
       } else if (m[2] === 'delete') {
         if (job.status === 'running') return sendJson(res, { error: 'Cancel it first' }, 409);
+        // Its splats keep where their photos were taken (the building view reads it from the job's COLMAP model).
+        await keepCameras({ library: library(), libraryDir: cfg.dirs.library, jobId: job.id, jobDir: job.dir }).catch(() => {});
         jobs = jobs.filter((j) => j !== job);
         rmSync(job.dir, { recursive: true, force: true });
         broadcast('removed', { id: job.id });

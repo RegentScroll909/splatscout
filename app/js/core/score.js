@@ -5,20 +5,20 @@ import { DirectionSphere, VoxelMap, BANDS } from './coverage.js';
 import { posePosition, clamp } from './math.js';
 import { getTemplate } from './plans.js';
 import { Bounds } from './bounds.js';
-import { spaceOf, boundsFor, mainSpace, spaceCount } from './spaces.js';
+import { mainSpace, spaceCount, framesIn, boundsIn } from './spaces.js';
 
 /**
  * Rebuild coverage structures from saved frames (poses, depth points and depth images), the same
- * way it was measured live. Surface coverage needs one set of coordinates, so it is rebuilt from the
- * main space (the AR sessions that were lined up with each other, see spaces.js), and the scan area
- * only applies when it was marked in that space.
+ * way it was measured live. Surface coverage needs one set of coordinates, so it is rebuilt in the
+ * main space (the AR sessions that were lined up with each other, see spaces.js), with the parts
+ * the phone lined up with it, and the scan area marked in any of those.
  */
 export function rebuildCoverage(frames, template, capture = {}) {
   const sphere = new DirectionSphere();
   const voxels = new VoxelMap(template.voxel, template.maxObsDist);
   const main = mainSpace(frames, capture);
   const space = main ? main.space : null;
-  const bd = boundsFor(capture, space);
+  const bd = boundsIn(capture, space);
   const bounds = bd ? Bounds.from(bd) : null;
   if (bounds) voxels.setBounds(bounds);
   frames.forEach((f, i) => {
@@ -26,8 +26,9 @@ export function rebuildCoverage(frames, template, capture = {}) {
     const pos = f.tracking === '6dof' && f.tracked ? posePosition(f.pose) : null;
     sphere.addView(f.pose, f.intr, { pos, odo: f.odo || 0 }, i);
   });
-  integrateFrames(voxels, frames.filter((f) => f.tracked && spaceOf(f, capture) === space));
-  return { sphere, voxels, bounds, segments: spaceCount(frames, capture), mainSpace: space };
+  const shown = space == null ? [] : framesIn(frames, capture, space);
+  integrateFrames(voxels, shown);
+  return { sphere, voxels, bounds, segments: spaceCount(frames, capture), mainSpace: space, shown, linked: new Set(shown.map((f) => f.linkedFrom).filter((s) => s != null)).size };
 }
 
 /** Add saved photos' depth to a coverage map (all in the same coordinates). */
@@ -59,7 +60,7 @@ const GRADES = [
 
 export function analyzeCapture(frames, capture) {
   const template = getTemplate(capture.template);
-  const { sphere, voxels, segments, bounds, mainSpace } = rebuildCoverage(frames, template, capture);
+  const { sphere, voxels, segments, bounds, mainSpace, shown, linked } = rebuildCoverage(frames, template, capture);
   const vstats = voxels.stats();
   const n = frames.length;
   const sixdof = capture.tracking === '6dof';
@@ -191,11 +192,12 @@ export function analyzeCapture(frames, capture) {
   const order = { bad: 0, warn: 1, info: 2 };
   fixes.sort((a, b) => order[a.level] - order[b.level]);
   if (sixdof && segments > 1) {
-    fixes.push({ level: 'info', text: `This capture has ${segments} separate AR maps (sessions that weren't lined up with each other). Coverage and AR poses come from the largest one; the others are still exported as photos.` });
+    const apart = segments - 1 - linked;
+    fixes.push({ level: 'info', text: `This scan is in ${segments} parts (tracking was lost, or a later session started on its own). SplatStation joins them on the PC from the photos where they overlap.${apart > 0 ? ` Coverage here shows the largest part${linked ? ` and the ${linked} lined up with it` : ''}; ${apart === 1 ? 'one part isn\'t' : `${apart} parts aren't`} counted.` : ' All of them are lined up here, so coverage counts them all.'}` });
   }
   if (!fixes.length) fixes.push({ level: 'good', text: 'No problems found. This capture is ready for your splat pipeline.' });
 
-  return { score, grade, verdict, parts, fixes, target, area, vstats, sphere, voxels, bounds, segments, mainSpace };
+  return { score, grade, verdict, parts, fixes, target, area, vstats, sphere, voxels, bounds, segments, mainSpace, shown, linked };
 }
 
 function hasFlag(f, flag) {

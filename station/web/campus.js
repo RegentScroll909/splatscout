@@ -1,6 +1,9 @@
 // SplatStation Campus page: ASU buildings coloured by how complete they are, headline numbers, charts of
 // expected splat quality, completion, light coverage and activity, and the details of a building or space.
 // Everything comes from /api/campus (station/lib/campus.mjs); the rules are in app/js/core/campusmodel.js.
+// A building's panel also draws where its photos were taken, floor by floor (plan.js, /api/campus/building).
+
+import * as PL from './plan.js';
 
 const $ = (q) => document.querySelector(q);
 const NS = 'http://www.w3.org/2000/svg';
@@ -82,9 +85,10 @@ function chip(b, extra) {
 const compBin = (b) => (!b.spaces ? 0 : 1 + S.data.model.completionSteps.filter((v) => b.completion >= v).length);
 const compColor = (b) => (b.restricted ? 'var(--off)' : compBin(b) ? `var(--seq-${compBin(b)})` : null);
 const compKeys = () => S.data.model.completionLabels.slice(1).map((t, i) => [`var(--seq-${i + 1})`, t]);
-const heatColor = (n) => (!n ? null : n >= 200 ? 'var(--seq-5)' : n >= 100 ? 'var(--seq-4)' : n >= 50 ? 'var(--seq-3)' : n >= 10 ? 'var(--seq-2)' : 'var(--seq-1)');
-const heatInk = (n) => (n >= 100 ? '#0b0b0b' : '#ffffff');
-const HEAT_KEYS = [['var(--seq-1)', '1–9'], ['var(--seq-2)', '10–49'], ['var(--seq-3)', '50–99'], ['var(--seq-4)', '100–199'], ['var(--seq-5)', '200+']];
+/** Scans in a light slot, as a step of the one-hue ramp (scans come in ones and twos, not hundreds). */
+const heatColor = (n) => (!n ? null : n >= 20 ? 'var(--seq-5)' : n >= 10 ? 'var(--seq-4)' : n >= 5 ? 'var(--seq-3)' : n >= 2 ? 'var(--seq-2)' : 'var(--seq-1)');
+const heatInk = (n) => (n >= 10 ? '#0b0b0b' : '#ffffff');
+const HEAT_KEYS = [['var(--seq-1)', '1'], ['var(--seq-2)', '2–4'], ['var(--seq-3)', '5–9'], ['var(--seq-4)', '10–19'], ['var(--seq-5)', '20+']];
 
 const campusBuildings = () => S.data.buildings.filter((b) => b.campus === S.campus);
 const campusSpaces = () => {
@@ -139,14 +143,15 @@ async function load({ quiet = false } = {}) {
   }
   document.body.style.opacity = '1';
   const first = !S.data;
-  const before = first ? null : S.data.totals.photos + S.data.totals.pending;
+  const sent = (d) => d.totals.scans + d.totals.approved; // scans members sent (not those turned down)
+  const before = first ? null : sent(S.data);
   seenPoints = first ? null : new Set(S.data.points.map(pointKey));
   S.data = data;
   if (!S.data.campuses.some((c) => c.id === S.campus)) S.campus = S.data.campuses[0].id;
   if (S.space && !S.data.spaces.some((x) => x.key === S.space)) S.space = null; // left out by a fresh start
-  const now = S.data.totals.photos + S.data.totals.pending, diff = before == null ? 0 : now - before;
+  const diff = before == null ? 0 : sent(S.data) - before;
   put($('#updated'), `Updated ${new Date(S.data.generatedAt).toLocaleTimeString()}`,
-    diff ? h('b', { class: 'newnote' }, ` · ${diff > 0 ? '+' : '−'}${Math.abs(diff)} photo${Math.abs(diff) === 1 ? '' : 's'}`) : null);
+    diff ? h('b', { class: 'newnote' }, ` · ${diff > 0 ? '+' : '−'}${Math.abs(diff)} scan${Math.abs(diff) === 1 ? '' : 's'}`) : null);
   renderPublished();
   renderSince();
   put($('#notes'), S.data.notes.map((n) => h('div', { class: 'muted small' }, n)));
@@ -155,7 +160,7 @@ async function load({ quiet = false } = {}) {
   renderAll(first);
 }
 
-// Live: check for new photos every 15 seconds while the page is in view, unless someone is typing in a field.
+// Live: check for new scans and reviews every 15 seconds while the page is in view, unless someone is typing in a field.
 let liveBusy = false;
 async function liveTick() {
   if (!$('#live').checked || document.hidden || liveBusy || !S.data) return;
@@ -179,7 +184,7 @@ function renderSince() {
   el.hidden = !d.since;
   if (!d.since) return;
   const hd = d.hidden || {};
-  const kinds = [[hd.builds, 'splat', 'splats'], [hd.jobs, 'capture on the dashboard', 'captures on the dashboard'], [hd.photos, 'photo', 'photos'], [hd.scans, 'scan', 'scans']].filter(([n]) => n);
+  const kinds = [[hd.builds, 'splat', 'splats'], [hd.jobs, 'capture on the dashboard', 'captures on the dashboard'], [hd.scans, 'scan', 'scans']].filter(([n]) => n);
   const left = kinds.map(([n, one, many]) => `${n} ${n === 1 ? one : many}`);
   const single = kinds.length === 1 && kinds[0][0] === 1;
   put(el,
@@ -189,7 +194,7 @@ function renderSince() {
     h('button', { class: 'tbtn', onclick: () => setSinceTo(null) }, 'Count everything again'));
 }
 async function setSinceTo(since) {
-  if (since && !confirm('Start the Campus map from zero?\n\nOnly photos, scans and splats that arrive from now on will count. Nothing is deleted, and “Count everything again” switches back. Members’ phones show the fresh map too.')) return;
+  if (since && !confirm('Start the Campus map from zero?\n\nOnly scans and splats that arrive from now on will count. Nothing is deleted, and “Count everything again” switches back. Members’ phones show the fresh map too.')) return;
   try {
     const r = await api('/api/campus/since', { since });
     if (r.publishFailed) alert(`The map here changed, but members’ phones weren’t updated: ${r.publishFailed}`);
@@ -224,11 +229,11 @@ function renderKpis() {
   const sum = (k) => bs.reduce((n, b) => n + b[k], 0);
   const tile = (label, value, sub, cls = '', extra = null) => h('div', { class: 'kpi ' + cls }, h('span', { class: 'lbl' }, label), h('span', { class: 'val' }, value), extra, sub ? h('span', { class: 'sub' }, sub) : null);
   put($('#kpis'),
-    tile('Spaces ready for a good splat', fmt(good), `of ${fmt(sp.length)} space${sp.length === 1 ? '' : 's'} with photos or splats on the ${S.campus} campus`, 'hero'),
+    tile('Spaces Good or better', fmt(good), `of ${fmt(sp.filter((x) => x.onMap).length)} space${sp.filter((x) => x.onMap).length === 1 ? '' : 's'} on the ${S.campus} campus map`, 'hero'),
     tile('Campus floor area covered', pct(c.completion), `about ${fmtArea(c.covered)} of ${fmtArea(c.area)}`, '', h('div', { class: 'meter', role: 'meter', 'aria-valuenow': +(c.completion * 100).toFixed(2), 'aria-valuemin': 0, 'aria-valuemax': 100 }, h('div', { style: `width:${Math.max(c.completion > 0 ? 2 : 0, c.completion * 100)}%` }))),
-    tile('Buildings started', fmt(c.started), `of ${fmt(open.length)} that can be photographed`),
-    tile('Photos accepted', fmt(sum('photos')), `${fmt(sum('pending'))} waiting for review`),
-    tile('Splats built', fmt(sum('builds')), `${fmt(sum('jobs'))} in the queue · ${fmt(sum('scans'))} scans sent`),
+    tile('Buildings started', fmt(c.started), `of ${fmt(open.length)} that can be scanned`),
+    tile('Splats on the map', fmt(sum('onMap')), 'approved, or made on this PC from your own scans'),
+    tile('Waiting for you', fmt(sum('waiting')), `scans and splats to review · ${fmt(sum('jobs'))} on the dashboard`, sum('waiting') ? 'hot' : ''),
     tile('Members contributing', fmt(S.data.totals.contributors), 'all campuses'));
 }
 
@@ -290,11 +295,11 @@ function renderMap(fit) {
   else setView(map.view);
   put($('#mapLegend'),
     h('span', { class: 'muted' }, 'Floor area covered:'),
-    h('span', { class: 'key' }, h('span', { class: 'sw', style: 'background:transparent;border:1px solid var(--axis)' }), 'No photos yet'),
+    h('span', { class: 'key' }, h('span', { class: 'sw', style: 'background:transparent;border:1px solid var(--axis)' }), 'Not on the map yet'),
     compKeys().map(([c, t]) => h('span', { class: 'key' }, h('span', { class: 'sw', style: `background:${c}` }), t)),
     h('span', { class: 'key' }, h('span', { class: 'sw', style: 'background:var(--off);border:1px solid var(--grid)' }), 'Off limits'),
-    h('span', { class: 'key' }, h('span', { class: 'dot', style: 'background:var(--st-good)' }), 'Photo or scan accepted'),
-    h('span', { class: 'key' }, h('span', { class: 'dot', style: 'background:var(--st-warning)' }), 'Waiting for review'));
+    h('span', { class: 'key' }, h('span', { class: 'dot', style: 'background:var(--st-good)' }), 'Scan approved'),
+    h('span', { class: 'key' }, h('span', { class: 'dot', style: 'background:var(--st-warning)' }), 'Scan waiting for review'));
 }
 
 /** Keep the map's shape: widen the box to the drawing's aspect ratio. */
@@ -374,12 +379,12 @@ function focusBuilding(b) {
 }
 
 function buildingTip(b) {
-  if (b.restricted) return [...tipValue(b.name, 'Off limits for photos')];
+  if (b.restricted) return [...tipValue(b.name, 'Off limits for scans')];
   const fa = b.floorArea;
-  const out = tipValue(b.spaces ? `${pct(b.completion)} of its floor area` : 'No photos yet', b.name + (b.ref ? ` (${b.ref})` : ''));
+  const out = tipValue(b.spaces ? `${pct(b.completion)} of its floor area` : 'Not on the map yet', b.name + (b.ref ? ` (${b.ref})` : ''));
   if (b.spaces) {
     out.push(tipRow(`About ${fmtArea(b.covered)} of ${fmtArea(fa.area)} · ${b.spaces} space${b.spaces === 1 ? '' : 's'}, ${b.good} Good · best: ${bandForScore(b.best).label}`));
-    out.push(tipRow(`${fmt(b.photos)} photos accepted${b.pending ? `, ${fmt(b.pending)} waiting` : ''} · ${b.builds} splat${b.builds === 1 ? '' : 's'}`));
+    out.push(tipRow(`${b.onMap} splat${b.onMap === 1 ? '' : 's'} on the map${b.waiting ? ` · ${b.waiting} waiting for your review` : ''}${b.jobs ? ` · ${b.jobs} on the dashboard` : ''}`));
   } else out.push(tipRow(`${fmtArea(fa.area)} of floor: ${fa.floors} floor${fa.floors === 1 ? '' : 's'}${fa.guessed ? ' (guessed)' : ''} × ${fmtArea(fa.footprint)}`));
   return out;
 }
@@ -409,18 +414,20 @@ function renderSide() {
 
 function overviewPanel() {
   const sp = campusSpaces();
-  const close = sp.filter((x) => x.score >= 40 && x.score < S.data.model.good).sort((a, b) => b.score - a.score).slice(0, 5);
-  const ready = sp.filter((x) => x.score >= S.data.model.good && !x.builds.length).slice(0, 5);
+  const review = sp.filter((x) => x.waiting || x.scans.length).slice(0, 6);
+  const better = sp.filter((x) => x.onMap && x.score < S.data.model.good).sort((a, b) => b.score - a.score).slice(0, 5);
   const elsewhere = S.data.elsewhere;
   const row = (x, meta) => h('div', { class: 'srow', onclick: () => select(x.code, x.key, true) },
-    h('span', { class: 'sname' }, `${x.building} · ${placeName(x)}`), chip(bandForScore(x.score)), h('span', { class: 'smeta' }, meta));
+    h('span', { class: 'sname' }, `${x.building} · ${placeName(x)}`), x.onMap ? chip(bandForScore(x.score)) : h('span', { class: 'chip' }, 'In review'), h('span', { class: 'smeta' }, meta));
   return [
     h('span', { class: 'kicker' }, S.campus),
     h('h3', {}, 'Where to go next'),
     h('p', { class: 'muted small', style: 'margin:0' }, 'Click a building on the map, in the charts or in the table to see its spaces.'),
-    h('h2', { style: 'margin-top:8px' }, 'Closest to good'),
-    close.length ? h('div', { class: 'rows' }, close.map((x) => row(x, x.advice[0] || ''))) : h('p', { class: 'muted small' }, 'No space is between Rough and Good yet.'),
-    ready.length ? [h('h2', { style: 'margin-top:8px' }, 'Good, but not built yet'), h('div', { class: 'rows' }, ready.map((x) => row(x, x.scans.length ? 'Process its scan on the dashboard.' : 'Build a capture from its photos on the Club page.')))] : null,
+    h('h2', { style: 'margin-top:8px' }, 'Waiting for your review'),
+    review.length ? h('div', { class: 'rows' }, review.map((x) => row(x, x.advice[0] || ''))) : h('p', { class: 'muted small' }, 'Nothing: every scan members sent has been reviewed.'),
+    review.length ? h('a', { class: 'btn small', href: 'club.html', style: 'align-self:flex-start' }, 'Review on the Club page') : null,
+    h('h2', { style: 'margin-top:8px' }, 'On the map, but not Good yet'),
+    better.length ? h('div', { class: 'rows' }, better.map((x) => row(x, x.advice[0] || ''))) : h('p', { class: 'muted small' }, 'Every space on the map is Good or better: what’s missing is new spaces.'),
     elsewhere.length ? [h('h2', { style: 'margin-top:8px' }, 'Not in an ASU building'), h('p', { class: 'muted small', style: 'margin:0' }, elsewhere.map((e) => `${e.building} / ${e.room}`).join(' · '))] : null,
   ];
 }
@@ -437,36 +444,126 @@ function buildingPanel(b) {
   return [
     h('div', { style: 'display:flex;justify-content:space-between;align-items:center;gap:8px' }, h('span', { class: 'kicker' }, `${b.campus}${b.ref ? ` · ${b.ref}` : ''}`), h('button', { class: 'tbtn', onclick: () => select(null, null) }, 'Back to campus')),
     h('h3', {}, b.name),
-    b.restricted ? h('p', { class: 'muted' }, 'Off limits: the club doesn’t photograph this building.') : [
+    b.restricted ? h('p', { class: 'muted' }, 'Off limits: the club doesn’t scan this building.') : [
       h('div', { style: 'display:flex;align-items:baseline;gap:10px;flex-wrap:wrap' }, h('span', { class: 'big' }, pct(b.completion)), h('span', { class: 'muted small' }, `of its floor area · about ${fmtArea(b.covered)} of ${fmtArea(fa.area)}`)),
       h('div', { class: 'meter' }, h('div', { style: `width:${Math.max(b.completion > 0 ? 2 : 0, b.completion * 100)}%` })),
       h('div', { class: 'plan' }, 'Floors:', input, h('button', { class: 'tbtn', onclick: () => saveFloors(input.value) }, 'Save'),
         fa.set ? h('button', { class: 'tbtn', onclick: () => saveFloors(null) }, 'Reset') : null,
         h('span', {}, `(${rule}) × ${fmtArea(fa.footprint)} footprint${fa.footprintGuessed ? ' (guessed)' : ''}`)),
-      h('p', { class: 'muted small', style: 'margin:0' }, `${fmt(b.photos)} photos accepted${b.pending ? ` · ${fmt(b.pending)} waiting for review` : ''} · ${b.scans} scan${b.scans === 1 ? '' : 's'} · ${b.builds} splat${b.builds === 1 ? '' : 's'} built${b.jobs ? ` · ${b.jobs} in the queue` : ''}`),
+      h('p', { class: 'muted small', style: 'margin:0' }, `${b.onMap} splat${b.onMap === 1 ? '' : 's'} on the map${b.waiting ? ` · ${b.waiting} waiting for your review` : ''}${b.jobs ? ` · ${b.jobs} on the dashboard` : ''}`),
       b.byFloor.length ? [
         h('h2', { style: 'margin-top:6px' }, 'Floor by floor'),
         h('div', { class: 'floors' }, b.byFloor.map((f) => [
           h('span', {}, f.floor ? `Floor ${f.floor}` : 'Floor not given'),
           h('span', { class: 'fb', title: `${pct(f.share)} of a ${fmtArea(fa.footprint)} floor` }, h('i', { style: `width:${Math.max(f.share > 0 ? 2 : 0, f.share * 100)}%` })),
           h('span', { class: 'n' }, `${pct(f.share)} · ${f.spaces} space${f.spaces === 1 ? '' : 's'}`)])),
-        h('p', { class: 'muted small', style: 'margin:0' }, 'Each floor’s share is of the footprint. Where on a floor a photo was taken isn’t known yet: members tag the floor and room, not a spot.'),
+        h('p', { class: 'muted small', style: 'margin:0' }, 'Each floor’s share is of the footprint.'),
       ] : null,
+      photoPlan(b),
       h('h2', { style: 'margin-top:6px' }, `Spaces (${sp.length})`),
       sp.length
         ? h('div', { class: 'rows' }, sp.map((x) => h('div', { class: 'srow', tabindex: 0, onclick: () => select(b.code, x.key), onkeydown: (e) => e.key === 'Enter' && select(b.code, x.key) },
             h('span', { class: 'sname' }, placeName(x) || 'Unnamed'), chip(bandForScore(x.score), String(x.score)),
             h('div', { class: 'bar1' }, h('div', { style: `width:${x.score}%;background:${STATUS[bandForScore(x.score).status][0]}` })),
             h('span', { class: 'smeta' }, spaceLine(x)))))
-        : h('p', { class: 'muted small' }, `Nothing yet. Members can take about ${S.data.model.kinds.room.good} photos of a room (in one kind of light), or do a full scan.`),
-      sp.length ? null : missionButton({ code: b.code, building: b.name, floor: '', room: 'Main entrance', need: S.data.model.kinds.large.good }),
+        : h('p', { class: 'muted small' }, 'Not on the map yet. One scan graded B or better of its entrance or lobby is a good start.'),
+      sp.length ? null : missionButton({ code: b.code, building: b.name, floor: '', room: 'Main entrance' }),
     ],
   ];
 }
 
+// ------------------------------------------------------------------ where photos were taken (building panel)
+// Each splat built on this PC brings its camera positions (its COLMAP model). Placed on the footprint in the
+// building view (building.html), they show which parts of each floor the club has been over, and the gaps. Read
+// once per building, again when its splats change or this page comes back into focus (a placement may have been
+// saved in the other tab).
+const plans = new Map(); // code → {builds, data, error, promise}
+const planFloors = {}; // code → the floor shown
+function planData(b) {
+  const had = plans.get(b.code);
+  if (had && had.builds === b.builds) return had;
+  const p = { builds: b.builds, data: had ? had.data : null, error: null };
+  p.promise = api('/api/campus/building?code=' + encodeURIComponent(b.code))
+    .then((d) => (p.data = d), (e) => (p.error = e.message))
+    .finally(() => {
+      p.promise = null;
+      if (S.building === b.code && !S.space) renderSide();
+    });
+  plans.set(b.code, p);
+  return p;
+}
+addEventListener('focus', () => {
+  if (!S.data || !S.building || S.space || !plans.has(S.building)) return;
+  plans.get(S.building).builds = -1; // read again, keeping the last plan on screen meanwhile
+  renderSide();
+});
+
+function photoPlan(b) {
+  const head = h('h2', { style: 'margin-top:6px' }, 'Where photos were taken');
+  const url = (q) => `building.html?${new URLSearchParams({ code: b.code, ...q })}`;
+  const p = planData(b);
+  if (!p.data) return [head, h('p', { class: 'muted small', style: 'margin:0' }, p.error ? `Couldn’t read its captures: ${p.error}` : 'Reading the camera positions of its splats…')];
+  const d = p.data;
+  if (!d.captures.length) return [head, h('p', { class: 'muted small', style: 'margin:0' }, 'No splat of this building on this PC yet. Once one is built, where each of its photos was taken shows here on the footprint.')];
+  const floors = PL.floorsOf(d);
+  if (!floors.includes(planFloors[b.code])) planFloors[b.code] = floors.find((f) => PL.onFloor(d, f).length) ?? floors[0];
+  const floor = planFloors[b.code];
+  const here = PL.onFloor(d, floor), cov = PL.coverageOf(d, floor);
+  const canvas = h('canvas', { class: 'pplan', role: 'img', 'aria-label': `Floor ${floor} of ${b.name} from above: its footprint, and a dot where each photo was taken` });
+  let view = null;
+  canvas.addEventListener('pointermove', (e) => {
+    if (!view) return;
+    const r = canvas.getBoundingClientRect(), hit = PL.cameraAt(d, floor, null, view, e.clientX - r.left, e.clientY - r.top);
+    canvas.style.cursor = hit ? 'pointer' : 'default';
+    if (!hit) return hideTip();
+    const c = hit.x.c;
+    showTip(e, ...tipValue(c.room, hit.i >= 0 ? `Photo ${hit.i + 1} of ${c.cams.length}` : 'Its first photo (its other camera positions are gone)'), tipRow(PL.STATUS_TEXT[hit.x.status]), tipRow('Click to open it in the building view'));
+  });
+  canvas.addEventListener('pointerleave', hideTip);
+  canvas.addEventListener('click', (e) => {
+    const r = canvas.getBoundingClientRect(), hit = view && PL.captureAt(d, floor, null, view, e.clientX - r.left, e.clientY - r.top);
+    open(url({ view: 'plan', floor: String(floor), ...(hit ? { key: hit.c.key } : {}) }), '_blank');
+  });
+  requestAnimationFrame(() => {
+    if (!canvas.isConnected) return;
+    // As tall as the footprint needs at this width, within reason.
+    const fp = d.building.footprint, ex = Math.max(...fp.map((q) => q[0])) - Math.min(...fp.map((q) => q[0])), ny = Math.max(...fp.map((q) => q[1])) - Math.min(...fp.map((q) => q[1]));
+    canvas.style.height = `${Math.round(clamp((canvas.clientWidth - 24) * (ny / Math.max(1, ex)) + 24, 200, 400))}px`;
+    const { ctx, w, h: hh } = PL.fitCanvas(canvas);
+    view = PL.fitView(fp, w, hh, 12);
+    PL.drawPlan(ctx, { w, h: hh, view, data: d, floor, show: { maxCones: 90 } });
+  });
+  const floorName = (f) => (f <= 0 ? (f === 0 ? 'B' : `B${1 - f}`) : String(f));
+  const extra = Math.max(0, cov.withGuesses.area - cov.placed.area);
+  return [
+    head,
+    h('div', { style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap' },
+      h('span', { class: 'muted small' }, 'Floor'),
+      h('div', { class: 'seg', 'aria-label': 'Floor' }, floors.map((f) => h('button', {
+        class: f === floor ? 'on' : '', 'aria-pressed': String(f === floor), title: `${PL.onFloor(d, f).length} capture${PL.onFloor(d, f).length === 1 ? '' : 's'}`,
+        onclick: () => { planFloors[b.code] = f; renderSide(); },
+      }, floorName(f)))),
+      h('span', { class: 'grow' }),
+      h('a', { class: 'btn small ghost', href: url({}), target: '_blank' }, 'Open in 3D')),
+    canvas,
+    h('p', { class: 'small', style: 'margin:0' }, here.length
+      ? [h('b', {}, `About ${fmtArea(cov.placed.area)} (${pct(cov.placed.share)})`), ` of floor ${floorName(floor)} photographed by placed captures`, extra >= 1 ? `, ${fmtArea(extra)} more where unplaced ones are guessed to be` : '', '. The footprint without dots is what’s left.']
+      : `No capture on floor ${floorName(floor)} yet.`),
+    here.length ? h('div', { class: 'rows' }, here.map((x) => h('div', { class: 'srow', style: 'cursor:default' },
+      h('span', { class: 'sname' }, h('span', { class: 'sw', style: `background:${x.color};display:inline-block;margin-right:7px;vertical-align:middle` }), x.c.room),
+      h('a', { class: 'tbtn', href: url({ place: x.c.key }), target: '_blank', title: x.status === 'placed' ? 'Move it on the footprint' : 'Put it where it is on the footprint' }, x.status === 'placed' ? 'Move' : 'Place'),
+      h('span', { class: 'smeta' }, [
+        PL.STATUS_TEXT[x.status],
+        x.c.cams.length ? `${fmt(x.c.cams.length)} photos placed by COLMAP` : 'camera positions unknown (its job folder was deleted)',
+        x.c.created ? `built ${fmtDate(x.c.created)}` : null,
+      ].filter(Boolean).join(' · '))))) : null,
+    here.some((x) => x.status !== 'placed') ? h('p', { class: 'muted small', style: 'margin:0' }, 'Dashed and marked “guess”: not placed yet, drawn at its GPS fix or spread along the building. Place it so it counts.') : null,
+  ];
+}
+
 const spaceLine = (x) => [
-  x.photos.accepted ? `${x.photos.accepted} photos` : null, x.photos.pending ? `${x.photos.pending} waiting` : null,
-  x.scans.length ? `${x.scans.length} scan${x.scans.length === 1 ? '' : 's'}` : null, x.builds.length ? `${x.builds.length} built` : null, x.jobs.length ? `${x.jobs.length} in the queue` : null,
+  x.onMap ? `${x.onMap} splat${x.onMap === 1 ? '' : 's'} on the map` : null,
+  x.waiting + x.scans.length ? `${x.waiting + x.scans.length} waiting for review` : null, x.jobs.length ? `${x.jobs.length} on the dashboard` : null,
   `${S.data.model.sizes[x.size].label.toLowerCase()}, ${x.areaSource === 'measured' ? 'measured ' : '~'}${fmtArea(x.area)}`,
 ].filter(Boolean).join(' · ');
 
@@ -489,31 +586,26 @@ function sizeEditor(x) {
 function spacePanel(x) {
   if (!x) return overviewPanel();
   const b = bandForScore(x.score);
-  const src = { built: 'from the splat already built', scan: 'from its scan', photos: 'from its photos', none: '' }[x.source];
-  const parts = [...(x.photos.parts || []), ...(x.scanScore && !x.photos.score ? [[`Scan`, x.scanScore]] : []), ...(x.built && x.source === 'built' ? x.built.parts : [])];
-  const maxLight = Math.max(1, ...LIGHTS.map(([k]) => x.photos.byLight[k] || 0));
+  const parts = x.built && x.source === 'built' ? x.built.parts : [];
+  const waitingNote = (bd) => (bd.review === 'review' ? h('b', { title: 'A member’s scan: approve it on the Club page to put it on the map' }, 'Waiting for your review · ') : bd.review === 'approved' ? 'Approved · ' : '');
   return [
     h('div', { style: 'display:flex;justify-content:space-between;align-items:center;gap:8px' }, h('span', { class: 'kicker' }, x.building), h('button', { class: 'tbtn', onclick: () => select(x.code, null) }, 'Back to building')),
     h('h3', {}, placeName(x) || 'Unnamed space'),
-    h('div', { style: 'display:flex;align-items:center;gap:10px;flex-wrap:wrap' }, h('span', { class: 'big' }, String(x.score)), h('span', { class: 'muted small' }, '/ 100'), chip(b)),
-    h('p', { class: 'small', style: 'margin:0' }, b.means),
-    h('p', { class: 'muted small', style: 'margin:0' }, `${x.source === 'built' && x.built && x.built.measured ? 'Measured on the splat already built, with photos held back from its training' : `Expected quality ${src}`}. ${S.data.model.kinds[x.kind].label}: about ${x.need.good} photos in one kind of light make it Good, ${x.need.excellent} Excellent.`),
+    x.onMap
+      ? h('div', { style: 'display:flex;align-items:center;gap:10px;flex-wrap:wrap' }, h('span', { class: 'big' }, String(x.score)), h('span', { class: 'muted small' }, '/ 100'), chip(b))
+      : h('p', { class: 'small', style: 'margin:0' }, 'Not on the map yet.'),
+    x.onMap ? h('p', { class: 'small', style: 'margin:0' }, b.means) : null,
+    x.onMap ? h('p', { class: 'muted small', style: 'margin:0' }, x.built && x.built.measured ? 'Measured on its best splat, with photos held back from its training.' : 'Estimated from how its best splat was built (its scan’s grade, the photos COLMAP placed, the training preset).') : null,
     sizeEditor(x),
     parts.length ? [h('h2', { style: 'margin-top:6px' }, 'How the number was reached'), h('table', { class: 'parts' }, parts.map(([label, v]) => h('tr', {}, h('td', {}, label), h('td', { class: 'v' }, v > 0 && label !== parts[0][0] ? `+${v}` : String(v)))))] : null,
-    x.photos.accepted ? [
-      h('h2', { style: 'margin-top:6px' }, 'Accepted photos by light'),
-      h('div', { class: 'lightbars' }, LIGHTS.map(([k, label]) => {
-        const n = x.photos.byLight[k] || 0;
-        return [h('span', {}, label), h('span', { class: 'b2', style: `width:${(n / maxLight) * 100}%;background:var(--seq-3);${n ? '' : 'visibility:hidden'}` }), h('span', { class: 'n' }, String(n))];
-      })),
-    ] : null,
+    x.scans.length ? h('p', { class: 'muted small' }, `${x.scans.length} scan${x.scans.length === 1 ? '' : 's'} from members not built yet: ${x.scans.map((sc) => `@${sc.user || '?'} (grade ${sc.grade || '?'}, ${sc.photos} photos)`).join(', ')}.`) : null,
     x.builds.length ? [h('h2', { style: 'margin-top:6px' }, 'Splats built'), h('div', { class: 'rows' }, x.builds.map((bd) => h('div', { class: 'srow', style: 'cursor:default' },
-      h('span', { class: 'sname' }, fmtDate(bd.created || bd.stamp)), chip(bandForScore(bd.score), String(bd.score)),
+      h('span', { class: 'sname' }, waitingNote(bd), fmtDate(bd.created || bd.stamp)), chip(bandForScore(bd.score), String(bd.score)),
       h('span', { class: 'smeta' }, measuredNote(bd), `${bd.placed}/${bd.photos} photos placed · reprojection ${bd.reprojError != null ? bd.reprojError.toFixed(2) + ' px' : '?'} · ${bd.preset || '?'} training${bd.grade ? ` · scan grade ${bd.grade}` : ''} `,
         h('a', { href: viewerUrl(bd), target: '_blank', class: 'link' }, 'View splat'))))),
       x.builds.some((bd) => !bd.measured) ? h('p', { class: 'muted small', style: 'margin:0' }, 'Estimated scores are worked out from how the build went. For a measured one, process the capture again on the dashboard with Measure quality ticked.') : null] : null,
     x.jobs.length ? h('p', { class: 'muted small' }, `${x.jobs.length} capture${x.jobs.length === 1 ? '' : 's'} of this space ${x.jobs.length === 1 ? 'is' : 'are'} on the dashboard (${x.jobs.map((j) => j.status).join(', ')}).`) : null,
-    x.contributors.length ? h('p', { class: 'muted small' }, 'Photos by ', x.contributors.map((c) => `@${c.handle} (${c.photos})`).join(', ')) : null,
+    x.contributors.length ? h('p', { class: 'muted small' }, 'Scanned by ', x.contributors.map((c) => `@${c.handle}`).join(', ')) : null,
     x.advice.length ? [h('h2', { style: 'margin-top:6px' }, 'What would make it better'), h('ul', { class: 'advice' }, x.advice.map((a) => h('li', {}, a)))] : null,
     x.score < S.data.model.excellent ? missionButton(x) : null,
   ];
@@ -531,24 +623,22 @@ const viewerUrl = (bd) => {
   return '/viewer.html?' + q;
 };
 
-/** Ask members for photos of a space: a mission on the Club page, in the light most photos are in. */
+/** Ask members for a scan of a space: a mission (bonus points when a scan of it is approved), seen in the app. */
 function missionButton(x) {
   if (!S.data.club) return null;
   const note = h('span', { class: 'muted small' });
-  const need = x.photos ? Math.max(10, x.more && x.more.good ? x.more.good : x.need.good) : x.need;
-  const light = x.photos && x.photos.dominant && x.photos.share < 1 ? x.photos.dominant : 'any';
   const btn = h('button', {
     class: 'btn small', onclick: async () => {
       btn.disabled = true;
       try {
-        await api('/api/club/mission', { op: 'create', title: `${x.building}: ${x.room || 'Main entrance'}${light !== 'any' ? `, ${light} light` : ''}`.slice(0, 80), building_code: x.code, floor: x.floor, room: x.room || 'Main entrance', light, bonus: 2, wanted: need });
-        note.textContent = 'Mission added: members see it in the app.';
+        await api('/api/club/mission', { op: 'create', title: `Scan ${x.building}: ${x.room || 'Main entrance'}`.slice(0, 80), building_code: x.code, floor: x.floor, room: x.room || 'Main entrance', light: 'any', bonus: 15 });
+        note.textContent = 'Mission added: members see it in the app, worth 15 bonus points.';
       } catch (e) {
         note.textContent = e.message;
         btn.disabled = false;
       }
     },
-  }, 'Ask members for photos');
+  }, 'Ask members for a scan');
   return h('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px' }, btn, note);
 }
 
@@ -560,25 +650,23 @@ function renderCharts() {
   activityChart();
 }
 
-/** Expected quality against photos, the rule of thumb per kind of space, and where the club's spaces sit. */
+/** Splat quality against the photos in a scan, the rule of thumb per kind of space, and where the club's splats sit. */
 function qualityChart() {
   const card = $('#qualityCard'), m = S.data.model;
   const sp = S.building ? spacesOf(S.building) : campusSpaces();
-  const dots = sp.filter((x) => x.photos.accepted + x.photos.pending > 0);
   const builds = sp.flatMap((x) => x.builds.map((bd) => ({ ...bd, x })));
   const kinds = Object.entries(m.kinds);
   const legend = h('div', { class: 'legend' },
     kinds.map(([k, v]) => h('span', { class: 'key' }, h('span', { class: 'sw line', style: `background:${KIND_COLOR[k]}` }), v.label)),
-    h('span', { class: 'key' }, h('span', { class: 'dot', style: 'background:var(--text)' }), 'Spaces: expected from their photos'),
-    h('span', { class: 'key' }, h('span', { style: 'display:inline-block;width:8px;height:8px;background:var(--text);transform:rotate(45deg)' }), 'Splats built: measured'),
+    h('span', { class: 'key' }, h('span', { style: 'display:inline-block;width:8px;height:8px;background:var(--text);transform:rotate(45deg)' }), 'Splats: measured'),
     h('span', { class: 'key' }, h('span', { style: 'display:inline-block;width:8px;height:8px;box-sizing:border-box;border:1.5px solid var(--text);transform:rotate(45deg)' }), 'estimated from the build'));
   frame(card, 'quality', 'How good a splat to expect',
-    `Expected quality against photos of one space taken in one kind of light. Lines: the rule of thumb for each kind of space. ${S.building ? 'This building' : `The ${S.campus} campus`}'s spaces and splats on top.`,
+    `Splat quality against the number of photos in a scan of one space (in one kind of light). Lines: the rule of thumb for each kind of space. ${S.building ? 'This building' : `The ${S.campus} campus`}'s splats on top.`,
     () => {
       const W = width(card, 320), H = 300, L = 34, R = 92, T = 8, B = 38;
       const lx = (n) => (Math.log10(clamp(n, 10, 1500)) - 1) / (Math.log10(1500) - 1);
       const x = (n) => L + lx(n) * (W - L - R), y = (q) => T + (1 - q / 100) * (H - T - B);
-      const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': 'Expected splat quality against number of photos, with the club’s spaces' });
+      const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': 'Splat quality against the number of photos in a scan, with the club’s splats' });
       // band boundaries and names
       m.bands.forEach((bnd, i) => {
         const top = i + 1 < m.bands.length ? m.bands[i + 1].min : 100;
@@ -600,25 +688,20 @@ function qualityChart() {
         svg.append(s('path', { d: 'M' + pts.map(([n, q]) => `${x(n).toFixed(1)},${y(q).toFixed(1)}`).join('L'), fill: 'none', style: `stroke:${KIND_COLOR[k]}`, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
       }
       const hit = (cx, cy, rows) => s('circle', { class: 'hit', cx, cy, r: 12, onpointermove: (e) => showTip(e, ...rows), onpointerleave: hideTip });
-      for (const d of dots) {
-        const cx = x(Math.max(10, d.photos.effective)), cy = y(d.photos.score);
-        svg.append(s('circle', { cx, cy, r: 4.5, style: `fill:${KIND_COLOR[d.kind]};stroke:var(--surface)`, 'stroke-width': 2 }));
-        svg.append(hit(cx, cy, [...tipValue(`${d.photos.score} expected from photos`, `${d.building} · ${placeName(d)}`), tipRow(`${d.photos.accepted} photos accepted${d.photos.pending ? ` + ${d.photos.pending} waiting` : ''}, ${Math.round(d.photos.effective)} counting light`), tipRow(bandForScore(d.photos.score).label)]));
-      }
       for (const bd of builds) {
         // Filled: measured on held-back photos. Outlined: estimated from how the build went. (A filled
         // diamond's dark edge eats into it, an outline's spreads out: sizes chosen so both look the same.)
         const cx = x(Math.max(10, bd.placed)), cy = y(bd.score), r = bd.measured ? 7 : 5.5;
         const look = bd.measured ? `fill:${KIND_COLOR[bd.x.kind]};stroke:var(--surface)` : `fill:var(--surface);stroke:${KIND_COLOR[bd.x.kind]}`;
         svg.append(s('path', { d: `M${cx},${cy - r}L${cx + r},${cy}L${cx},${cy + r}L${cx - r},${cy}Z`, style: look, 'stroke-width': 2 }));
-        svg.append(hit(cx, cy, [...tipValue(`${bd.score}: ${bandForScore(bd.score).label}`, `Built: ${bd.x.building} · ${placeName(bd.x)}`), tipRow(`${bd.placed} of ${bd.photos} photos placed${bd.grade ? ` · scan grade ${bd.grade}` : ''}`),
+        svg.append(hit(cx, cy, [...tipValue(`${bd.score}: ${bandForScore(bd.score).label}`, `${bd.review === 'review' ? 'Waiting for your review' : 'On the map'}: ${bd.x.building} · ${placeName(bd.x)}`), tipRow(`${bd.placed} of ${bd.photos} photos placed${bd.grade ? ` · scan grade ${bd.grade}` : ''}`),
           tipRow(bd.measured && bd.eval ? `Measured: PSNR ${bd.eval.psnr.toFixed(1)} dB, SSIM ${Number.isFinite(bd.eval.ssim) ? bd.eval.ssim.toFixed(3) : '?'}${bd.eval.views ? ` on ${bd.eval.views} held-back photos` : ''}` : 'Estimated from the build')]));
       }
-      if (!dots.length && !builds.length) svg.append(s('text', { x: L + 12, y: T + 18 }, 'No spaces with photos or splats here yet: the lines show what to expect.'));
+      if (!builds.length) svg.append(s('text', { x: L + 12, y: T + 18 }, 'No splats here yet: the lines show what to expect from a scan.'));
       return svg;
     },
-    () => tableOf(['Space', 'Kind', 'Photos', 'Expected from photos', 'Scan', 'Built', 'Overall'],
-      sp.map((x) => [`${x.building} · ${placeName(x)}`, m.kinds[x.kind].label, String(x.photos.accepted + x.photos.pending), x.photos.accepted + x.photos.pending ? String(x.photos.score) : '–', x.scanScore ? String(x.scanScore) : '–', x.built ? `${x.built.score} ${x.built.measured ? 'measured' : 'estimated'}` : '–', `${x.score} ${bandForScore(x.score).label}`]), [2, 3, 4, 5]),
+    () => tableOf(['Space', 'Kind', 'Splats', 'Waiting for review', 'Best splat', 'On the map'],
+      sp.map((x) => [`${x.building} · ${placeName(x)}`, m.kinds[x.kind].label, String(x.builds.length), String(x.waiting + x.scans.length), x.built ? `${x.built.score} ${x.built.measured ? 'measured' : 'estimated'}` : '–', x.onMap ? `${x.score} ${bandForScore(x.score).label}` : 'Not yet']), [2, 3]),
     legend);
 }
 
@@ -651,23 +734,23 @@ function rankChart() {
       });
       return svg;
     },
-    () => tableOf(['Building', 'Floor area covered', 'Covered', 'Floor area', 'Spaces', 'Good', 'Photos', 'Splats'], bs.map((b) => [b.name, pct(b.completion), fmtArea(b.covered), fmtArea(b.floorArea.area), String(b.spaces), String(b.good), fmt(b.photos), String(b.builds)]), [1, 2, 3, 4, 5, 6, 7]));
+    () => tableOf(['Building', 'Floor area covered', 'Covered', 'Floor area', 'Spaces', 'Good', 'Splats on the map', 'Waiting for review'], bs.map((b) => [b.name, pct(b.completion), fmtArea(b.covered), fmtArea(b.floorArea.area), String(b.spaces), String(b.good), String(b.onMap), String(b.waiting)]), [1, 2, 3, 4, 5, 6, 7]));
 }
 
-/** Accepted photos per light slot: buildings (or a building's spaces) against morning…night. */
+/** Scans per light slot (by when they were sent): buildings against morning…night. */
 function lightChart() {
   const card = $('#lightCard');
   const b = S.building && buildingOf(S.building);
-  const rows = b
-    ? spacesOf(b.code).map((x) => ({ name: placeName(x) || 'Unnamed', light: x.photos.byLight, total: x.photos.accepted }))
-    : campusBuildings().filter((x) => x.photos > 0).sort((a, c) => c.photos - a.photos).slice(0, 10).map((x) => ({ name: x.name, light: x.light, total: x.photos }));
-  const legend = h('div', { class: 'legend' }, h('span', {}, 'Accepted photos:'), HEAT_KEYS.map(([c, t]) => h('span', { class: 'key' }, h('span', { class: 'sw', style: `background:${c}` }), t)));
-  frame(card, 'light', 'Light coverage', b ? `${b.name}: accepted photos of each space in each kind of light. A splat is cleanest from one light; empty columns are chances for missions.` : `Accepted photos per building in each kind of light (${S.campus}, top 10). A splat is cleanest from one light.`,
+  const total = (x) => LIGHTS.reduce((n, [k]) => n + (x.light[k] || 0), 0);
+  const rows = (b ? [b] : campusBuildings().filter((x) => total(x) > 0).sort((a, c) => total(c) - total(a)).slice(0, 10))
+    .map((x) => ({ name: x.name, light: x.light, total: total(x) })).filter((r) => r.total > 0);
+  const legend = h('div', { class: 'legend' }, h('span', {}, 'Scans:'), HEAT_KEYS.map(([c, t]) => h('span', { class: 'key' }, h('span', { class: 'sw', style: `background:${c}` }), t)));
+  frame(card, 'light', 'Light coverage', b ? `${b.name}: scans sent in each kind of light. Each scan is one session, so its splat has one lighting; empty columns are chances for missions.` : `Scans per building in each kind of light, by when they were sent (${S.campus}, top 10).`,
     () => {
-      if (!rows.length) return empty(b ? 'No accepted photos in this building yet.' : 'No accepted photos on this campus yet.');
+      if (!rows.length) return empty(b ? 'No scans of this building yet.' : 'No scans on this campus yet.');
       const W = width(card, 300), labelW = Math.min(190, W * 0.36), head = 34, row = 30, gap = 2;
       const cw = (W - labelW) / 4, H = head + rows.length * row;
-      const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': 'Accepted photos by light slot' });
+      const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': 'Scans by light slot' });
       LIGHTS.forEach(([, label, hours], j) => {
         svg.append(s('text', { x: labelW + cw * j + cw / 2, y: 12, 'text-anchor': 'middle', style: 'fill:var(--text)' }, label));
         svg.append(s('text', { x: labelW + cw * j + cw / 2, y: 26, 'text-anchor': 'middle' }, hours));
@@ -680,16 +763,16 @@ function lightChart() {
           if (c) svg.append(s('rect', { x: x0, y: y0 + gap / 2, width: cw - gap, height: row - gap, rx: 3, style: `fill:${c}` }));
           else svg.append(s('rect', { x: x0, y: y0 + gap / 2, width: cw - gap, height: row - gap, rx: 3, style: 'fill:none;stroke:var(--grid)' }));
           svg.append(s('text', { x: x0 + (cw - gap) / 2, y: y0 + row / 2 + 4, 'text-anchor': 'middle', style: `fill:${c ? heatInk(n) : 'var(--dim)'}` }, n ? String(n) : '–'));
-          svg.append(s('rect', { class: 'hit', x: x0, y: y0, width: cw, height: row, onpointermove: (e) => showTip(e, ...tipValue(`${n} accepted photo${n === 1 ? '' : 's'}`, `${r.name} · ${label.toLowerCase()} light`), tipRow(`${r.total ? Math.round((n / r.total) * 100) : 0}% of its photos`)), onpointerleave: hideTip }));
+          svg.append(s('rect', { class: 'hit', x: x0, y: y0, width: cw, height: row, onpointermove: (e) => showTip(e, ...tipValue(`${n} scan${n === 1 ? '' : 's'}`, `${r.name} · ${label.toLowerCase()} light`), tipRow(`${r.total ? Math.round((n / r.total) * 100) : 0}% of its scans`)), onpointerleave: hideTip }));
         });
       });
       return svg;
     },
-    () => tableOf([b ? 'Space' : 'Building', ...LIGHTS.map((l) => l[1]), 'Total'], rows.map((r) => [r.name, ...LIGHTS.map(([k]) => String(r.light[k] || 0)), String(r.total)]), [1, 2, 3, 4, 5]),
+    () => tableOf(['Building', ...LIGHTS.map((l) => l[1]), 'Total'], rows.map((r) => [r.name, ...LIGHTS.map(([k]) => String(r.light[k] || 0)), String(r.total)]), [1, 2, 3, 4, 5]),
     rows.length ? legend : null);
 }
 
-/** Photos sent per day over the chosen period. */
+/** Scans sent per day over the chosen period. */
 function activityChart() {
   const card = $('#activityCard');
   const byDay = new Map(S.data.days.map((d) => [d.day, d]));
@@ -697,19 +780,19 @@ function activityChart() {
   const days = [];
   for (let i = S.period - 1; i >= 0; i--) {
     const d = new Date(today.getTime() - i * 864e5).toISOString().slice(0, 10);
-    days.push(byDay.get(d) || { day: d, photos: 0, accepted: 0, pending: 0, scans: 0, builds: 0, byLight: {} });
+    days.push(byDay.get(d) || { day: d, scans: 0, approved: 0, builds: 0, byLight: {} });
   }
-  const total = days.reduce((n, d) => n + d.photos, 0);
-  frame(card, 'activity', 'Photos sent per day', `Single photos sent by members over the last ${S.period} days (all campuses). Hover a day for scans and splats built.`,
+  const total = days.reduce((n, d) => n + d.scans, 0);
+  frame(card, 'activity', 'Scans sent per day', `Scans members sent over the last ${S.period} days (all campuses). Hover a day for approvals and splats built.`,
     () => {
-      if (!S.data.club) return empty('The club database isn’t set up on this PC, so there is no photo activity to show.');
+      if (!S.data.club) return empty('The club database isn’t set up on this PC, so there is no scan activity to show.');
       const W = width(card, 300), H = 220, L = 34, R = 8, T = 8, B = 26;
-      const max = Math.max(4, ...days.map((d) => d.photos));
+      const max = Math.max(4, ...days.map((d) => d.scans));
       const step = max <= 10 ? 2 : max <= 50 ? 10 : max <= 100 ? 20 : max <= 250 ? 50 : 100;
       const top = Math.ceil(max / step) * step;
       const y = (n) => T + (1 - n / top) * (H - T - B);
       const slot = (W - L - R) / days.length, cw = Math.min(24, Math.max(2, slot - 2));
-      const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': `Photos sent per day, last ${S.period} days` });
+      const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': `Scans sent per day, last ${S.period} days` });
       for (let v = 0; v <= top; v += step) {
         svg.append(s('line', { class: v ? 'gridline' : 'axisline', x1: L, x2: W - R, y1: y(v), y2: y(v) }));
         svg.append(s('text', { x: L - 6, y: y(v) + 4, 'text-anchor': 'end' }, v.toLocaleString()));
@@ -717,21 +800,20 @@ function activityChart() {
       const every = Math.ceil(days.length / 6);
       days.forEach((d, i) => {
         const x0 = L + i * slot + (slot - cw) / 2;
-        if (d.photos) svg.append(s('path', { d: colPath(x0, y(d.photos), cw, y(0) - y(d.photos)), style: 'fill:var(--cat-1)' }));
+        if (d.scans) svg.append(s('path', { d: colPath(x0, y(d.scans), cw, y(0) - y(d.scans)), style: 'fill:var(--cat-1)' }));
         if ((days.length - 1 - i) % every === 0) svg.append(s('text', { x: x0 + cw / 2, y: H - 8, 'text-anchor': 'middle' }, fmtDay(d.day)));
         svg.append(s('rect', {
           class: 'hit', x: L + i * slot, y: T, width: slot, height: H - T - B,
-          onpointermove: (e) => showTip(e, ...tipValue(`${d.photos} photo${d.photos === 1 ? '' : 's'}`, fmtDay(d.day)),
-            d.photos ? tipRow(`${d.accepted} accepted · ${d.pending} waiting`) : null,
-            d.photos ? tipRow(LIGHTS.filter(([k]) => d.byLight[k]).map(([k, l]) => `${l.toLowerCase()} ${d.byLight[k]}`).join(' · ')) : null,
-            d.scans || d.builds ? tipRow(`${d.scans} scan${d.scans === 1 ? '' : 's'} sent · ${d.builds} splat${d.builds === 1 ? '' : 's'} built`) : null),
+          onpointermove: (e) => showTip(e, ...tipValue(`${d.scans} scan${d.scans === 1 ? '' : 's'} sent`, fmtDay(d.day)),
+            d.scans ? tipRow(LIGHTS.filter(([k]) => d.byLight[k]).map(([k, l]) => `${l.toLowerCase()} ${d.byLight[k]}`).join(' · ')) : null,
+            d.approved || d.builds ? tipRow(`${d.approved} approved · ${d.builds} splat${d.builds === 1 ? '' : 's'} built`) : null),
           onpointerleave: hideTip,
         }));
       });
-      if (!total) svg.append(s('text', { x: L + 10, y: T + 16 }, `No photos sent in the last ${S.period} days.`));
+      if (!total) svg.append(s('text', { x: L + 10, y: T + 16 }, `No scans sent in the last ${S.period} days.`));
       return svg;
     },
-    () => tableOf(['Day', 'Photos', 'Accepted', 'Waiting', 'Scans', 'Splats built'], days.filter((d) => d.photos || d.scans || d.builds).reverse().map((d) => [fmtDay(d.day), String(d.photos), String(d.accepted), String(d.pending), String(d.scans), String(d.builds)]), [1, 2, 3, 4, 5]));
+    () => tableOf(['Day', 'Scans sent', 'Approved', 'Splats built'], days.filter((d) => d.scans || d.approved || d.builds).reverse().map((d) => [fmtDay(d.day), String(d.scans), String(d.approved), String(d.builds)]), [1, 2, 3]));
 }
 
 // ------------------------------------------------------------------ the table of every building
@@ -742,16 +824,16 @@ function renderTable() {
   let bs = all.filter((b) => (S.show === 'all' ? true : S.show === 'started' ? b.spaces > 0 && !b.restricted : S.show === 'open' ? !b.restricted : b.restricted))
     .filter((b) => !q || b.name.toLowerCase().includes(q) || (b.ref || '').toLowerCase().includes(q));
   const key = S.sort.key, dir = S.sort.dir;
-  const val = { name: (b) => b.name.toLowerCase(), completion: (b) => b.completion, covered: (b) => b.covered, floors: (b) => b.floorArea.floors, good: (b) => b.good, best: (b) => b.best, photos: (b) => b.photos, pending: (b) => b.pending, builds: (b) => b.builds, contributors: (b) => b.contributors }[key];
+  const val = { name: (b) => b.name.toLowerCase(), completion: (b) => b.completion, covered: (b) => b.covered, floors: (b) => b.floorArea.floors, good: (b) => b.good, best: (b) => b.best, onMap: (b) => b.onMap, waiting: (b) => b.waiting, jobs: (b) => b.jobs, contributors: (b) => b.contributors }[key] || ((b) => b.completion);
   bs = bs.sort((a, b) => (val(a) < val(b) ? -dir : val(a) > val(b) ? dir : a.name.localeCompare(b.name)));
   const th = (label, k, num) => h('th', { class: 'sortable', style: num ? 'text-align:right' : null, 'aria-sort': S.sort.key === k ? (dir > 0 ? 'ascending' : 'descending') : 'none', onclick: () => { S.sort = { key: k, dir: S.sort.key === k ? -dir : k === 'name' ? 1 : -1 }; renderTable(); } }, label + (S.sort.key === k ? (dir > 0 ? ' ↑' : ' ↓') : ''));
   const search = h('input', { type: 'search', value: S.search, placeholder: 'Filter by name', style: 'font:inherit;font-size:0.85rem;color:var(--text);background:var(--surface-2);border:1px solid var(--line-2);border-radius:8px;padding:5px 10px', oninput: (e) => { S.search = e.target.value; renderTable(); setTimeout(() => { const i = $('#tableCard input[type=search]'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); } });
   put(card,
     h('div', { class: 'card-head' }, h('div', { class: 'grow' }, h('h2', {}, `Every building · ${S.campus}`), h('p', { class: 'desc' }, 'Sort by any column; click a row to see the building on the map.')),
       search,
-      h('div', { class: 'seg' }, [['started', 'Started'], ['open', 'Can be photographed'], ['off', 'Off limits'], ['all', 'All']].map(([k, l]) => h('button', { class: S.show === k ? 'on' : '', onclick: () => { S.show = k; renderTable(); } }, l)))),
+      h('div', { class: 'seg' }, [['started', 'Started'], ['open', 'Can be scanned'], ['off', 'Off limits'], ['all', 'All']].map(([k, l]) => h('button', { class: S.show === k ? 'on' : '', onclick: () => { S.show = k; renderTable(); } }, l)))),
     bs.length ? h('div', { class: 'tablev', style: 'max-height:460px' }, h('table', { class: 'data' },
-      h('thead', {}, h('tr', {}, th('Building', 'name'), th('Floor area covered', 'completion'), th('Covered', 'covered', true), th('Floors', 'floors', true), th('Good spaces', 'good', true), th('Best space', 'best'), th('Photos', 'photos', true), th('Waiting', 'pending', true), th('Splats', 'builds', true), h('th', {}, 'Light'), th('Members', 'contributors', true))),
+      h('thead', {}, h('tr', {}, th('Building', 'name'), th('Floor area covered', 'completion'), th('Covered', 'covered', true), th('Floors', 'floors', true), th('Good spaces', 'good', true), th('Best space', 'best'), th('Splats on the map', 'onMap', true), th('Waiting for review', 'waiting', true), th('On the dashboard', 'jobs', true), h('th', {}, 'Scans by light'), th('Members', 'contributors', true))),
       h('tbody', {}, bs.map((b) => h('tr', { class: 'click' + (b.restricted ? ' off' : ''), tabindex: 0, onclick: () => !b.restricted && select(b.code, null, true), onkeydown: (e) => e.key === 'Enter' && !b.restricted && select(b.code, null, true) },
         h('td', {}, b.name, b.ref && b.ref.length >= 2 ? h('span', { class: 'muted' }, ` ${b.ref}`) : null),
         h('td', {}, b.restricted ? 'Off limits' : [h('span', { class: 'tbar' }, h('i', { style: `width:${Math.max(b.completion > 0 ? 3 : 0, b.completion * 100)}%` })), pct(b.completion)]),
@@ -759,7 +841,7 @@ function renderTable() {
         h('td', { class: 'n', title: b.floorArea.set ? 'Set by the club' : b.floorArea.guessed ? 'Guessed: OpenStreetMap doesn’t say' : 'From OpenStreetMap' }, `${b.floorArea.floors}${b.floorArea.guessed ? '?' : ''}`),
         h('td', { class: 'n' }, String(b.good)),
         h('td', {}, b.spaces ? chip(bandForScore(b.best)) : '–'),
-        h('td', { class: 'n' }, fmt(b.photos)), h('td', { class: 'n' }, fmt(b.pending)), h('td', { class: 'n' }, String(b.builds)),
+        h('td', { class: 'n' }, String(b.onMap)), h('td', { class: 'n' }, String(b.waiting)), h('td', { class: 'n' }, String(b.jobs)),
         h('td', {}, h('span', { class: 'mini', title: LIGHTS.map(([k, l]) => `${l}: ${b.light[k] || 0}`).join(', ') }, LIGHTS.map(([k]) => h('span', { style: `background:${heatColor(b.light[k] || 0) || 'transparent'};outline:1px solid var(--grid)` })))),
         h('td', { class: 'n' }, String(b.contributors))))))) : empty('No buildings match.'));
 }
@@ -769,22 +851,23 @@ function renderHow() {
   const m = S.data.model;
   put($('#howCard'),
     h('div', { class: 'card-head' }, h('div', { class: 'grow' }, h('h2', {}, 'How the numbers work'))),
-    h('p', {}, 'Most numbers here are estimates from rules of thumb. They are meant to tell the club where to go next, and they should be checked against the club’s own results: the diamonds in the quality chart are splats already built on this PC, filled where SplatStation measured them.'),
+    h('p', {}, 'The club takes full scans only: one member scanning one space in one go, so its splat has one lighting and one arrangement of the furniture. A space is on the campus map once a splat of it is: a member’s, after you approve it on the Club page, or one made on this PC from your own scan. Many numbers here are estimates from rules of thumb, to tell the club where to go next; the diamonds in the quality chart are the club’s own splats, filled where SplatStation measured them.'),
     h('h3', {}, 'Quality bands'),
     h('div', { class: 'tablev', style: 'max-height:none' }, tableOf(['Band', 'Score', 'What a splat looks like'], m.bands.map((b, i) => [chip(b), `${b.min}–${i + 1 < m.bands.length ? m.bands[i + 1].min - 1 : 100}`, b.means]))),
-    h('h3', {}, 'Expected quality of a space'),
-    h('p', {}, `From photos: the more photos of a space in one kind of light, the better, with diminishing returns. A room reaches Good at about ${m.kinds.room.good} photos and Excellent at about ${m.kinds.room.excellent}; a hallway needs ${m.kinds.hallway.good} and ${m.kinds.hallway.excellent}; a large open space like a lobby ${m.kinds.large.good} and ${m.kinds.large.excellent} (the kind is guessed from the space’s name). Photos in other light count a quarter, because a splat can’t agree with two lightings at once, and a space whose photos are spread over several kinds of light loses up to 20 points. Fewer than ${m.minPhotos} photos rarely give COLMAP enough to place them at all.`),
-    h('p', {}, 'From a scan: the capture coach’s grade (it scores coverage, sharpness and light as you scan), less a little because a good scan can still fail to process.'),
-    h('p', {}, 'From a splat already built: measured, when it was processed with Measure quality ticked on the dashboard. Every 12th photo was then held back from training, and the PSNR of the splat’s renders of those views against the photos sets the score (table below), less for photos COLMAP couldn’t place. Otherwise estimated: what its photos or scan promised, discounted when COLMAP placed fewer than 95% of the photos, when the reprojection error is above 1 pixel, or when it was trained with the quick preset. In the quality chart, measured splats are filled diamonds and estimated ones outlined.'),
+    h('h3', {}, 'Quality of a space'),
+    h('p', {}, 'A space’s quality is its best splat on the map. Measured, when it was processed with Measure quality ticked on the dashboard: every 12th photo was held back from training, and the PSNR of the splat’s renders of those views against the photos sets the score (table below), less for photos COLMAP couldn’t place. Otherwise estimated: what its scan’s grade promised, discounted when COLMAP placed fewer than 95% of the photos, when the reprojection error is above 1 pixel, or when it was trained with the quick preset. In the quality chart, measured splats are filled diamonds and estimated ones outlined.'),
+    h('p', {}, `How many photos a scan needs: the more photos of a space in one kind of light, the better, with diminishing returns. A room reaches Good at about ${m.kinds.room.good} photos and Excellent at about ${m.kinds.room.excellent}; a hallway needs ${m.kinds.hallway.good} and ${m.kinds.hallway.excellent}; a large open space like a lobby ${m.kinds.large.good} and ${m.kinds.large.excellent} (the lines in the quality chart). Fewer than ${m.minPhotos} photos rarely give COLMAP enough to place them at all.`),
     m.psnrStops ? h('div', { class: 'tablev', style: 'max-height:none' }, tableOf(['Measured PSNR', 'Score', 'Band'], m.psnrStops.map(([db, q]) => [`${db} dB`, String(q), chip(bandForScore(q))]), [1])) : null,
     h('h3', {}, 'How complete a building is'),
     h('p', {}, `A building’s completion is the share of its floor area that its spaces cover. Its floor area is its footprint (from its outline on OpenStreetMap, or ${fmtArea(m.defaultFootprint)} where there is none) times its floors: OpenStreetMap’s count where it has one, otherwise 2 (marked with a ? in the table) until the club sets it on the building’s panel. Each space covers its own floor area in proportion to how close it is to Good: all of it at Good, half of it halfway there. A space’s area is measured when its splat was lined up with the phone’s AR tracking (and so is in metres): from its scan’s outline, or, for club photos taken with Track position (AR), from the floor the splat shows around where they were taken. Otherwise it’s typical for its size, guessed from the space’s name until the club picks one on the space’s panel:`),
     h('div', { class: 'tablev', style: 'max-height:none' }, tableOf(['Size', 'Counts for', 'For example', 'Photos for Good'], Object.values(m.sizes).map((v) => [v.label, fmtArea(v.area), v.hint, `about ${m.kinds[v.kind].good} (${m.kinds[v.kind].label.toLowerCase()})`]), [1, 3])),
-    h('p', {}, 'Offices, restrooms and rooms the club can’t enter count in a building’s floor area too, so a building whose public spaces are all done still shows well under 100%. A building’s panel also shows each floor’s share of the footprint. Where on a floor a photo was taken isn’t known: members tag the floor and room, not a spot.'),
-    h('p', {}, 'Photos waiting for review count straight away, so the map moves with every photo sent; rejecting one takes it off again. Start fresh counts only what arrives from then on (nothing is deleted, and Count everything again switches back). Live checks for new photos every 15 seconds and marks new map points as they arrive.'),
+    h('p', {}, 'Offices, restrooms and rooms the club can’t enter count in a building’s floor area too, so a building whose public spaces are all done still shows well under 100%. A building’s panel also shows each floor’s share of the footprint.'),
+    h('h3', {}, 'Where photos were taken'),
+    h('p', {}, 'Every splat built on this PC knows where each of its photos was taken: COLMAP solved it. A building’s panel draws those camera positions on its footprint, floor by floor, with a cone the way each photo looked, so the parts of a floor nobody has photographed show as gaps. Each capture is placed on the footprint once, in the building’s 3D view (Open in 3D): drag it, turn it, or line up two of its points with the outline. Until then it’s drawn at a guess (at its GPS fix, or spread along the building) and doesn’t count. “Photographed” is the footprint within 1.5 m of where a photo was taken, or inside a scan’s outline. Members’ single photos are tagged with a floor and room, not a spot, so they aren’t on the plan.'),
+    h('p', {}, 'Scans waiting for your review show on the map and in their space, but count only once you approve their splat (approving also gives the member their points). Start fresh counts only what arrives from then on (nothing is deleted, and Count everything again switches back). Live checks for new scans every 15 seconds and marks new map points as they arrive.'),
     h('p', {}, 'Off-limits buildings (residence halls, health, police and courts, children’s centers) are shown in dark grey and never count.'),
     h('h3', {}, 'What members see'),
-    h('p', {}, 'Publish to members sends a summary to the Campus map in the phone app: each space’s expected quality and the floor area it counts for, its accepted photos in each kind of light, how many wait for review, and about how many more photos, in which light, would make it Good (counted with the same rules, so the phone says what this page says). Floor counts the club set go too, so the map is coloured the same. No member names and no GPS points are sent, and nothing in off-limits buildings. It also happens by itself a few seconds after you review photos, change a size or a floor count, and within a minute of new photos arriving while SplatStation runs.'));
+    h('p', {}, 'Publish to members sends a summary to the Campus map in the phone app: each space’s quality and the floor area it counts for, how many splats of it are on the map, and how many of its scans wait for review (counted with the same rules, so the phone says what this page says). Floor counts the club set go too, so the map is coloured the same. No member names and no GPS points are sent, and nothing in off-limits buildings. It also happens by itself a few seconds after you review a scan, change a size or a floor count, and within a minute of a new scan arriving while SplatStation runs.'));
 }
 
 // ------------------------------------------------------------------ publishing for members' phones

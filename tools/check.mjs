@@ -975,6 +975,205 @@ test('merging phones: pairs within and across captures; each scan area lands in 
   assert.ok(across >= 100 * 100 && across <= 120 * 120, `${across} pairs across the captures`);
 });
 
+// ---- A scan in parts: tracking was lost, scanning carried on as a new part, SplatStation joins the parts.
+// (These draw on the seeded Math.random; the seed is put back afterwards, so the checks below see the same noise.)
+const seedBeforeParts = seed;
+const { Relocalizer } = await import('../app/js/capture/relocalizer.js');
+const { exportFiles } = await import('../app/js/data/exporter.js');
+const { framesIn, boundsIn, partsOf } = await import('../app/js/core/spaces.js');
+const { wallAngleFactor } = await import('../app/js/core/guide.js');
+const { segmentPairs, fitPart, movePose, colmapQt, addToModel } = await import('../station/lib/colmap.mjs');
+const { scanParts } = await import('../station/lib/pipeline.mjs');
+
+test('scan in parts: a loss that doesn\'t line up offers a new part at once, and the earlier map is found in the background', () => {
+  const vm = practiceMap();
+  let photos = 30;
+  const stub = { voxels: vm, bounds: null, recording: true, paused: false, photoKeys: [], space: 100, viewSpace: 100, lastT: 0, partPhotos: () => photos };
+  const R = new Relocalizer(stub);
+  let t = 0;
+  const seen = [];
+  const step = (f) => {
+    const fi = { pose: f ? Float32Array.from(f.pose) : null, trackState: f ? 'ok' : 'lost' };
+    const raw = f ? R.apply(fi) : null;
+    R.frame(fi, raw, t, 0.25);
+    if (f) R.addDepth({ xyz: xfPoints(R.xf, f.pts), d: f.d, nx: f.nx, ny: f.ny }, raw, INTR_AR, t);
+    const ev = R.tick(t);
+    if (ev) seen.push(ev.type);
+    t += 0.25;
+    stub.lastT = t;
+    return ev;
+  };
+  for (const f of lookAround(XF_ID, [0.5, 0.8], 30, 8)) step(f);
+  assert.equal(R.mode, null, 'tracking fine: nothing to do');
+  for (let k = 0; k < 4; k++) step(null);
+  // Back in other AR coordinates (ARCore started over): turned 40° and 1.4 m away.
+  const S = xf(40 * DEG, [1.2, 0.1, -0.7]);
+  const back = t;
+  for (const f of lookAround(S, [0.5, 0.8], 30, 24)) if (R.mode !== 'offer') step(f);
+  assert.equal(R.mode, 'offer', `a new part is offered (${seen.join(', ')})`);
+  assert.ok(t - back <= 5 && !seen.includes('searching'), `at once, without searching first (${(t - back).toFixed(2)} s)`);
+  assert.ok(R.holding, 'photos wait only while it is offered');
+  // "Keep scanning (new part)": a fresh map, and the earlier one searched for in the background.
+  R.newPart();
+  photos = 0;
+  stub.voxels = new VoxelMap(0.2, 7);
+  R.watch({ voxels: vm, space: 100, floorY: 0 }, t);
+  assert.ok(!R.holding, 'photos carry on meanwhile');
+  let linked = null;
+  for (const [p, look] of [[[0.5, 0.8], 60], [[-1.5, -1], 200], [[2, -0.5], 100], [[0.6, 0.6], 150], [[-1.2, 0.9], 300]]) {
+    for (const f of lookAround(S, p, look, 10)) if (!linked) linked = step(f);
+    assert.ok(!R.holding, 'never blocking');
+  }
+  assert.ok(linked && linked.type === 'partsLinked', `found the earlier map (${R.bg ? `${R.bg.status} ${R.bg.tries} tries` : seen.join(', ')})`);
+  const d = xfDelta(linked.xf, S, [0.5, 1.3, 0.8]);
+  assert.ok(d.dist < 0.1 && d.yaw < 2, `lined up within 10 cm / 2° (${d.dist.toFixed(3)} m, ${d.yaw.toFixed(2)}°)`);
+});
+
+test('re-alignment: a slow, steady sweep gathers views from different spots (it used to wait for ever)', () => {
+  const R = new Relocalizer({ voxels: practiceMap(), bounds: null, recording: true, paused: false, photoKeys: [], space: 100, viewSpace: 100, lastT: 0, partPhotos: () => 0 });
+  R.begin('manual', 0);
+  // 1 cm and 1.5° between depth samples (5 a second): what "sweep slowly" looks like.
+  for (let k = 0; k < 40; k++) {
+    const h = (30 + k * 1.5) * DEG;
+    const pose = poseLookDir([0.5 + 0.01 * k, 1.35, 0.8], [Math.sin(h), -0.25, -Math.cos(h)]);
+    const g = depthGrid(pose, INTR_AR, 32, 24, 0.25, 8);
+    R.addDepth({ xyz: g.xyz, d: g.d, nx: g.nx, ny: g.ny }, pose, INTR_AR, k * 0.2);
+  }
+  const kept = R.state.frames.filter((f) => !f.standIn).length;
+  assert.ok(kept >= 10 && R.state.frames.length <= kept + 1, `${kept} views kept, plus the latest`);
+});
+
+// A recorded scan: a real one when this PC has SplatStation's jobs, else a lap of the practice room.
+const fsx = await import('node:fs');
+const { homedir } = await import('node:os');
+const recorded = (() => {
+  const jobs = process.env.SPLATSTATION_JOBS || join(homedir(), 'SplatStation', 'jobs');
+  try {
+    for (const id of fsx.readdirSync(jobs)) {
+      const f = join(jobs, id, 'dataset', 'splatscout.json');
+      if (!existsSync(f)) continue;
+      const m = JSON.parse(readFileSync(f, 'utf8'));
+      const fr = (m.frames || []).filter((x) => x.tracked && x.pose && x.intrinsics);
+      if (m.capture && m.capture.tracking === '6dof' && fr.length >= 150 && m.bounds && m.bounds.poly) return { name: `${m.capture.room} (${id})`, frames: fr.slice(0, 300), bounds: m.bounds };
+    }
+  } catch {}
+  const frames = Array.from({ length: 200 }, (_, i) => {
+    const a = (i / 200) * Math.PI * 4;
+    return { pose: Array.from(poseLookDir([Math.cos(a) * 2.4, 1.4, Math.sin(a) * 1.9], [-Math.cos(a), -0.1, -Math.sin(a)])), intrinsics: INTR_AR, metrics: { relSharp: 0.9 }, flags: [] };
+  });
+  return { name: 'practice lap', frames, bounds: { poly: [[-3, -2.5], [3, -2.5], [3, 2.5], [-3, 2.5]], floorY: 0, margin: 0.35, skips: [] } };
+})();
+
+await (async () => {
+  const rec = recorded.frames;
+  const cut = Math.round(rec.length * 0.55);
+  // After the loss ARCore's coordinates are the old ones turned 70° and moved: part 2's poses are in those.
+  const X = xf(70 * DEG, [3, 0.2, -2]);
+  const frames = rec.map((f, i) => ({
+    id: `f${i}`, seq: i + 1, segment: i < cut ? 1 : 2, space: i < cut ? 100 : 200, pass: 'mid', t: i, tracked: true,
+    pose: i < cut ? f.pose : Array.from(xfPose(X, f.pose)), intr: f.intrinsics, m: f.metrics || { relSharp: 0.9 }, flags: f.flags || [],
+    trigger: 'trans', baseline: 0.1, jpeg: new Blob([new Uint8Array([i & 255])]),
+  }));
+  const moveBounds = (b, x) => ({ ...b, poly: b.poly.map(([px, pz]) => { const q = xfPoints(x, new Float32Array([px, 0, pz])); return [q[0], q[2]]; }), floorY: b.floorY + x.t[1], skips: [] });
+  const outline = { ...recorded.bounds, skips: [], space: 100, segment: 1 };
+  // The outline was marked in part 1; the same outline marked again in part 2 (in its coordinates) is moved back.
+  const capture = { id: 'c1', building: 'Hall', room: 'Room', template: 'room', engine: 'xr', tracking: '6dof', createdAt: Date.now(), segments: 2, stats: {},
+    boundsBySpace: { 100: outline, 200: { ...moveBounds(outline, X), space: 200, segment: 2 } } };
+  const { files } = await exportFiles(capture, frames);
+  const file = (n) => files.find((f) => f.name === n);
+  const man = JSON.parse(file('splatscout.json').data);
+  assert.deepEqual(man.parts.map((p) => [p.part, p.space, p.main, p.photos, p.poses]), [[1, 100, true, cut, 'poses/colmap/sparse/0'], [2, 200, false, rec.length - cut, 'poses/parts/2/colmap/sparse/0']]);
+  assert.ok(man.frames.every((f, i) => f.part === (i < cut ? 1 : 2) && f.segment === (i < cut ? 1 : 2)), 'each photo records its part and segment');
+  near(man.bounds.poly.flat(), outline.poly.flat(), 1e-3, 'the crop outline stays in the main part\'s coordinates');
+  const centres = (txt) => imagesFromText(txt).map((im) => {
+    const [qw, qx, qy, qz, tx, ty, tz] = im.qt;
+    const R = [[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)], [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)], [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]];
+    return [im.name, [0, 1, 2].map((j) => -(R[0][j] * tx + R[1][j] * ty + R[2][j] * tz))];
+  });
+  const main = centres(file('poses/colmap/sparse/0/images.txt').data), other = centres(file('poses/parts/2/colmap/sparse/0/images.txt').data);
+  assert.deepEqual([main.length, other.length], [cut, rec.length - cut], 'one COLMAP model per part');
+  near(other[0][1], frames[cut].pose.slice(12, 15), 1e-3, 'part 2 in its own AR coordinates');
+  assert.ok(JSON.parse(file('poses/transforms.json').data).frames.every((f) => f.segment === 1), 'transforms.json: the main part, segment by segment');
+
+  // SplatStation: the parts, main first, each with its AR poses in its own coordinates.
+  const mainNames = new Set(main.map(([n]) => n));
+  const parts = scanParts(man, man.frames.filter((f) => mainNames.has(f.file.slice(7))).map((f) => ({ name: f.file.slice(7) })));
+  assert.deepEqual(parts.map((p) => [p.part, p.main, p.names.length, p.frames.length]), [[1, true, cut, cut], [2, false, rec.length - cut, rec.length - cut]]);
+  assert.ok(parts[1].bounds && !scanParts({ ...man, frames: man.frames.map((f) => ({ ...f, space: 100 })) }, null), 'a scan in one part has none');
+  const pairs = segmentPairs(parts);
+  const name = (i) => `${String(i + 1).padStart(4, '0')}.jpg`;
+  assert.equal(new Set(pairs).size, pairs.length, 'no pair twice');
+  assert.ok(pairs.includes(`${name(cut - 1)} ${name(cut)}`) && pairs.includes(`${name(cut - 30)} ${name(cut + 29)}`), 'where part 2 begins, every photo against the end of part 1');
+  assert.ok(pairs.includes(`${name(0)} ${name(1)}`) && pairs.includes(`${name(cut + 1)} ${name(cut + 2)}`), 'neighbours within each part');
+  assert.ok(pairs.length < (rec.length * (rec.length - 1)) / 2 * 0.6, `fewer than every pair (${pairs.length}; scans over 700 photos use these)`);
+
+  // The solve: COLMAP placed part 2's first 8 photos (its overlap with part 1) in the main part's coordinates, and
+  // a ninth in the wrong place. The fit moves part 2 back, and the rest of its photos follow their AR poses.
+  const images = new Map();
+  for (let i = cut; i < cut + 8; i++) images.set(name(i), { qt: colmapQt(rec[i].pose) });
+  const wrong = rec[cut + 40].pose.slice();
+  wrong[12] += 2;
+  images.set(name(cut + 40), { qt: colmapQt(wrong) });
+  const fit = fitPart(parts[1].frames, images);
+  assert.ok(fit && fit.inliers === 8 && fit.placed === 9, `the wrongly placed photo is left out (${fit && fit.inliers}/${fit && fit.placed})`);
+  let worst = 0;
+  for (const f of parts[1].frames) {
+    const i = +f.name.slice(0, 4) - 1, p = movePose(fit, f.pose);
+    worst = Math.max(worst, Math.hypot(p[12] - rec[i].pose[12], p[13] - rec[i].pose[13], p[14] - rec[i].pose[14]), Math.hypot(p[8] - rec[i].pose[8], p[9] - rec[i].pose[9], p[10] - rec[i].pose[10]));
+  }
+  assert.ok(worst < 0.01, `every photo of part 2 back where it was taken (worst ${worst.toFixed(4)})`);
+  assert.equal(fitPart(parts[1].frames, new Map([...images].slice(0, 3))), null, 'three placed photos are too few to go on');
+  // The outline marked in part 2 lands on part 1's.
+  const cams = parts[1].frames.map((f) => ({ name: f.name, C: movePose(fit, f.pose).slice(12, 15) }));
+  near(partAreas([parts[1]], cams)[0].poly.flat(), outline.poly.flat(), 0.02, 'part 2\'s outline in the main part\'s coordinates');
+  // Its other photos go into the model under the database's ids; what's there already stays as it is.
+  const model = colmapText(rec.slice(0, 3).map((f, i) => ({ name: name(i), pose: f.pose, intr: f.intrinsics })), null);
+  const rows = new Map([0, 1, 2, cut + 20, cut + 21].map((i) => [name(i), { image_id: 100 + i, camera_id: 1, frame_id: 300 + i, rig_id: 1 }]));
+  const out = addToModel(model, [{ name: name(cut + 20), qt: colmapQt(rec[cut + 20].pose) }, { name: name(1), qt: [1, 0, 0, 0, 0, 0, 0] }, { name: name(cut + 21), qt: colmapQt(rec[cut + 21].pose) }], rows);
+  assert.equal(out.added, 2, 'a photo the model has is not added twice');
+  assert.ok(out.images.includes(` 1 ${name(cut + 20)}\n`) && out.frames.includes(`\n${300 + cut + 21} 1 `), 'with its database image, camera, frame and rig ids');
+  near(centres(out.images).find(([n]) => n === name(cut + 21))[1], rec[cut + 21].pose.slice(12, 15), 1e-4, 'at its pose');
+
+  // On the phone, a part lined up in the background counts towards the coverage map (and only there).
+  const linkCap = { ...capture, links: [{ from: 200, to: 100, xf: xfInverse(X) }], boundsBySpace: { 200: capture.boundsBySpace[200] } };
+  const shown = framesIn(frames, linkCap, 100);
+  assert.equal(shown.length, rec.length, 'both parts on one map');
+  near(shown[cut + 5].pose.slice(12, 15), rec[cut + 5].pose.slice(12, 15), 1e-3, 'part 2 moved onto part 1');
+  near(boundsIn(linkCap, 100).poly.flat(), outline.poly.flat(), 1e-3, 'and its outline');
+  assert.deepEqual(partsOf(frames, linkCap).map((p) => p.space), [100, 200], 'still two parts for the export');
+  passed++;
+  console.log(`  ok scan in parts: a recorded scan (${recorded.name}) with tracking lost partway exports two parts; SplatStation joins them into one model`);
+})();
+
+test('plain wall: warned before tracking slips, turning fast at it too, and long walls are approached at an angle', () => {
+  const base = { trackState: 'ok', rotSpeed: 5, linSpeed: 0.1, flowSpeed: 0.05, relSharp: 0.9, blurRisk: 0, mean: 120, clipHi: 0, clipLo: 0, texture: 0.2, spread: 0.9, depthMed: 2 };
+  // A few corners bunched in one corner of the frame: plain, though not blank.
+  let c = new Coach();
+  c.update({ ...base, t: 0, texture: 0.07, spread: 0.25 });
+  let r = c.update({ ...base, t: 0.6, texture: 0.07, spread: 0.25 });
+  assert.equal(r.primary.title, 'Plain wall: get the corner or the floor in view');
+  assert.equal(r.chips.detail.value, 'plain');
+  c = new Coach();
+  c.update({ ...base, t: 0, texture: 0.07, spread: 0.75 });
+  assert.equal(c.update({ ...base, t: 0.6, texture: 0.07, spread: 0.75 }).primary.level, 'good', 'the same detail spread over the view is fine');
+  c = new Coach();
+  c.update({ ...base, t: 0, texture: 0.04, rotSpeed: 20 });
+  assert.equal(c.update({ ...base, t: 0.4, texture: 0.04, rotSpeed: 20 }).primary.title, 'Plain wall: turn slowly');
+  // A 6 m wall along x = 3.05 is long, a 0.8 m piece isn't; views of it are worth most at 30-70° off head-on.
+  const wallMap = (z0, z1) => {
+    const vm = new VoxelMap(0.2, 7), pts = [];
+    for (let z = z0; z <= z1; z += 0.05) for (let y = 0.3; y <= 2.3; y += 0.05) pts.push(3.05, y, z);
+    for (let i = 0; i < 3; i++) vm.integrate(new Float32Array(pts), [1, 1.4, (z0 + z1) / 2], false);
+    return new Guide({ template: getTemplate('room'), bounds: null, voxels: vm });
+  };
+  const long = wallMap(-3, 3)._longWall([3.05, 1.3, 0.5]);
+  assert.ok(long && Math.abs(Math.abs(long.n[0]) - 1) < 0.05, `found the long wall (${JSON.stringify(long)})`);
+  assert.equal(wallMap(0.1, 0.9)._longWall([3.05, 1.3, 0.5]), null, 'a short piece is not one');
+  const at = (deg) => wallAngleFactor([-Math.cos(deg * DEG), 0, Math.sin(deg * DEG)], long);
+  assert.ok(at(0) < 0.5 && at(10) < 0.5 && at(45) === 1 && at(60) === 1, `head-on ${at(0)}, at 45° ${at(45)}`);
+});
+seed = seedBeforeParts;
+
 const { rigConfig, VIEWS_360, isEquirect, viewSize } = await import('../station/lib/video.mjs');
 test('360 video: views cut from each frame make a rig that turns the right way', () => {
   assert.ok(isEquirect({ width: 5760, height: 2880 }) && isEquirect({ width: 1600, height: 800, spherical: false }));
@@ -1065,7 +1264,7 @@ const fake = createFake();
 fake.install(globalThis, fileFetch);
 
 const R = await import('../app/js/core/clubrules.js');
-test('club rules: light slots, handles, duplicate hashes, photo checks and points', () => {
+test('club rules: light slots, handles, which scans can be sent, and points for an approved scan', () => {
   const at = (hr) => Date.UTC(2026, 10, 3, hr + 7, 30); // Phoenix is UTC-7 all year
   assert.deepEqual([5, 6, 10, 11, 15, 16, 19, 20, 23].map((hr) => R.lightSlot(at(hr))), ['night', 'morning', 'morning', 'afternoon', 'afternoon', 'evening', 'evening', 'night', 'night']);
   assert.equal(R.phoenixDay(Date.UTC(2026, 10, 4, 5, 0)), '2026-11-03', '10 pm in Phoenix is still the 3rd');
@@ -1075,76 +1274,18 @@ test('club rules: light slots, handles, duplicate hashes, photo checks and point
   assert.equal(new Set(names).size, 40);
   assert.ok(names.every(R.validHandle), 'every suggested handle is allowed');
 
-  const img = (f, w = 90, h = 80) => Uint8Array.from({ length: w * h }, (_, i) => Math.max(0, Math.min(255, f(i % w, Math.floor(i / w)))));
-  const A = img((x, y) => 128 + 100 * Math.sin(x / 7 + y / 11));
-  const A2 = img((x, y) => 128 + 100 * Math.sin(x / 7 + y / 11) + ((x * 7 + y * 13) % 5) - 2); // same view, a little noise
-  const B = img((x, y) => 128 + 100 * Math.sin(x / 3 - y / 5)); // another view
-  const hash = (g) => R.dhash(g, 90, 80);
-  assert.match(hash(A), /^[0-9a-f]{16}$/);
-  assert.ok(R.hamming(hash(A), hash(A2)) <= R.NEAR_DUPLICATE, 'the same view with noise is a near-duplicate');
-  assert.ok(R.hamming(hash(A), hash(B)) > 10, 'another view is not');
-  assert.equal(R.hamming('0000000000000000', 'ffffffffffffffff'), 64);
-
-  const P = (m, t) => R.photoChecks({ w: 1920, h: 1080, mean: 120, clipHi: 0, rel: 1, ...m }, t);
-  assert.equal(P({}).level, 'ok');
-  assert.deepEqual(P({ w: 640, h: 480 }).reasons, ['too small']);
-  assert.equal(P({ mean: 15 }).level, 'reject');
-  assert.equal(P({ mean: 35 }).level, 'review');
-  assert.equal(P({ mean: 245 }).level, 'reject');
-  assert.equal(P({ clipHi: 0.4 }).level, 'review');
-  assert.equal(P({ rel: 0.5 }, { blurReject: 0.6 }).level, 'reject', 'the phone drops a blurry photo');
-  assert.equal(P({ rel: 0.3 }).level, 'review', 'the PC only flags it for a person to look at');
-  assert.equal(P({ rel: 0.7 }).level, 'ok');
-
-  const S = R.scorePhoto;
-  assert.equal(S({}).points, 1);
-  assert.equal(S({ firstInRoom: true, newLight: true }).points, 6, 'the first photo of a room (its light is new too, but counts once)');
-  assert.equal(S({ newLight: true, light: 'evening' }).points, 4);
-  assert.equal(S({ mission: { bonus: 3, light: 'evening' }, light: 'evening' }).points, 4);
-  assert.equal(S({ mission: { bonus: 3, light: 'evening' }, light: 'morning' }).points, 1, 'an evening mission needs evening light');
-  assert.equal(S({ mission: { bonus: 3, light: 'any' }, light: 'morning' }).points, 4);
-  assert.equal(S({ baseLeft: 0 }).points, 0, 'past the daily limit');
-  assert.equal(R.scoreScan({ photos: 412, grade: 'A' }), 30 + 41 + 30);
-  assert.equal(R.scoreScan({ photos: 5000, grade: 'C' }), 30 + 70 + 5);
-  assert.equal(R.scoreScan({ photos: 3 }), 30);
-});
-
-const SP = await import('../app/js/core/snappose.js');
-test('Snap in AR: the pose sent with a photo, poses the PC can use, and the floor from the height change', () => {
-  const lens = { fx: 1374.0978646, fy: 1374.7604370, cx: 430, cy: 960, w: 860, h: 1920 };
-  const m = Array.from(poseLookDir([1.234567, 1.45, -2.1], [0.6, -0.1, -0.8]));
-  const session = crypto.randomUUID();
-  const p = SP.poseRecord(Float32Array.from(m), lens, session, 12.3456);
-  assert.deepEqual([p.v, p.session, p.m.length, p.m[12], p.t], [1, session, 16, 1.2346, 12.35], 'rotation to 6 decimals, position to 0.1 mm');
-  assert.deepEqual(p.intr, { fx: 1374.1, fy: 1374.76, cx: 430, cy: 960, w: 860, h: 1920 });
-  assert.ok(SP.poseShapeOk(p) && JSON.stringify(p).length < 600, 'small, and the shape the database takes');
-  assert.deepEqual(SP.poseRecord(m, lens, session, 0, 0.5).intr, { fx: 687.05, fy: 687.38, cx: 215, cy: 480, w: 430, h: 960 }, 'a photo kept at half size: its lens too');
-  for (const bad of [null, [], { ...p, session: 'x' }, { ...p, m: p.m.slice(1) }, { ...p, m: [...p.m.slice(1), 'x'] }, { ...p, m: [...p.m.slice(1), NaN] }, { ...p, intr: { ...p.intr, fx: 0 } }, { ...p, intr: { ...p.intr, w: '860' } }, { ...p, pad: 'x'.repeat(1500) }]) {
-    assert.ok(!SP.poseShapeOk(bad), `refused: ${JSON.stringify(bad)?.slice(0, 60)}`);
-  }
-  const u = SP.usablePose(p, { w: 860, h: 1920 });
-  assert.ok(u && u.session === session && u.intr.fx === 1374.1);
-  assert.deepEqual(SP.usablePose(p, { w: 430, h: 960 }).intr, { fx: 687.05, fy: 687.38, cx: 215, cy: 480, w: 430, h: 960 }, 'the photo on the PC is half the size: so is its lens');
-  assert.equal(SP.usablePose(p, { w: 1920, h: 860 }), null, 'turned on its side: the lens doesn’t fit');
-  assert.equal(SP.usablePose({ ...p, m: p.m.map((x, i) => (i < 3 ? x * 1.2 : x)) }), null, 'not a rotation');
-  assert.equal(SP.usablePose({ ...p, m: [...p.m.slice(0, 15), 0] }), null, 'not a rigid pose');
-  assert.equal(SP.usablePose({ ...p, m: [...p.m.slice(0, 12), 2e4, 0, 0, 1] }), null, '20 km away');
-  assert.equal(SP.usablePose({ ...p, intr: { ...p.intr, fx: 100 } }), null, 'a lens no phone has');
-  // Floors: 1, 2, 3 …, and B, B2 below the ground floor.
-  assert.deepEqual(['2', ' 12 ', 'B', 'b2', 'Basement', 'LL', 'Mezzanine', '', null].map(SP.floorLevel), [2, 12, 0, -1, 0, 0, null, null, null]);
-  assert.deepEqual([3, 1, 0, -1].map(SP.floorLabel), ['3', '1', 'B', 'B2']);
-  const at = (floor, dy) => SP.floorSuggestion({ y: 1.4, floor }, 1.4 + dy);
-  assert.equal(at('2', 0.6), null, 'holding the phone up');
-  assert.equal(at('2', 2.2), null, 'a stair landing between floors');
-  assert.deepEqual(at('2', 4.3), { floor: '3', storeys: 1, dy: 4.3 });
-  assert.deepEqual(at('2', 9.1), { floor: '4', storeys: 2, dy: 9.1 }, 'two floors of a tall building');
-  assert.deepEqual(at('3', 3.5 * -3), { floor: 'B', storeys: -3, dy: -10.5 }, 'three short floors down from the third: the basement');
-  assert.deepEqual(at('1', -2.6), { floor: 'B', storeys: -1, dy: -2.6 });
-  assert.deepEqual(at('', 4.1), { floor: null, storeys: 1, dy: 4.1 }, 'with no floor to count from, only that it changed');
-  assert.equal(SP.floorSuggestion({ y: null, floor: '1' }, 5), null);
-  const hf = new SP.HeightFilter(5);
-  for (const y of [1.4, 1.41, 3.9, 1.39, 1.42]) hf.add(y);
-  assert.equal(hf.value(), 1.41, 'a moment’s jolt is ignored');
+  // The club takes full scans graded B or better; points come when it approves the splat made from one.
+  assert.deepEqual(['A', 'B', 'C', 'D', 'F', '', null].map(R.canUpload), [true, true, false, false, false, false, false]);
+  const S = (o) => R.scoreScan(o).points;
+  assert.equal(S({ grade: 'A' }), 30);
+  assert.equal(S({ grade: 'B', newArea: 64 }), 20 + 6, '1 point for every 10 m² it adds to the campus map');
+  assert.equal(S({ grade: 'A', newArea: 2000 }), 30 + 30, 'up to 30');
+  assert.equal(S({ grade: 'A', newArea: 400, rescan: true }), 5, 'a space the map already had as Good: a thank-you');
+  assert.equal(S({ grade: 'A', rescan: true, mission: { bonus: 15, title: 'Rescan the lobby' } }), 30 + 15, 'unless a mission asked for it');
+  assert.deepEqual(R.scoreScan({ grade: 'B', newArea: 120, mission: { bonus: 10, title: 'Hayden study rooms' } }).parts,
+    [['Scan graded B', 20], ['120 m² new on the campus map', 12], ['Mission: Hayden study rooms', 10]]);
+  assert.equal(S({ grade: 'C' }), 0);
+  assert.ok(R.POINTS_HELP.some((t) => /B or better/.test(t)));
 });
 
 const campus = await import('../app/js/data/campus.js');
@@ -1174,7 +1315,6 @@ await (async () => {
 
 const crowdApp = await import('../app/js/data/crowd.js');
 const clubApp = await import('../app/js/data/club.js');
-const snapsApp = await import('../app/js/data/snaps.js');
 const crowdStation = await import('../station/lib/crowd.mjs');
 crowdApp.CROWD.url = FAKE_URL;
 fake.db.invites.set('CLUB-TEST', { code: 'CLUB-TEST', label: 'test', max_uses: 5, uses: 0, active: true });
@@ -1185,7 +1325,7 @@ await (async () => {
   assert.equal(await clubApp.myProfile(), null, 'not a member yet');
   assert.deepEqual(await clubApp.leaderboard('all'), [], 'a stranger sees no leaderboard');
   assert.deepEqual(await clubApp.missions(), [], 'and no missions');
-  await assert.rejects(crowdApp.uploadCapture({ id: 'x', engine: 'xr' }, [{ name: 'images/0001.jpg', data: 'x', type: 'image/jpeg' }, { name: 'splatscout.json', data: '{}', type: 'application/json' }],
+  await assert.rejects(crowdApp.uploadCapture({ id: 'x', engine: 'xr', score: { grade: 'A' } }, [{ name: 'images/0001.jpg', data: 'x', type: 'image/jpeg' }, { name: 'splatscout.json', data: '{}', type: 'application/json' }],
     { buildingCode: 'hayden-library', buildingName: 'Hayden Library', floor: '1', room: 'x' }, { save: async () => {} }), /join the club first/);
   await assert.rejects(clubApp.join('Test_Fox', 'WRONG'), /invite code/);
   await assert.rejects(clubApp.join('x', 'CLUB-TEST'), /3 to 20/);
@@ -1196,10 +1336,12 @@ await (async () => {
   assert.equal((await clubApp.restrictedCodes()).get('cereus-hall'), 'residence');
   assert.deepEqual((await clubApp.leaderboard('all')).map((r) => r.handle), ['Test_Fox']);
   assert.deepEqual(await clubApp.missions(), []);
+  assert.deepEqual(await clubApp.myScans(), [], 'no scans yet');
   passed++;
   console.log('  ok club (phone): nothing is accepted before joining; invite code, handle rules, restricted list, leaderboard');
 })();
 
+let phoneScan = null; // the scan this phone sends; the club reviews it further down
 await (async () => {
   const photo = (n) => new Blob([new Uint8Array([0xff, 0xd8, n, 0xff, 0xd9])], { type: 'image/jpeg' });
   const files = [
@@ -1210,6 +1352,8 @@ await (async () => {
   const capture = { id: 'c1', engine: 'xr', score: { grade: 'B' }, geo: { lat: 33.42, lon: -111.93, acc: 9 } };
   const tags = { buildingCode: 'schwada-classroom-office-building', buildingName: 'Schwada Classroom Office Building', floor: '1', room: 'Snall', contributor: 'Test_Fox' };
   const save = async () => {};
+  // Graded C: the phone doesn't offer to send it, and the database refuses it too.
+  await assert.rejects(crowdApp.uploadCapture({ id: 'c3', engine: 'xr', score: { grade: 'C' } }, files, tags, { save }), /refused this upload/, 'a scan graded C');
   // The connection drops part way: the upload stops, and a second try sends only what's missing.
   fake.db.failOnce.add('/images/0005.jpg');
   await assert.rejects(crowdApp.uploadCapture(capture, files, tags, { save }), /0005\.jpg.*simulated/);
@@ -1220,329 +1364,115 @@ await (async () => {
   assert.equal(up.id, firstId, 'resumed, not started again');
   assert.equal(up.status, 'done');
   const row = fake.db.captures.get(up.id);
-  assert.equal(row.status, 'new');
-  assert.equal(row.photo_count, 6);
-  assert.equal(row.building_name, 'Schwada Classroom Office Building');
+  assert.deepEqual([row.status, row.photo_count, row.grade, row.building_name], ['new', 6, 'B', 'Schwada Classroom Office Building']);
   for (const [k, n] of fake.db.posts) assert.equal(n, k.endsWith('0005.jpg') ? 2 : 1, `${k} sent ${n} times`);
   assert.ok(fake.db.files.has(`captures/${up.prefix}/upload.json`), 'file list sent last');
-  await assert.rejects(crowdApp.uploadCapture({ id: 'c2', engine: 'xr' }, files, { ...tags, buildingCode: 'cereus-hall', buildingName: 'Cereus Hall' }, { save }), /refused this upload/, 'a restricted building');
+  await assert.rejects(crowdApp.uploadCapture({ id: 'c2', engine: 'xr', score: { grade: 'A' } }, files, { ...tags, buildingCode: 'cereus-hall', buildingName: 'Cereus Hall' }, { save }), /refused this upload/, 'a restricted building');
+  // No single photos any more: the database refuses them.
+  const single = await crowdApp.api('/rest/v1/photos', { method: 'POST', body: { id: crypto.randomUUID(), taken_at: new Date().toISOString(), building_code: 'hayden-library', building_name: 'Hayden Library', storage_path: 'x', status: 'uploading' } });
+  assert.ok(!single.ok, 'a single photo is refused');
 
-  // SplatStation brings it in as a normal SplatScout ZIP, filed under the shared building name, and awards points.
+  // SplatStation brings it in as a normal SplatScout ZIP, filed under the shared building name. No points yet:
+  // they come when the club approves the splat built from it.
   const dir = mkdtempSync(join(tmpdir(), 'crowd-'));
   const c = { url: FAKE_URL, key: 'sb_secret_test' };
-  const zip = await crowdStation.importUpload(c, up.id, dir, () => {}, R.scoreScan);
+  const zip = await crowdStation.importUpload(c, up.id, dir, () => {});
   assert.match(zip, /Schwada_Classroom_Office_Building_Snall_20\d{6}_club-/);
   assert.equal((await listZip(zip)).length, files.length);
   const m = JSON.parse(await readZipText(zip, 'splatscout.json'));
   assert.equal(m.capture.building, 'Schwada Classroom Office Building');
   assert.equal(m.capture.typedBuilding, 'Schwada Building');
-  assert.equal(m.club.buildingCode, 'schwada-classroom-office-building');
-  assert.equal(m.club.contributor, 'Test_Fox');
-  assert.equal(fake.db.captures.get(up.id).status, 'approved');
-  assert.equal(fake.db.captures.get(up.id).points, R.scoreScan({ photos: 6, grade: 'B' }));
-  assert.deepEqual((await clubApp.leaderboard('all'))[0], { handle: 'Test_Fox', points: 45, photos: 0, scans: 1 });
+  assert.deepEqual([m.club.id, m.club.buildingCode, m.club.contributor, m.club.grade], [up.id, 'schwada-classroom-office-building', 'Test_Fox', 'B']);
+  assert.deepEqual([fake.db.captures.get(up.id).status, fake.db.captures.get(up.id).points], ['processed', 0]);
+  assert.deepEqual((await clubApp.leaderboard('all'))[0], { handle: 'Test_Fox', points: 0, photos: 0, scans: 0 });
+  assert.deepEqual((await clubApp.myScans()).map((s) => [s.status, s.grade, s.review_note]), [['processed', 'B', null]], 'the member sees it being built and reviewed');
   assert.match(crowdStation.crowdConfig(dir).error, /crowd\.json/);
+  phoneScan = up.id;
   passed++;
-  console.log('  ok club scans: members only, resume after a dropped connection, SplatStation imports a normal ZIP and awards points');
+  console.log('  ok club scans: members only, graded B or better, resume after a dropped connection, no single photos, SplatStation imports a normal ZIP (no points yet)');
 })();
 
-await (async () => {
-  // The photo queue on the phone, with a plain Map instead of IndexedDB.
-  const mem = new Map();
-  snapsApp.useStore({ putSnap: async (s) => void mem.set(s.id, s), getSnap: async (id) => mem.get(id), listSnaps: async () => [...mem.values()], deleteSnap: async (id) => void mem.delete(id) });
-  const jpg = (n) => new Blob([new Uint8Array([0xff, 0xd8, n, 0xff, 0xd9])], { type: 'image/jpeg' });
-  let seq = 0;
-  const snap = (o = {}) => ({ id: crypto.randomUUID(), session: crypto.randomUUID(), createdAt: Date.now() + ++seq, takenAt: Date.now(), blob: jpg(seq), thumb: jpg(seq), w: 1920, h: 1080, bytes: 5,
-    building: { code: 'hayden-library', name: 'Hayden Library' }, floor: '1', room: 'Lobby', geo: { lat: 33.4189, lon: -111.9346, acc: 9, t: Date.now() }, sharp: 100, brightness: 120, phash: '0123456789abcdef', light: 'afternoon', device: 'Pixel 8', camera: 'camera2 0', ...o });
-  const settle = async () => {
-    await new Promise((r) => setTimeout(r, 40));
-    for (let i = 0; i < 300 && snapsApp.status().running; i++) await new Promise((r) => setTimeout(r, 10));
-  };
-  const got = (s) => mem.get(s.id); // saveSnap stores a copy
-  const rows = () => [...fake.db.photos.values()];
-  const filesOf = () => [...fake.db.files.keys()].filter((k) => k.startsWith('club-photos/'));
-
-  // 1. Photos are sent in the background; once sent, only the thumbnail stays on the phone.
-  const three = [snap(), snap(), snap()];
-  for (const s of three) await snapsApp.saveSnap(s);
-  await settle();
-  assert.ok(three.every((s) => got(s).state === 'done' && got(s).blob === null && got(s).thumb), 'sent; thumbnails kept');
-  assert.equal(rows().filter((p) => p.status === 'new').length, 3);
-  assert.equal(filesOf().length, 3);
-  const r0 = rows()[0];
-  assert.equal(r0.user_id, [...fake.db.profiles.keys()][0]);
-  assert.equal(r0.storage_path, `hayden-library/floor-1-lobby/${r0.id}.jpg`);
-  assert.deepEqual([r0.width, r0.height, r0.device, r0.light, r0.phash], [1920, 1080, 'Pixel 8', 'afternoon', '0123456789abcdef']);
-
-  // 2. A busy server isn't the photo's fault: it waits in line and goes on later.
-  const busy = snap();
-  fake.db.flaky.add(`/${busy.id}.jpg`);
-  await snapsApp.saveSnap(busy);
-  await settle();
-  assert.equal(got(busy).state, 'row', 'the row is in, the file is waiting');
-  assert.match(snapsApp.status().lastError, /server busy/);
-  snapsApp.kick();
-  await settle();
-  assert.equal(got(busy).state, 'done');
-
-  // 3. A refusal is final until someone looks at it; "try again" resumes where it stopped.
-  const refused = snap();
-  fake.db.failOnce.add(`/${refused.id}.jpg`);
-  await snapsApp.saveSnap(refused);
-  await settle();
-  assert.equal(got(refused).state, 'failed');
-  assert.equal(got(refused).resume, 'row');
-  assert.match(got(refused).error, /Could not send the file/);
-  await snapsApp.retry(refused.id);
-  await settle();
-  assert.equal(got(refused).state, 'done');
-  assert.equal(fake.db.posts.get(`club-photos/hayden-library/floor-1-lobby/${refused.id}.jpg`), 2, 'sent twice: the refused try and the retry');
-
-  // 4. A restricted building is refused by the database, and the phone says why.
-  const bad = snap({ building: { code: 'cereus-hall', name: 'Cereus Hall' } });
-  await snapsApp.saveSnap(bad);
-  await settle();
-  assert.equal(got(bad).state, 'failed');
-  assert.match(got(bad).error, /restricted building/);
-  assert.equal(filesOf().length, 5, 'no file was sent for it');
-  await snapsApp.remove(bad.id);
-  assert.ok(!mem.has(bad.id));
-
-  // 5. A paused member sends nothing; resuming sends it.
-  const uid = [...fake.db.profiles.keys()][0];
-  fake.db.profiles.get(uid).banned = true;
-  await clubApp.myProfile({ fresh: true });
-  const held = snap();
-  await snapsApp.saveSnap(held);
-  await settle();
-  assert.equal(got(held).state, 'queued');
-  assert.equal(snapsApp.status().blocked, 'banned');
-  fake.db.profiles.get(uid).banned = false;
-  await clubApp.myProfile({ fresh: true });
-  snapsApp.kick();
-  await settle();
-  assert.equal(got(held).state, 'done');
-
-  // 5b. Track position (AR): the pose goes with the photo's row. A club database that doesn't take positions yet
-  //     (supabase-snap-pose.sql not run), or a pose it won't take, still gets the photo, just without one.
-  const pose = SP.poseRecord(Array.from(poseLookDir([0.4, 1.45, -1.2], [0, 0, -1])), { fx: 1374.1, fy: 1374.76, cx: 430, cy: 960, w: 860, h: 1920 }, crypto.randomUUID(), 3.2);
-  const arSnap = snap({ w: 860, h: 1920, pose, camera: 'AR camera (ARCore)' });
-  await snapsApp.saveSnap(arSnap);
-  await settle();
-  fake.db.noPose = true;
-  const early = snap({ w: 860, h: 1920, pose });
-  await snapsApp.saveSnap(early);
-  await settle();
-  fake.db.noPose = false;
-  const broken = snap({ pose: { ...pose, m: pose.m.slice(0, 15) } });
-  const plainSnap = snap();
-  for (const s of [broken, plainSnap]) await snapsApp.saveSnap(s);
-  await settle();
-  assert.ok([arSnap, early, broken, plainSnap].every((s) => got(s).state === 'done'), 'all four sent');
-  assert.deepEqual(fake.db.photos.get(arSnap.id).pose, pose, 'the pose is in the club database');
-  assert.deepEqual([fake.db.photos.get(arSnap.id).width, fake.db.photos.get(arSnap.id).camera], [860, 'AR camera (ARCore)']);
-  assert.ok(!('pose' in fake.db.photos.get(early.id)) && /'pose' column/.test(got(early).poseDropped), 'no positions in the database yet: sent without');
-  assert.ok(!('pose' in fake.db.photos.get(broken.id)) && /photo_pose/.test(got(broken).poseDropped), 'a broken pose: sent without');
-  assert.ok(!('pose' in fake.db.photos.get(plainSnap.id)), 'an ordinary photo sends no pose at all (older databases take it)');
-  for (const s of [arSnap, early, broken, plainSnap]) mem.delete(s.id); // (the counts below are about the photos above)
-
-  // 6. The club's verdicts come back onto the phone.
-  const first = rows()[0];
-  Object.assign(first, { status: 'accepted', points: 6, reviewed_at: new Date().toISOString(), review_note: 'First photo of this room +5' });
-  await snapsApp.refreshStatuses();
-  const c = await snapsApp.counts();
-  assert.deepEqual([c.accepted, c.points, c.sent, c.waiting, c.failed], [1, 6, 5, 0, 0]);
-  assert.equal((await clubApp.leaderboard('all'))[0].points, 51, 'the scan (45) and the photo (6)');
-  assert.equal((await clubApp.leaderboard('week'))[0].points, 6 + 45, 'both counted this week');
-
-  // 7. Leaving the club deletes everything sent: files first, then rows, then the profile.
-  await clubApp.leave();
-  assert.equal(rows().length, 0);
-  assert.equal(fake.db.captures.size, 0);
-  assert.equal([...fake.db.files.keys()].length, 0, 'every file is gone');
-  assert.equal(await clubApp.myProfile({ fresh: true }), null);
-  assert.deepEqual(await clubApp.leaderboard('all'), [], 'having left, the board is closed again');
-  passed++;
-  console.log('  ok club (phone): the photo queue sends in the background, waits out a busy server, stops on a refusal, and leaving deletes it all');
-})();
-
-// ---- SplatStation's side
 const clubSt = await import('../station/lib/club.mjs');
 const clubApi = await import('../station/lib/clubapi.mjs');
+const campusLib = await import('../station/lib/campus.mjs');
 await (async () => {
+  // SplatStation's side: members' scans with what this PC made of them, and the review of their splats.
   const dir = mkdtempSync(join(tmpdir(), 'clubpc-'));
-  const inbox = join(dir, 'inbox');
-  mkdirSync(inbox);
-  const cfg = { workDir: dir, tools: {}, dirs: { inbox } };
+  const cfg = { workDir: dir, dirs: { library: join(dir, 'library'), inbox: join(dir, 'inbox'), jobs: join(dir, 'jobs') } };
+  for (const d of Object.values(cfg.dirs)) mkdirSync(d, { recursive: true });
+  writeFileSync(join(dir, 'crowd.json'), JSON.stringify({ url: FAKE_URL, secretKey: 'sb_secret_test' }));
   const c = { url: FAKE_URL, key: 'sb_secret_test' };
-  const ldir = clubSt.clubDir(dir);
-  const buildings = new Map(asuList.map((b) => [b.code, b]));
-
-  const U1 = '00000000-0000-4000-8000-0000000000a1', U2 = '00000000-0000-4000-8000-0000000000a2';
-  fake.db.profiles.set(U1, { user_id: U1, handle: 'Mesa_Quail', banned: false, created_at: new Date().toISOString() });
-  fake.db.profiles.set(U2, { user_id: U2, handle: 'Solar_Hawk', banned: false, created_at: new Date().toISOString() });
-  const idx = {};
-  const mix = (i) => ((0x9e3779b97f4a7c15n * BigInt(i + 1)) % 2n ** 64n).toString(16).padStart(16, '0'); // well-spread fake hashes
-  const t0 = Date.UTC(2026, 10, 3, 20, 0); // 13:00 in Phoenix: afternoon
-  const session = (n) => `5e55105e-0000-4000-8000-00000000000${n}`;
-  let made = 0;
-  /** A photo row in the club database, its cloud file, and (when `local`) the copy and measurements SplatStation would hold. */
-  const add = (o = {}, m = {}, local = true) => {
-    const i = ++made, id = `cccccccc-cccc-4ccc-8ccc-${String(i).padStart(12, '0')}`;
-    const place = { building_code: 'hayden-library', building_name: 'Hayden Library', floor: '1', room: 'Lobby', ...o };
-    const path = `${place.building_code}/floor-${place.floor}-${place.room.toLowerCase()}/${id}.jpg`;
-    const taken = o.taken || t0 + i * 1000;
-    delete o.taken;
-    fake.db.photos.set(id, { id, user_id: U1, created_at: new Date(taken + 500).toISOString(), taken_at: new Date(taken).toISOString(), floor: '1', room: 'Lobby', storage_path: path, session: session(1), mission_id: null,
-      lat: null, lon: null, gps_accuracy_m: null, device: 'Pixel 8', status: 'new', points: 0, file_removed: false, review_note: null, reviewed_at: null, ...place, ...o });
-    fake.db.files.set('club-photos/' + path, new Uint8Array([0xff, 0xd8, i, 0xff, 0xd9]));
-    if (local) {
-      writeFileSync(clubSt.photoFile(ldir, id), Buffer.from([0xff, 0xd8, i, 0xff, 0xd9]));
-      writeFileSync(clubSt.thumbFile(ldir, id), Buffer.from([0xff, 0xd8, i, 0xff, 0xd9]));
-      idx[id] = { w: 1920, h: 1080, sharp: 100 + (i % 7), mean: 120, clipHi: 0, texture: 0.3, phash: mix(i), bytes: 5, ...m };
-      writeFileSync(join(ldir, 'index.json'), JSON.stringify(idx));
-    }
-    return id;
+  const buildings = clubApi.buildings();
+  const U = '00000000-0000-4000-8000-0000000000e1', U2 = '00000000-0000-4000-8000-0000000000e2';
+  for (const [id, handle] of [[U, 'Scan_Hawk'], [U2, 'Scan_Owl']]) fake.db.profiles.set(id, { user_id: id, handle, banned: false, created_at: new Date().toISOString() });
+  const S1 = 'ce000000-0000-4000-8000-000000000001', S2 = 'ce000000-0000-4000-8000-000000000002', S3 = 'ce000000-0000-4000-8000-000000000003';
+  const scan = (id, o) => fake.db.captures.set(id, { id, user_id: U, created_at: new Date(Date.now() - 864e5).toISOString(), building_code: 'hayden-library', building_name: 'Hayden Library', floor: '2', room: 'Study room 3',
+    storage_prefix: `hayden-library/floor-2-study-room-3/${id}`, photo_count: 240, grade: 'A', status: 'processed', points: 0, reviewed_at: null, review_note: null, contributor: 'Scan_Hawk', lat: 33.4189, lon: -111.9346, gps_accuracy_m: 9, ...o });
+  scan(S1, {});
+  scan(S2, { user_id: U2, contributor: 'Scan_Owl', room: 'Reading room', storage_prefix: `hayden-library/floor-2-reading-room/${S2}`, grade: 'B' });
+  scan(S3, { status: 'new', floor: '1', room: 'Main lobby', storage_prefix: `hayden-library/floor-1-main-lobby/${S3}` });
+  // The splats built from the first two: in metres (lined up with the phone's AR), with their scan outlines.
+  const lib = [];
+  const splat = (id, room, stamp, w, contributor) => {
+    const path = `Hayden Library/${room}/${stamp}`;
+    mkdirSync(join(cfg.dirs.library, path), { recursive: true });
+    writeFileSync(join(cfg.dirs.library, path, 'info.json'), JSON.stringify({ building: 'Hayden Library', room, level: '2', created: new Date().toISOString(), photos: 240, placed: 240,
+      colmap: { mode: 'sfm-ar', reprojError: 0.5 }, training: { preset: 'standard' }, capture: { grade: 'A', score: 92 }, club: { id, buildingCode: 'hayden-library', contributor, grade: 'A' },
+      crop: { areas: [{ poly: [[0, 0], [w, 0], [w, 4], [0, 4]] }] } }));
+    lib.push({ path, building: 'Hayden Library', room, stamp });
   };
+  splat(S1, 'Study room 3', '2026-11-07_1000', 6, 'Scan_Hawk'); // 24 m²
+  splat(S2, 'Reading room', '2026-11-07_1100', 100, 'Scan_Owl'); // 400 m²
+  const library = () => lib.map((it) => ({ ...it, info: JSON.parse(readFileSync(join(cfg.dirs.library, it.path, 'info.json'), 'utf8')) }));
+  let published = 0;
+  const api = async (path, post) => {
+    let out = null;
+    await clubApi.handleClub({ req: { socket: { remoteAddress: '127.0.0.1' }, method: post ? 'POST' : 'GET' }, res: {}, path, cfg, readBody: async () => post || {},
+      sendJson: (res, body, code = 200) => (out = { code, body }), say() {}, scanInbox() {},
+      library, jobs: () => [], campus: (cc) => campusLib.campusData({ club: cc, library: library(), jobs: [], buildings, workDir: dir, jobsDir: cfg.dirs.jobs }), onCampusChanged: () => published++ });
+    return out;
+  };
+  const studyMission = await clubSt.createMission(c, { title: 'Scan the Hayden study rooms', building_code: 'hayden-library', room: 'study room 3', bonus: 15 });
+  fake.db.missions.get(studyMission.id).created_at = new Date(Date.now() - 2 * 864e5).toISOString();
 
-  // -- first opinions
-  const ids = Array.from({ length: 12 }, () => add());
-  const dark = add({}, { mean: 10 }), dim = add({}, { mean: 32 }), blurry = add({}, { sharp: 15 });
-  const dupA = ids[0];
-  const dupB = add({}, { phash: idx[dupA].phash }); // same view as the first, same member
-  const copy = add({ user_id: U2, session: session(2) }, { phash: idx[ids[1]].phash }); // another member, same view
-  const far = add({ lat: 33.5, lon: -111.9, gps_accuracy_m: 10 }); // GPS puts it 10 km away
-  const clock = add({ taken_at: new Date(t0 + 86400e3).toISOString() }); // the phone clock says tomorrow
-  const unsynced = add({}, {}, false);
-  let list = await clubSt.reviewList(c, cfg, buildings);
-  const v = (id) => list.find((p) => p.id === id).verdict;
-  assert.equal(v(ids[3]).level, 'accept');
-  assert.equal(v(dark).level, 'reject');
-  assert.deepEqual(v(dark).reasons, ['too dark']);
-  assert.equal(v(dim).level, 'review');
-  assert.equal(v(blurry).level, 'review');
-  assert.match(v(blurry).reasons.join(), /maybe blurry/, 'judged against the rest of the outing');
-  assert.equal(v(dupB).level, 'reject');
-  assert.match(v(dupB).reasons.join(), /near-duplicate/);
-  assert.equal(v(dupA).level, 'accept', 'the first of two identical photos stays');
-  assert.equal(v(copy).level, 'review');
-  assert.match(v(copy).reasons.join(), /another member/);
-  assert.match(v(far).reasons.join(), /GPS puts it \d+ m from the building/);
-  assert.match(v(clock).reasons.join(), /clock/);
-  assert.equal(v(unsynced).level, 'review');
-  assert.equal(list.find((p) => p.id === ids[0]).handle, 'Mesa_Quail');
-  assert.equal(list.find((p) => p.id === ids[0]).lightSlot, 'afternoon');
+  // The review list: each scan with what this PC made of it, and what approving it would earn.
+  let r = await api('/api/club/scans');
+  const by = (id) => r.body.scans.find((x) => x.id === id);
+  assert.deepEqual([by(S1).handle, by(S1).splat.path, by(S3).splat, by(S3).award], ['Scan_Hawk', 'Hayden Library/Study room 3/2026-11-07_1000', null, null]);
+  assert.equal(by(S1).award.points, 30 + 2 + 15, 'grade A, 24 m² new on the map, and the study-room mission');
+  assert.deepEqual([by(S1).award.facts.newArea, by(S1).award.facts.rescan, by(S1).award.facts.score], [24, false, 92]);
+  assert.equal(by(S2).award.points, 20 + 30, 'grade B, and 400 m² new (30 at most)');
 
-  // -- accepting awards points: the first photo of a room, then 1 each
-  const first12 = ids;
-  let r = await clubSt.review(c, cfg, { ids: first12, action: 'accept' });
-  assert.equal(r.changed, 12);
-  assert.equal(r.points, 6 + 11, '5 extra for the first photo of the room');
-  const p = (id) => fake.db.photos.get(id);
-  assert.deepEqual([p(ids[0]).status, p(ids[0]).points, p(ids[1]).points], ['accepted', 6, 1]);
-  assert.match(p(ids[0]).review_note, /First photo of this room \+5/);
-  assert.equal((await clubSt.review(c, cfg, { ids: first12, action: 'accept' })).changed, 0, 'accepting twice awards nothing');
+  // Approve: the member gets the points, and the splat goes on the campus map.
+  r = await api('/api/club/scan', { op: 'approve', id: S1 });
+  assert.deepEqual([r.code, r.body.points], [200, 47]);
+  assert.deepEqual([fake.db.captures.get(S1).status, fake.db.captures.get(S1).points], ['approved', 47]);
+  assert.deepEqual([library()[0].info.review.status, library()[0].info.review.points], ['approved', 47]);
+  assert.equal(published, 1, 'members’ phones follow');
+  assert.equal((await api('/api/club/scan', { op: 'approve', id: S1 })).code, 409, 'approving twice awards nothing');
+  assert.equal((await api('/api/club/scan', { op: 'approve', id: S3 })).code, 400, 'a scan whose splat isn’t built yet');
+  assert.equal((await api('/api/club/scan', { op: 'approve', id: 'not-an-id' })).code, 400);
+  // Not approved: no points, the member is told why, and the splat stays off the map.
+  r = await api('/api/club/scan', { op: 'reject', id: S2, note: 'A person is in the scan' });
+  assert.equal(r.code, 200);
+  assert.deepEqual([fake.db.captures.get(S2).status, fake.db.captures.get(S2).review_note, fake.db.captures.get(S2).points], ['rejected', 'A person is in the scan', 0]);
+  assert.equal(library()[1].info.review.status, 'rejected');
+  // The phone's own scan from above, turned down before it was built: its owner reads why.
+  await api('/api/club/scan', { op: 'reject', id: phoneScan, note: 'Too blurry or patchy' });
+  assert.deepEqual((await clubApp.myScans()).map((s) => [s.status, s.review_note]), [['rejected', 'Too blurry or patchy']]);
+  const board = await clubApp.leaderboard('all');
+  assert.deepEqual(board.find((x) => x.handle === 'Scan_Hawk'), { handle: 'Scan_Hawk', points: 47, photos: 0, scans: 1 });
+  assert.deepEqual(board.find((x) => x.handle === 'Scan_Owl'), { handle: 'Scan_Owl', points: 0, photos: 0, scans: 0 });
+  assert.equal((await clubApp.missions()).find((m) => m.id === studyMission.id).done, 1, 'the mission counts the approved scan of its space');
+  // Delete a scan from the cloud (its files and its row).
+  assert.equal((await api('/api/club/scan', { op: 'delete', id: S3 })).code, 200);
+  assert.ok(!fake.db.captures.has(S3));
 
-  // -- a mission's bonus needs its light; a new light in a covered room earns a little
-  const mid = crypto.randomUUID();
-  fake.db.missions.set(mid, { id: mid, title: 'Evening lobby', bonus: 3, light: 'evening', wanted: 10, active: true });
-  const evening = t0 + 4 * 3600e3; // 17:00 Phoenix
-  const eve = add({ mission_id: mid, taken: evening }), eve2 = add({ mission_id: mid, taken: evening + 5000 }), noon = add({ mission_id: mid, taken: t0 + 60e3 });
-  r = await clubSt.review(c, cfg, { ids: [eve, eve2, noon], action: 'accept' });
-  assert.equal(p(eve).points, 1 + 3 + 3, 'photo, first evening light here, mission bonus');
-  assert.equal(p(eve2).points, 1 + 3, 'photo, mission bonus');
-  assert.equal(p(noon).points, 1, 'a mission asking for evening light gives nothing at noon');
-
-  // -- the daily limit on base points
-  const many = Array.from({ length: 4 }, () => add({ user_id: U2, session: session(2), taken: t0 + 3600e3 }));
-  const prior = Array.from({ length: 100 }, (_, i) => ({ id: 'p' + i, user_id: U2, created_at: new Date(t0).toISOString(), taken_at: new Date(t0).toISOString(), building_code: 'hayden-library', floor: '1', room: 'Lobby' }));
-  const plan = clubSt.planAwards(many.map((id) => fake.db.photos.get(id)), prior);
-  assert.ok(plan.every((x) => x.points === 0), 'photos past 100 points a day are welcome but score nothing');
-
-  // -- rejecting deletes the photo here and in the cloud
-  const [x1, x2] = [add(), add()];
-  const cloud = `club-photos/${p(x1).storage_path}`;
-  assert.ok(fake.db.files.has(cloud) && existsSync(clubSt.photoFile(ldir, x1)));
-  r = await clubSt.review(c, cfg, { ids: [x1, x2], action: 'reject', note: 'A person is in the frame' });
-  assert.equal(r.changed, 2);
-  assert.deepEqual([p(x1).status, p(x1).review_note, p(x1).file_removed], ['rejected', 'A person is in the frame', true]);
-  assert.ok(!fake.db.files.has(cloud) && !existsSync(clubSt.photoFile(ldir, x1)) && !existsSync(clubSt.thumbFile(ldir, x1)), 'gone from the cloud and from this PC');
-  assert.equal((await clubSt.review(c, cfg, { ids: [ids[0]], action: 'reopen' })).changed, 1);
-  assert.equal(p(ids[0]).status, 'new');
-  await clubSt.review(c, cfg, { ids: [ids[0]], action: 'accept' });
-
-  // -- a capture from the accepted photos of one room
-  const room = { building_code: 'hayden-library', floor: '1', room: 'Lobby' };
-  let built = await clubSt.buildCapture(c, cfg, room, inbox, '2.5.0');
-  assert.equal(built.photos, 12 + 3, '12 photos, and the 3 taken for the mission');
-  assert.ok(built.sharedCamera, 'one phone, one orientation: one camera');
-  assert.match(built.file, /Hayden_Library_Lobby_2026110\d_club-photos\.zip$/);
-  const entries = await listZip(built.file);
-  assert.equal(entries.filter((e) => /images\/\d{4}\.jpg$/.test(e.name)).length, built.photos);
-  const man = JSON.parse(await readZipText(built.file, 'splatscout.json'));
-  assert.deepEqual([man.capture.engine, man.capture.tracking, man.capture.building, man.capture.room], ['club-photos', 'none', 'Hayden Library', 'Lobby']);
-  assert.ok(man.club.contributors.includes('Mesa_Quail'));
-  assert.ok(man.club.lightSlots.includes('evening') && man.club.lightSlots.includes('afternoon'));
-  assert.ok(man.frames.every((f) => f.intrinsics && f.intrinsics.w === 1920 && Math.abs(f.intrinsics.fx - 1920 / 2 / Math.tan((68 / 2) * (Math.PI / 180))) < 0.1), 'one camera: its field of view is offered as a starting guess');
-  assert.ok(man.frames.every((f) => f.lens === 'guess'), 'a guess, for COLMAP to refine');
-  assert.deepEqual(lensGroups(man.frames).map((g) => [g.names.length, g.camera.model, g.camera.single]), [[built.photos, 'SIMPLE_RADIAL', true]]);
-  // Photos from another phone: each photo's lens is left for COLMAP to work out.
-  const other = add({ device: 'iPhone 15' }, {});
-  await clubSt.review(c, cfg, { ids: [other], action: 'accept' });
-  built = await clubSt.buildCapture(c, cfg, room, inbox);
-  assert.ok(!built.sharedCamera);
-  assert.ok(JSON.parse(await readZipText(built.file, 'splatscout.json')).frames.every((f) => !f.intrinsics));
-  await assert.rejects(clubSt.buildCapture(c, cfg, { building_code: 'hayden-library', floor: '9', room: 'Nowhere' }, inbox), /at least 10 are needed/);
-
-  // -- photos taken with Track position (AR): the AR session with the most photos sets the coordinates, as a
-  //    scan's poses do; its photos go first and its poses go in as a COLMAP model
-  const SX = 'a5e55000-0000-4000-8000-00000000000a', SY = 'a5e55000-0000-4000-8000-00000000000b';
-  const lens = { fx: 1374.1, fy: 1374.76, cx: 430, cy: 960, w: 860, h: 1920 };
-  const at = (k, s) => SP.poseRecord(Array.from(poseLookDir([k * 0.4, 1.4, 0], [0, 0, -1])), lens, s, k);
-  const atrium = (o) => ({ room: 'Atrium', session: session(3), ...o });
-  const arX = Array.from({ length: 12 }, (_, k) => add(atrium({ pose: at(k, SX) }), { w: 860, h: 1920 }));
-  const arY = Array.from({ length: 4 }, (_, k) => add(atrium({ pose: at(k, SY), session: session(4) }), { w: 860, h: 1920 }));
-  const turned = add(atrium({ pose: at(13, SX) }), { w: 1920, h: 860 }); // the photo here isn't the shape its pose describes
-  const ordinary = Array.from({ length: 3 }, () => add(atrium({ session: session(5) })));
-  await clubSt.review(c, cfg, { ids: [...ordinary, turned, ...arY, ...arX], action: 'accept' });
-  built = await clubSt.buildCapture(c, cfg, { building_code: 'hayden-library', floor: '1', room: 'Atrium' }, inbox);
-  assert.deepEqual(built.ar, { session: SX, photos: 12, posed: 16, sessions: 2 });
-  assert.ok(!built.sharedCamera, 'AR and ordinary photos: their lenses differ');
-  const amf = JSON.parse(await readZipText(built.file, 'splatscout.json'));
-  assert.equal(amf.capture.tracking, '6dof', 'the pipeline takes its poses like a scan’s');
-  assert.deepEqual(amf.club.photos.slice(0, 12), arX, 'that session’s photos come first, in the order they were taken');
-  assert.ok(amf.frames.slice(0, 12).every((f) => f.tracked && f.pose.length === 16 && f.arSession === SX && f.intrinsics.fx === 1374.1));
-  assert.ok(amf.frames.slice(12).every((f) => !f.pose && !f.tracked), 'nobody else is in its coordinates');
-  assert.equal(amf.frames.filter((f) => f.arPose && f.arSession === SY).length, 4, 'another session’s poses are kept, apart');
-  assert.equal(amf.frames.filter((f) => !f.intrinsics).length, 4, 'COLMAP works out the lens of the turned photo and the ordinary ones');
-  assert.ok(amf.frames.filter((f) => f.intrinsics).every((f) => f.lens === 'exact'), 'AR lenses are marked exact');
-  assert.deepEqual(lensGroups(amf.frames).map((g) => [g.names.length, g.camera.model, g.camera.params, g.camera.single]),
-    [[16, 'PINHOLE', '1374.1000,1374.7600,430.0000,960.0000', true], [4, 'SIMPLE_RADIAL', null, false]], 'both AR sessions share their exact lens; the rest get one each');
-  assert.deepEqual(lensGroups(amf.frames)[1].names, amf.frames.filter((f) => !f.intrinsics).map((f) => f.file.slice('images/'.length)));
-  const amodel = (name) => readZipText(built.file, `poses/colmap/sparse/0/${name}.txt`);
-  const aimg = (await amodel('images')).split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(' '));
-  assert.deepEqual(aimg.map((p) => `${p[0]} ${p[8]} ${p[9]}`), Array.from({ length: 12 }, (_, i) => `${i + 1} 1 ${String(i + 1).padStart(4, '0')}.jpg`), 'numbered as COLMAP numbers the files');
-  assert.match(await amodel('cameras'), /^1 PINHOLE 860 1920 1374\.1 1374\.76 430 960$/m, 'the AR camera’s own lens');
-  for (const k of ['points3D', 'rigs', 'frames']) assert.ok(await amodel(k), `${k}.txt (COLMAP 4 wants it)`);
-  // Too few photos from any one AR session to set the coordinates: no model, the photos alone.
-  const stairs = Array.from({ length: 10 }, (_, k) => add({ room: 'Stairs', session: session(3), pose: at(k, k < 6 ? SX : SY) }, { w: 860, h: 1920 }));
-  await clubSt.review(c, cfg, { ids: stairs, action: 'accept' });
-  built = await clubSt.buildCapture(c, cfg, { building_code: 'hayden-library', floor: '1', room: 'Stairs' }, inbox);
-  assert.deepEqual(built.ar, { session: null, photos: 0, posed: 10, sessions: 2 });
-  assert.equal(JSON.parse(await readZipText(built.file, 'splatscout.json')).capture.tracking, 'none');
-  assert.ok(!(await listZip(built.file)).some((e) => e.name.includes('/poses/')));
-  // A club database without positions yet: the photos alone, as before.
-  fake.db.noPose = true;
-  built = await clubSt.buildCapture(c, cfg, { building_code: 'hayden-library', floor: '1', room: 'Atrium' }, inbox);
-  fake.db.noPose = false;
-  assert.deepEqual([built.photos, built.ar], [20, null]);
-
-  // -- freeing the cloud's storage keeps the local copies and the points
-  const kept = clubSt.photoFile(ldir, ids[2]);
-  const before = [...fake.db.files.keys()].length;
-  const freed = await clubSt.freeCloud(c, cfg);
-  assert.ok(freed.photos >= 15 && freed.bytes > 0);
-  assert.ok([...fake.db.files.keys()].length < before && p(ids[2]).file_removed && p(ids[2]).points === 1 && existsSync(kept));
+  // The campus map counts the approved splat; the one not approved stays off it.
+  const d = await campusLib.campusData({ club: c, library: library(), jobs: [], buildings, workDir: dir });
+  const study = d.spaces.find((x) => x.room === 'Study room 3');
+  assert.deepEqual([study.onMap, study.waiting, study.area, study.areaSource, study.score, study.contributors.map((x) => x.handle)], [1, 0, 24, 'measured', 92, ['Scan_Hawk']]);
+  assert.ok(!d.spaces.some((x) => x.room === 'Reading room'), 'a splat not approved stays off the map');
 
   // -- missions, invites, members, restricted places
   await assert.rejects(clubSt.createMission(c, { title: 'x' }), /3 to 80/);
@@ -1560,13 +1490,12 @@ await (async () => {
   assert.equal(fake.db.invites.get(inv.code).active, false);
 
   const members = await clubSt.listMembers(c);
-  assert.ok(members.find((m) => m.handle === 'Mesa_Quail').points > 17);
+  assert.deepEqual(['points', 'scans'].map((k) => members.find((x) => x.handle === 'Scan_Hawk')[k]), [47, 1]);
   await assert.rejects(clubSt.setMember(c, U2, { handle: 'bad handle' }), /3 to 20/);
   await clubSt.setMember(c, U2, { handle: 'Solar_Hawk2', banned: true });
   assert.deepEqual([fake.db.profiles.get(U2).handle, fake.db.profiles.get(U2).banned], ['Solar_Hawk2', true]);
   const purged = await clubSt.purgeMember(c, cfg, U2);
-  assert.ok(purged.photos >= 5 && !fake.db.profiles.has(U2) && ![...fake.db.photos.values()].some((x) => x.user_id === U2));
-  assert.ok(!existsSync(clubSt.photoFile(ldir, copy)), 'their local copies are deleted too');
+  assert.ok(purged.scans === 1 && !fake.db.profiles.has(U2) && ![...fake.db.captures.values()].some((x) => x.user_id === U2), JSON.stringify(purged));
 
   const flagged = [...buildings.values()].filter((b) => b.restricted).length;
   fake.db.restricted_buildings.clear();
@@ -1584,76 +1513,30 @@ await (async () => {
   const own = Object.values(networkInterfaces()).flat().find((i) => i && i.family === 'IPv4' && !i.internal);
   if (own) assert.ok(clubApi.isLocal({ socket: { remoteAddress: own.address } }), 'this PC’s own network address (the dashboard opened by its Wi-Fi address)');
   let answer = null;
-  await clubApi.handleClub({ req: { socket: { remoteAddress: '203.0.113.7' }, method: 'GET' }, res: {}, path: '/api/club/photos', cfg, readBody: async () => ({}), sendJson: (res, body, code) => (answer = [code, body]), say() {}, scanInbox() {} });
+  await clubApi.handleClub({ req: { socket: { remoteAddress: '203.0.113.7' }, method: 'GET' }, res: {}, path: '/api/club/scans', cfg, readBody: async () => ({}), sendJson: (res, body, code) => (answer = [code, body]), say() {}, scanInbox() {} });
   assert.equal(answer[0], 403, 'a phone on the Wi-Fi is refused');
   passed++;
-  console.log('  ok club (PC): first opinions, points (first photo, light, mission, daily limit), reject deletes, capture from photos, members, invites, restricted places');
-})();
-
-// With ffmpeg: measuring and syncing real photos.
-await (async () => {
-  let ffmpeg = null;
-  for (const f of ['ffmpeg', join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe')]) {
-    try {
-      execFileSync(f, ['-version'], { stdio: 'ignore' });
-      ffmpeg = f;
-      break;
-    } catch {}
-  }
-  if (!ffmpeg) return console.log('  (skipped: measuring real photos needs ffmpeg)');
-  const dir = mkdtempSync(join(tmpdir(), 'clubff-'));
-  const make = (name, vf) => execFileSync(ffmpeg, ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=1', '-vf', vf, '-frames:v', '1', join(dir, name)]);
-  make('sharp.jpg', 'null');
-  make('blurry.jpg', 'boxblur=14');
-  make('dark.jpg', 'eq=brightness=-0.85');
-  const a = await clubSt.measure(ffmpeg, join(dir, 'sharp.jpg')), b = await clubSt.measure(ffmpeg, join(dir, 'blurry.jpg')), d = await clubSt.measure(ffmpeg, join(dir, 'dark.jpg'));
-  assert.deepEqual([a.w, a.h], [1280, 720], 'the real size, not the analysis size');
-  assert.match(a.phash, /^[0-9a-f]{16}$/);
-  assert.ok(a.sharp > b.sharp * 20, `sharp ${a.sharp} against blurred ${b.sharp}`);
-  assert.ok(d.mean < 30 && a.mean > 60, 'brightness');
-  assert.ok(R.hamming(a.phash, b.phash) <= 12, 'a blurred copy of a view still looks like the same view');
-
-  // sync: download new photos, measure them and make thumbnails
-  const cfg = { workDir: dir, tools: { ffmpeg }, dirs: {} };
-  const c = { url: FAKE_URL, key: 'sb_secret_test' };
-  fake.db.photos.clear(); // (the earlier checks left rows behind)
-  fake.db.files.clear();
-  const id = 'dddddddd-dddd-4ddd-8ddd-000000000001', path = `hayden-library/floor-1-lobby/${id}.jpg`;
-  fake.db.profiles.set('u9', { user_id: 'u9', handle: 'Sync_Test', banned: false });
-  fake.db.photos.set(id, { id, user_id: 'u9', status: 'new', storage_path: path, file_removed: false, created_at: new Date().toISOString() });
-  fake.db.files.set('club-photos/' + path, new Uint8Array(readFileSync(join(dir, 'sharp.jpg'))));
-  const res = await clubSt.sync(c, cfg);
-  assert.deepEqual([res.total, res.downloaded, res.failed], [1, 1, 0]);
-  const ldir = clubSt.clubDir(dir), idx = clubSt.loadIndex(ldir);
-  assert.deepEqual([idx[id].w, idx[id].h], [1280, 720]);
-  assert.ok(existsSync(clubSt.photoFile(ldir, id)) && existsSync(clubSt.thumbFile(ldir, id)));
-  assert.equal((await clubSt.sync(c, cfg)).downloaded, 0, 'only new photos are downloaded');
-  fake.db.profiles.delete('u9');
-  fake.db.photos.delete(id);
-  passed++;
-  console.log('  ok club (PC, with ffmpeg): measures real photos (size, sharpness, light, hash) and syncs only the new ones');
+  console.log('  ok club (PC): scans with what this PC made of them, approve (points, mission bonus, campus map) or not (the member reads why), missions, invites, members, restricted places');
 })();
 
 // ---------------------------------------------------------------- campus view
 const CM = await import('../app/js/core/campusmodel.js');
-test('campus model: quality bands, photo curve, light mixing, scans, builds, sizes and floor area covered', () => {
+test('campus model: quality bands, the photo-count rule of thumb, scans, builds, sizes and floor area covered', () => {
   assert.deepEqual([0, 24, 25, 49, 50, 74, 75, 89, 90, 100].map((q) => CM.bandOf(q).id), ['none', 'none', 'rough', 'rough', 'fair', 'fair', 'good', 'good', 'excellent', 'excellent']);
   assert.deepEqual(['Main lobby', '2nd floor hallway', 'Room 214', 'Snall', 'Reading room', 'Stairwell B'].map(CM.kindOf), ['large', 'hallway', 'room', 'room', 'large', 'hallway']);
-  // A room is Good at about 125 photos in one light and Excellent at about 208; bigger spaces need more.
+  // How many photos a scan needs: a room is Good at about 125 in one light and Excellent at about 208; bigger spaces need more.
   assert.equal(CM.photosFor(CM.GOOD, 'room'), 125);
   assert.equal(CM.photosFor(CM.EXCELLENT, 'room'), 208);
   assert.ok(CM.photosFor(CM.GOOD, 'large') > CM.photosFor(CM.GOOD, 'hallway') && CM.photosFor(CM.GOOD, 'hallway') > CM.photosFor(CM.GOOD, 'room'));
   assert.ok(CM.photoCurve(19, 'room') <= 15, 'too few photos to place');
   const curve = CM.curvePoints('room');
   assert.ok(curve.every((p, i) => !i || p[1] >= curve[i - 1][1]), 'more photos never hurt');
-
   const one = CM.photoEstimate({ byLight: { afternoon: 125 } }, 'room');
   assert.deepEqual([one.score, one.dominant, one.share], [75, 'afternoon', 1]);
   const mixed = CM.photoEstimate({ byLight: { afternoon: 60, evening: 60 } }, 'room');
-  assert.equal(Math.round(mixed.effective), 75, 'the other light counts a quarter');
+  assert.equal(Math.round(mixed.effective), 75, 'photos in other light count a quarter');
   assert.ok(mixed.score < one.score - 15 && mixed.parts.some(([t, v]) => /mixed/.test(t) && v < 0), 'and mixed light costs points');
-  assert.equal(CM.photoEstimate({ byLight: { morning: 125 }, devices: 3 }, 'room').score, 72, 'three phones: -3');
-  assert.equal(CM.photoEstimate({}, 'room').score, 0);
+  assert.deepEqual(CM.photosNeeded({ room: 'Room 214', photos: { byLight: { evening: 90 } } }), { n: 33, light: 'evening' });
 
   assert.equal(CM.scanEstimate([{ grade: 'A' }]).score, 87);
   assert.equal(CM.scanEstimate([{ grade: 'C' }, { grade: 'B', score: 85 }]).score, 81, 'the best scan counts');
@@ -1673,28 +1556,15 @@ test('campus model: quality bands, photo curve, light mixing, scans, builds, siz
   assert.equal(CM.builtEstimate({ ...snall, placed: 526, eval: { psnr: 26, ssim: 0.9, views: 44 } }).score, 45, 'photos COLMAP couldn’t place still count against it');
   assert.equal(CM.builtEstimate(snall).measured, false);
 
+  // What would improve a space, now that the club takes full scans only.
   const fresh = CM.spaceEstimate({ room: 'Main lobby' });
   assert.deepEqual([fresh.score, fresh.source, fresh.kind], [0, 'none', 'large']);
-  // Advice counts photos exactly as the score is shown: 205 make a big space Good (the curve's round figure is 208).
-  assert.match(fresh.advice[0], /Nothing yet\. About 205 photos/);
-  const partial = CM.spaceEstimate({ room: 'Room 214', photos: { byLight: { evening: 90 }, pending: 4 } });
-  assert.equal(partial.source, 'photos');
-  assert.ok(partial.advice.some((a) => /About 33 more photos in evening light would make it Good/.test(a)), partial.advice.join(' / '));
-  // photosNeeded: that many more in that light reach Good and one fewer doesn't; mixed light needs more than the plain curve says.
-  assert.deepEqual(CM.photosNeeded({ room: 'Room 214', photos: { byLight: { evening: 90 } } }), { n: 33, light: 'evening' });
-  const mixedRoom = { room: 'Room 101', photos: { byLight: { afternoon: 60, evening: 60 } } };
-  assert.deepEqual(CM.photosNeeded(mixedRoom), { n: 52, light: 'afternoon' });
-  assert.ok(CM.spaceEstimate({ ...mixedRoom, photos: { byLight: { afternoon: 111, evening: 60 } } }).score < CM.GOOD, 'one fewer is still Fair');
-  assert.ok(CM.spaceEstimate({ ...mixedRoom, photos: { byLight: { afternoon: 110, evening: 60 } } }).score < CM.GOOD, 'the plain curve’s 50 falls short');
-  assert.deepEqual(CM.photosNeeded({ room: 'Main lobby' }), { n: 205, light: null }, 'nothing yet: any one kind of light');
-  assert.equal(CM.photosNeeded({ room: 'Room 2', photos: { byLight: { night: 40 } }, scans: [{ grade: 'C' }] }).n, 64, 'a scan counts towards it');
-  assert.equal(CM.photosNeeded({ room: 'Snall', builds: [snall] }).n, 0, 'already there');
-  assert.ok(partial.advice.some((a) => /4 photos are waiting for review/.test(a)));
-  const built = CM.spaceEstimate({ room: 'Snall', photos: { byLight: { night: 10 }, sinceBuild: 10 }, builds: [snall] });
-  assert.deepEqual([built.score, built.source, built.band.id], [99, 'built', 'excellent']);
-  assert.ok(built.advice.some((a) => /10 photos accepted since the last build/.test(a)));
-  const both = CM.spaceEstimate({ room: 'Room 214', photos: { byLight: { morning: 125 } }, scans: [{ grade: 'B', score: 80 }] });
-  assert.equal(both.score, Math.round(76 + 0.1 * 75), 'the scan (80, less 5%) and the photos (75) back each other up a little');
+  assert.match(fresh.advice[0], /^Not on the map yet: one scan graded B or better/);
+  assert.match(CM.spaceEstimate({ room: 'Room 3', scans: [{ grade: 'A' }] }).advice[0], /The scan looks good: process it/);
+  assert.match(CM.spaceEstimate({ room: 'Room 2', builds: [{ photos: 60, placed: 40, reprojError: 2, preset: 'quick' }] }).advice[0], /^On the map, but (none|rough|fair|not enough yet)/i);
+  const built = CM.spaceEstimate({ room: 'Snall', builds: [snall] });
+  assert.deepEqual([built.score, built.source, built.band.id, built.advice], [99, 'built', 'excellent', []]);
+  assert.match(CM.spaceEstimate({ room: 'Snall', builds: [{ ...snall, gradeScore: 80 }] }).advice[0], /Good\. A new scan graded A could make it Excellent/);
 
   // Completion by floor area: footprint × floors (the club's count, else OpenStreetMap's, else 2).
   const hay = CM.floorArea({ levels: 4, area: 5476 });
@@ -1712,7 +1582,7 @@ test('campus model: quality bands, photo curve, light mixing, scans, builds, siz
   assert.deepEqual(cov.byFloor.map((f) => [f.floor, f.spaces, +(f.share * 100).toFixed(2)]), [['1', 2, 7.85], ['2', 1, 2.74], ['', 1, 0]], 'floor by floor, as a share of the footprint; no floor given goes last');
   assert.equal(CM.buildingCoverage([{ score: 90, area: 5000 }], CM.floorArea({ area: 1000, levels: 1 })).completion, 1, 'never more than all of it');
   assert.deepEqual([0, 0.004, 0.01, 0.049, 0.05, 0.2, 0.5, 1].map((x) => CM.completionBin(x)), [0, 1, 2, 2, 3, 4, 5, 5]);
-  assert.equal(CM.completionBin(0, true), 1, 'photos waiting for review count as started');
+  assert.equal(CM.completionBin(0, true), 1, 'a scan waiting for review counts as started');
   assert.deepEqual([0, 0.0004, 0.0027, 0.024, 0.24, 1.2].map(CM.pctText), ['0%', '<0.1%', '0.3%', '2.4%', '24%', '100%']);
   assert.equal(CM.SIZES[CM.sizeOf('Main lobby')].area, 400);
   assert.deepEqual(['Main lobby', 'Room 214', 'Study room 3', 'Classroom 101', 'Reading room', 'Ballroom foyer', 'Arizona Ballroom', '2nd floor hallway'].map(CM.sizeOf),
@@ -1720,27 +1590,29 @@ test('campus model: quality bands, photo curve, light mixing, scans, builds, siz
   assert.ok(CM.spaceEstimate({ room: 'Room 12', kind: 'large', photos: { byLight: { morning: 125 } } }).score < CM.GOOD, 'a size the club sets changes the photo rule too');
 });
 
-const campusLib = await import('../station/lib/campus.mjs');
 await (async () => {
   const workDir = mkdtempSync(join(tmpdir(), 'campus-'));
   const buildings = new Map(asuList.map((b) => [b.code, b]));
-  for (const t of ['profiles', 'photos', 'captures', 'missions']) fake.db[t].clear();
+  for (const t of ['captures', 'missions']) fake.db[t].clear();
   const U = '00000000-0000-4000-8000-0000000000c1';
   fake.db.profiles.set(U, { user_id: U, handle: 'Map_Tester', banned: false });
   const hl = buildings.get('hayden-library');
-  const noon = Date.UTC(2026, 10, 3, 20, 0), evening = Date.UTC(2026, 10, 4, 1, 0); // 13:00 and 18:00 in Phoenix
-  const add = (i, o) => {
-    const id = `ca000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
-    fake.db.photos.set(id, { id, user_id: U, created_at: new Date(o.t + 6e4).toISOString(), taken_at: new Date(o.t).toISOString(), building_code: 'hayden-library', building_name: 'Hayden Library',
-      floor: '1', room: 'Main Lobby', session: 's1', device: 'Pixel 8', lat: hl.c[0], lon: hl.c[1], gps_accuracy_m: 9, status: 'accepted', reviewed_at: new Date(o.t + 864e5).toISOString(), ...o, t: undefined });
-  };
-  for (let i = 0; i < 160; i++) add(i, { t: noon + i * 1000 });
-  for (let i = 160; i < 200; i++) add(i, { t: evening + i * 1000 });
-  for (let i = 200; i < 205; i++) add(i, { t: noon, status: 'new', reviewed_at: null });
-  fake.db.captures.set('c-1', { id: 'c-1', user_id: U, created_at: new Date(noon).toISOString(), building_code: 'memorial-union', building_name: 'Memorial Union', floor: '2', room: 'Ballroom foyer', photo_count: 380, grade: 'B', status: 'approved', lat: null, lon: null });
+  const day3 = Date.UTC(2026, 10, 3, 20, 0); // 1 pm on Nov 3 in Phoenix
+  const scan = (id, o) => fake.db.captures.set(id, { id, user_id: U, created_at: new Date(day3).toISOString(), building_code: 'hayden-library', building_name: 'Hayden Library', floor: '1', room: 'Main Lobby',
+    photo_count: 400, grade: 'A', status: 'new', points: 0, reviewed_at: null, lat: hl.c[0], lon: hl.c[1], gps_accuracy_m: 9, ...o });
+  scan('cv-1', {}); // sent, not on this PC yet
+  scan('cv-2', { building_code: 'memorial-union', building_name: 'Memorial Union', floor: '2', room: 'Ballroom foyer', status: 'approved', points: 40, reviewed_at: new Date(day3 + 864e5).toISOString(), lat: null, lon: null });
+  scan('cv-3', { status: 'rejected', room: 'Reading room' }); // not approved: left out
   const library = [
+    // Your own scan, built on this PC: on the map as it is.
     { path: 'Hayden Library/Main lobby/2026-11-01_1200', building: 'Hayden Library', room: 'Main lobby', stamp: '2026-11-01_1200',
       info: { building: 'Hayden Library', room: 'main lobby', created: new Date(Date.UTC(2026, 10, 1, 19)).toISOString(), photos: 300, placed: 290, colmap: { reprojError: 0.7, mode: 'sfm' }, training: { preset: 'standard', splats: 1e6 }, capture: null } },
+    // A member's scan, approved.
+    { path: 'Memorial Union/Ballroom foyer/2026-11-04_1000', building: 'Memorial Union', room: 'Ballroom foyer', stamp: '2026-11-04_1000',
+      info: { building: 'Memorial Union', room: 'Ballroom foyer', level: '2', created: new Date(Date.UTC(2026, 10, 4, 17)).toISOString(), photos: 400, placed: 400, colmap: { reprojError: 0.6, mode: 'sfm' }, training: { preset: 'standard' }, capture: { grade: 'A', score: 92 }, club: { id: 'cv-2', buildingCode: 'memorial-union', contributor: 'Map_Tester' } } },
+    // A member's scan, built and waiting for your review: shown, not counted.
+    { path: 'Hayden Library/Study room 3/2026-11-05_1000', building: 'Hayden Library', room: 'Study room 3', stamp: '2026-11-05_1000',
+      info: { building: 'Hayden Library', room: 'Study room 3', level: '2', created: new Date(Date.UTC(2026, 10, 5, 17)).toISOString(), photos: 240, placed: 240, colmap: { reprojError: 0.5, mode: 'sfm' }, training: { preset: 'standard' }, capture: { grade: 'A', score: 92 }, club: { id: 'cv-4', buildingCode: 'hayden-library', contributor: 'Map_Tester' } } },
     { path: 'Practice/Demo classroom/2026-10-19_1836', building: 'Practice', room: 'Demo classroom', stamp: '2026-10-19_1836', info: { building: 'Practice', room: 'Demo classroom', photos: 309, placed: 309 } },
   ];
   const jobs = [{ id: 'j1', status: 'waiting', building: 'Old Main', room: 'Main hall', summary: { photos: 140 }, source: { name: 'Old_Main_Main_hall.zip' } }];
@@ -1748,56 +1620,55 @@ await (async () => {
   assert.deepEqual(campusLib.loadSettings(workDir), { since: null, floors: { 'hayden-library': 5 }, sizes: {} });
   assert.throws(() => campusLib.saveSize(workDir, 'x|1|y', 'enormous'), /Unknown size/);
 
-  const d = await campusLib.campusData({ club: { url: FAKE_URL, key: 'sb_secret_test' }, library, jobs, buildings, workDir });
+  const club = { url: FAKE_URL, key: 'sb_secret_test' };
+  const d = await campusLib.campusData({ club, library, jobs, buildings, workDir });
   assert.deepEqual(d.notes, []);
-  const lobby = d.spaces.find((x) => x.code === 'hayden-library');
-  assert.equal(d.spaces.filter((x) => x.code === 'hayden-library').length, 1, 'photos and the built splat of "Main Lobby" / "main lobby" are one space');
-  assert.deepEqual([lobby.photos.accepted, lobby.photos.pending, lobby.photos.byLight.afternoon, lobby.photos.byLight.evening], [200, 5, 160, 40]);
-  assert.equal(lobby.kind, 'large');
-  assert.equal(lobby.builds.length, 1);
-  assert.equal(lobby.source, 'built', 'its splat (290 of 300 photos placed) beats what the 200 club photos in mixed light promise');
-  assert.ok(lobby.score > lobby.photos.score);
-  assert.ok(lobby.advice.some((a) => /200 photos accepted since the last build/.test(a)), lobby.advice.join(' / '));
-  assert.ok(lobby.advice.some((a) => /5 photos are waiting for review/.test(a)));
-  assert.equal(lobby.photos.effective, 165 + 0.25 * 40, 'the 5 waiting for review count already: 165 at noon, 40 in the evening');
-  assert.equal(lobby.contributors[0].handle, 'Map_Tester');
+  assert.equal(d.spaces.filter((x) => x.code === 'hayden-library' && /lobby/i.test(x.room)).length, 1, 'a member’s scan of "Main Lobby" and your splat of "main lobby" are one space');
+  const lobby = d.spaces.find((x) => x.code === 'hayden-library' && /lobby/i.test(x.room));
+  assert.deepEqual([lobby.onMap, lobby.scans.length, lobby.waiting, lobby.source, lobby.kind], [1, 1, 0, 'built', 'large'], 'your own splat counts; the member’s scan waits');
+  assert.ok(lobby.advice.some((a) => /1 scan from members isn’t built yet/.test(a)), lobby.advice.join(' / '));
+  const study = d.spaces.find((x) => x.room === 'Study room 3');
+  assert.deepEqual([study.onMap, study.waiting, study.score, study.covered], [0, 1, 0, 0], 'built, but waiting for your review: not counted');
+  assert.match(study.advice[0], /^1 splat is waiting for your review/);
+  const mu = d.spaces.find((x) => x.code === 'memorial-union');
+  assert.deepEqual([mu.onMap, mu.score, mu.floor, mu.contributors.map((x) => x.handle)], [1, 92, '2', ['Map_Tester']], 'a member’s approved splat counts');
+  assert.ok(!d.spaces.some((x) => x.room === 'Reading room'), 'a scan not approved is left out');
+  const om = d.spaces.find((x) => x.code === 'old-main');
+  assert.deepEqual([om.jobs.length, om.score], [1, 0], 'a capture waiting on the dashboard shows up, but counts once it’s built');
+  assert.deepEqual([d.elsewhere.length, d.elsewhere[0].building], [1, 'Practice']);
   const hayden = d.buildings.find((b) => b.code === 'hayden-library');
   assert.deepEqual([hayden.floorArea.floors, hayden.floorArea.set, hayden.floorArea.area], [5, true, 5476 * 5], 'the club’s own floor count wins');
   assert.deepEqual([lobby.size, lobby.area, lobby.areaSource], ['large', 400, 'typical'], 'a lobby, by its name');
-  assert.ok(Math.abs(hayden.completion - (400 * Math.min(1, lobby.score / 75)) / (5476 * 5)) < 1e-9);
-  assert.equal(CM.pctText(hayden.completion), '1.5%', 'one big lobby of a five-floor library');
-  assert.deepEqual(hayden.byFloor.map((f) => [f.floor, f.spaces]), [['1', 1]]);
-  assert.equal(hayden.photos, 200);
-  const mu = d.spaces.find((x) => x.code === 'memorial-union');
-  assert.deepEqual([mu.source, mu.scanScore], ['scan', 76]);
-  const om = d.spaces.find((x) => x.code === 'old-main');
-  assert.deepEqual([om.jobs.length, om.score], [1, 0], 'a capture waiting on the dashboard shows up, but counts once it’s built');
-  assert.equal(d.elsewhere.length, 1);
-  assert.equal(d.elsewhere[0].building, 'Practice');
-  const tempe = d.campuses.find((c) => c.id === 'Tempe');
+  assert.ok(Math.abs(hayden.completion - 400 / (5476 * 5)) < 1e-9, 'only splats on the map count');
+  assert.deepEqual([hayden.onMap, hayden.waiting, hayden.builds], [1, 2, 2], 'the lobby’s scan and the study room’s splat wait for you');
+  const tempe = d.campuses.find((x) => x.id === 'Tempe');
   assert.equal(tempe.started, 3);
   assert.ok(tempe.area > 1e6 && tempe.completion > 0 && tempe.completion < 0.001, `${tempe.area} m², ${tempe.completion}`);
   assert.ok(d.buildings.filter((b) => b.restricted).every((b) => b.completion === 0));
-  assert.equal(d.points.length, 205, 'every photo with a GPS reading');
+  assert.deepEqual(d.points.map((p) => [p.code, p.status]), [['hayden-library', 'new']], 'scans with a GPS reading');
   const day = d.days.find((x) => x.day === '2026-11-03');
-  assert.deepEqual([day.photos, day.accepted, day.pending, day.scans], [205, 200, 5, 1], 'days are Phoenix days: 6 pm on the 3rd is still the 3rd');
+  assert.deepEqual([day.scans, day.byLight.afternoon], [2, 2], 'days are Phoenix days');
+  assert.equal(d.days.find((x) => x.day === '2026-11-04').approved, 1);
   assert.equal(d.days.find((x) => x.day === '2026-11-01').builds, 1);
+  assert.deepEqual([d.totals.scans, d.totals.approved, d.totals.onMap, d.totals.waiting], [1, 1, 2, 1]);
   assert.equal(d.model.kinds.room.good, 125);
   assert.ok(d.model.kinds.room.curve.length > 20);
+  // What approving the study room's splat would add: its typical 20 m² (a small room), it wasn't Good before.
+  const facts = campusLib.approvalFacts(d, 'Hayden Library/Study room 3/2026-11-05_1000');
+  assert.deepEqual([facts.newArea, facts.rescan, facts.build.score], [20, false, 92]);
+  assert.equal(campusLib.approvalFacts(d, 'Hayden Library/Main lobby/2026-11-01_1200').rescan, true, 'the lobby is on the map as Good already');
 
   // A fresh start: only what arrives from then on counts (nothing is deleted), and it can be undone.
-  const club = { url: FAKE_URL, key: 'sb_secret_test' };
   campusLib.setSince(workDir, new Date(Date.UTC(2026, 10, 2)).toISOString());
   const fresh = await campusLib.campusData({ club, library, jobs, buildings, workDir });
   assert.equal(fresh.since, '2026-11-02T00:00:00.000Z');
-  assert.deepEqual(fresh.hidden, { photos: 0, scans: 0, builds: 2, jobs: 1 }, 'the splats of Oct 19 and Nov 1, and a capture with no date');
-  const freshLobby = fresh.spaces.find((x) => x.code === 'hayden-library');
-  assert.deepEqual([freshLobby.builds.length, freshLobby.source], [0, 'photos']);
-  assert.ok(fresh.buildings.find((b) => b.code === 'hayden-library').completion < hayden.completion);
-  assert.ok(!fresh.elsewhere.length && !fresh.spaces.some((x) => x.code === 'old-main'));
+  assert.deepEqual(fresh.hidden, { scans: 0, builds: 2, jobs: 1 }, 'your Nov 1 splat, the practice one, and a capture with no date');
+  const freshLobby = fresh.spaces.find((x) => x.code === 'hayden-library' && /lobby/i.test(x.room));
+  assert.deepEqual([freshLobby.onMap, freshLobby.scans.length], [0, 1]);
+  assert.equal(fresh.buildings.find((b) => b.code === 'hayden-library').completion, 0);
   campusLib.setSince(workDir, 'now');
   const blank = await campusLib.campusData({ club, library, jobs, buildings, workDir });
-  assert.deepEqual([blank.spaces.length, blank.points.length, blank.totals.photos, blank.hidden.photos], [0, 0, 0, 205], 'from now on: a blank map');
+  assert.deepEqual([blank.spaces.length, blank.points.length, blank.hidden.scans], [0, 0, 2], 'from now on: a blank map');
   campusLib.setSince(workDir, null);
   assert.equal((await campusLib.campusData({ club: null, library, jobs: [], buildings, workDir })).hidden.builds, 0, 'and back');
   assert.throws(() => campusLib.setSince(workDir, 'not a time'), /isn’t a time/);
@@ -1811,7 +1682,7 @@ await (async () => {
   const rect = { areas: [{ poly: [[0, 0], [6, 0], [6, 4], [0, 4]] }] };
   assert.equal(campusLib.measuredArea({ colmap: { mode: 'sfm-ar' }, crop: rect }), 24, 'lined up with the AR tracking: metres');
   assert.equal(campusLib.measuredArea({ colmap: { mode: 'sfm' }, crop: rect }), null, 'a COLMAP-only solve has no scale');
-  // Club photos taken with Track position have no outline: the floor measured on the splat (its walk map) counts.
+  // With no outline, the floor measured on the splat (its walk map) counts.
   assert.equal(campusLib.measuredArea({ colmap: { mode: 'ar-poses' }, floor: { area: 47.4, from: 'walk map' } }), 47, 'no outline: the floor measured on the splat');
   assert.equal(campusLib.measuredArea({ colmap: { mode: 'ar-poses' }, crop: rect, floor: { area: 47 } }), 24, 'an outline comes first');
   assert.equal(campusLib.measuredArea({ colmap: { mode: 'sfm' }, floor: { area: 47 } }), null, 'never without metres');
@@ -1820,14 +1691,13 @@ await (async () => {
     info: { created: '2026-11-05T19:00:00.000Z', photos: 200, placed: 200, colmap: { mode: 'sfm-ar', reprojError: 0.5 }, training: { preset: 'standard' }, crop: rect } }] });
   assert.deepEqual([scanned.spaces[0].area, scanned.spaces[0].areaSource, scanned.spaces[0].size], [24, 'measured', 'small'], 'its scan’s floor, not the 20 m² a study room usually is');
 
-  // Without the club database: this PC's splats only, and a note saying so.
+  // Without the club database: this PC's splats only (members' splats wait until their approval can be read), and a note saying so.
   const local = await campusLib.campusData({ club: null, library, jobs: [], buildings, workDir });
   assert.match(local.notes[0], /isn’t set up/);
-  assert.equal(local.spaces.length, 1);
-  assert.equal(local.spaces[0].source, 'built');
-  assert.equal(local.totals.photos, 0);
+  assert.deepEqual(local.spaces.map((x) => x.onMap).sort(), [0, 0, 1]);
+  assert.equal(local.totals.scans, 0);
   passed++;
-  console.log('  ok campus view: spaces from photos (waiting ones too), scans, splats and queued captures, floor area covered, a fresh start, sizes, campus totals, map points and daily activity');
+  console.log('  ok campus view: approved and own splats on the map, members’ scans and splats waiting for review, floor area covered, a fresh start, sizes, campus totals, map points and daily activity');
 })();
 
 // ---------------------------------------------------------------- campus map on the phone
@@ -1838,48 +1708,32 @@ await (async () => {
   const workDir = mkdtempSync(join(tmpdir(), 'campusmap-'));
   const buildings = new Map(asuList.map((b) => [b.code, b]));
   const c = { url: FAKE_URL, key: 'sb_secret_test' };
-  for (const t of ['photos', 'captures', 'missions', 'campus_spaces', 'campus_plans']) fake.db[t].clear();
+  for (const t of ['captures', 'missions', 'campus_spaces', 'campus_plans']) fake.db[t].clear();
   const U = '00000000-0000-4000-8000-0000000000d1';
   fake.db.profiles.set(U, { user_id: U, handle: 'Light_Seeker', banned: false });
-  const noon = Date.UTC(2026, 10, 3, 20, 0), evening = Date.UTC(2026, 10, 4, 1, 0), morning = Date.UTC(2026, 10, 4, 16, 0); // 13:00, 18:00, 09:00 in Phoenix
-  let k = 0;
-  const add = (code, floor, room, n, t, o = {}) => {
-    for (let i = 0; i < n; i++) {
-      const id = `cb000000-0000-4000-8000-${String(++k).padStart(12, '0')}`;
-      fake.db.photos.set(id, { id, user_id: U, created_at: new Date(t + i * 1000 + 6e4).toISOString(), taken_at: new Date(t + i * 1000).toISOString(), building_code: code, building_name: buildings.get(code).name,
-        floor, room, session: 's2', device: 'Pixel 8', lat: null, lon: null, status: 'accepted', reviewed_at: new Date(t + 864e5).toISOString(), ...o });
-    }
-  };
-  add('hayden-library', '2', 'Room 214', 90, evening); // one light
-  add('hayden-library', '1', 'Main lobby', 160, noon);
-  add('hayden-library', '1', 'Main lobby', 60, evening); // mostly afternoon, some evening
-  add('hayden-library', '1', 'Main lobby', 4, noon, { status: 'new', reviewed_at: null });
-  add('memorial-union', '1', 'Food court', 150, morning); // Good
-  add('cereus-hall', '1', 'Lounge', 30, noon); // a residence hall: never published
+  const row = { user_id: U, created_at: new Date().toISOString(), floor: '2', photo_count: 180, grade: 'B', status: 'new', points: 0, reviewed_at: null, lat: null, lon: null };
+  fake.db.captures.set('cm-1', { ...row, id: 'cm-1', building_code: 'hayden-library', building_name: 'Hayden Library', room: 'Room 214' }); // waiting for review
+  fake.db.captures.set('cm-2', { ...row, id: 'cm-2', building_code: 'cereus-hall', building_name: 'Cereus Hall', room: 'Lounge' }); // a residence hall: never published
+  const library = [
+    { path: 'Memorial Union/Food court/2026-11-06_1200', building: 'Memorial Union', room: 'Food court', stamp: '2026-11-06_1200',
+      info: { building: 'Memorial Union', room: 'Food court', level: '1', created: new Date().toISOString(), photos: 300, placed: 300, colmap: { mode: 'sfm', reprojError: 0.6 }, training: { preset: 'standard' }, capture: { grade: 'B', score: 80 } } },
+    { path: 'Hayden Library/Main lobby/2026-11-06_1300', building: 'Hayden Library', room: 'Main lobby', stamp: '2026-11-06_1300',
+      info: { building: 'Hayden Library', room: 'Main lobby', level: '1', created: new Date().toISOString(), photos: 150, placed: 150, colmap: { mode: 'sfm', reprojError: 1.8 }, training: { preset: 'quick' } } },
+  ];
   campusLib.saveFloors(workDir, 'memorial-union', 1);
-
-  const d = await campusLib.campusData({ club: c, library: [], jobs: [], buildings, workDir });
+  const d = await campusLib.campusData({ club: c, library, jobs: [], buildings, workDir });
   assert.equal(d.clubError, null);
-  const room = d.spaces.find((x) => x.room === 'Room 214'), lobby = d.spaces.find((x) => x.room === 'Main lobby'), food = d.spaces.find((x) => x.room === 'Food court');
-  assert.deepEqual([room.more.good, room.more.light], [33, 'evening']);
-  assert.ok(room.advice.includes('About 33 more photos in evening light would make it Good.'), 'the Campus page says the same number the phone will');
-  // Exact under the model's own rules: that many more in that light reach Good, one fewer doesn't.
-  const lobbyWith = (extra) => CM.spaceEstimate({ room: 'Main lobby', photos: { byLight: { afternoon: 164 + extra, evening: 60 }, devices: 1 } }).score; // 4 of them waiting for review
-  assert.equal(lobby.more.light, 'afternoon');
-  assert.ok(lobbyWith(lobby.more.good) >= CM.GOOD && lobbyWith(lobby.more.good - 1) < CM.GOOD, `lobby needs ${lobby.more.good}`);
-  assert.deepEqual([food.band, food.more.good, food.more.light], ['good', 0, 'morning']);
-  assert.ok(food.more.excellent > 0);
 
-  // The rows members get: counts only (no handles, member ids or GPS points), nothing in off-limits buildings.
+  // The rows members get: counts and sizes only (no handles, member ids or GPS points), nothing in off-limits buildings.
   const rows = campusLib.summaryRows(d, '2026-11-05T20:00:00.000Z');
   assert.deepEqual(rows.spaces.map((r) => r.building_code).sort(), ['hayden-library', 'hayden-library', 'memorial-union']);
-  const r214 = rows.spaces.find((r) => r.room === 'Room 214');
-  assert.deepEqual([r214.space_key, r214.floor, r214.kind, r214.area, r214.evening, r214.morning, r214.need_good, r214.need_light, r214.band], ['hayden-library|2|room 214', '2', 'room', 60, 90, 0, 33, 'evening', 'fair']);
-  assert.deepEqual([rows.spaces.find((r) => r.room === 'Main lobby').pending, rows.spaces.find((r) => r.room === 'Main lobby').area], [4, 400]);
+  const r214 = rows.spaces.find((r) => r.room === 'Room 214'), food = rows.spaces.find((r) => r.room === 'Food court');
+  assert.deepEqual([r214.builds, r214.scans, r214.score, r214.morning, r214.need_good, r214.need_light], [0, 1, 0, 0, 0, null], 'a scan waiting for review, nothing on the map yet');
+  assert.deepEqual([food.builds, food.scans, food.score, food.band, food.area], [1, 0, 80, 'good', 60]);
   assert.ok(!JSON.stringify(rows).includes('Light_Seeker') && !JSON.stringify(rows).includes(U) && !/"lat"|"lon"/.test(JSON.stringify(rows)), 'no handles, ids or GPS');
   assert.deepEqual(rows.plans, [{ building_code: 'memorial-union', floors: 1, updated_at: '2026-11-05T20:00:00.000Z' }]);
 
-  // A view built without the club's photos is never published (it would wipe the map).
+  // A view built without the club database is never published (it would wipe the map).
   await assert.rejects(campusLib.publishSummary(c, { ...d, clubError: 'timeout' }), /couldn’t be read/);
   await assert.rejects(campusLib.publishSummary(c, { ...d, club: false }), /couldn’t be read/);
   let pub = await campusLib.publishSummary(c, d);
@@ -1888,7 +1742,8 @@ await (async () => {
   // The phone: a stranger sees nothing; a member gets the summary and colours buildings as SplatStation does.
   const mem = {};
   campusMap.useCache({ get: () => mem.v || null, set: (v) => (mem.v = JSON.parse(JSON.stringify(v))) });
-  assert.equal(await clubApp.myProfile({ fresh: true }), null, 'this phone left the club earlier');
+  await clubApp.leave();
+  assert.equal(await clubApp.myProfile({ fresh: true }), null, 'this phone left the club');
   let sm = await campusMap.load();
   assert.deepEqual([sm.spaces.length, sm.plans.length], [0, 0], 'not a member: nothing');
   await clubApp.join('Map_Fox', 'CLUB-TEST');
@@ -1898,20 +1753,18 @@ await (async () => {
   const phone = campusMap.summarize(asuList, sm);
   for (const b of d.buildings.filter((x) => !x.restricted)) {
     const p = phone.find((x) => x.code === b.code);
-    assert.ok(Math.abs(p.completion - b.completion) < 1e-9 && Math.abs(p.covered - b.covered) < 1e-9 && p.floorArea.area === b.floorArea.area && p.good === b.good, `${b.name}: phone ${p.completion} of ${p.floorArea.area} m², station ${b.completion} of ${b.floorArea.area} m²`);
+    assert.ok(Math.abs(p.completion - b.completion) < 1e-9 && Math.abs(p.covered - b.covered) < 1e-9 && p.floorArea.area === b.floorArea.area && p.good === b.good, `${b.name}: phone ${p.completion}, station ${b.completion}`);
   }
-  const mu = phone.find((x) => x.code === 'memorial-union'), hl = phone.find((x) => x.code === 'hayden-library'), cereus = phone.find((x) => x.code === 'cereus-hall');
+  const mu = phone.find((x) => x.code === 'memorial-union'), hl = phone.find((x) => x.code === 'hayden-library');
   assert.deepEqual([mu.floorArea.floors, mu.floorArea.set, mu.completion, campusMap.completionBin(mu)], [1, true, 60 / 8061, 1], 'the club’s count of 1 floor; one Good room of 60 m² in 8,061 m²');
-  assert.deepEqual(hl.byFloor.map((f) => f.floor), ['1', '2']);
-  assert.ok(cereus.restricted && cereus.completion === 0 && !cereus.spaces.length);
-  assert.equal(campusMap.completionBin(phone.find((x) => x.code === 'old-main')), 0, 'no photos yet');
-  assert.equal(campusMap.needText(hl.spaces.find((x) => x.room === 'Room 214')), 'About 33 more photos in evening light (4–8 pm) would make it Good.');
-  assert.match(campusMap.needText(mu.spaces[0]), /^Good already\. About \d+ more in morning light \(6–11 am\) would make it Excellent\.$/);
-  assert.equal(campusMap.needText({ score: 0, need_good: 123, need_light: null }), 'About 123 photos in one kind of light would make it Good.');
-  assert.deepEqual(campusMap.closestToGood(phone, { light: 'evening' }).map((p) => p.x.room), ['Room 214'], 'what to shoot in the evening');
-  const todo = campusMap.closestToGood(phone);
-  assert.deepEqual(todo.map((p) => p.x.room).sort(), ['Main lobby', 'Room 214']);
-  assert.ok(todo[0].x.need_good <= todo[1].x.need_good, 'fewest photos to Good first');
+  assert.equal(campusMap.completionBin(phone.find((x) => x.code === 'old-main')), 0);
+  assert.equal(campusMap.BIN_LABELS[0], 'Not on the map yet');
+  assert.equal(campusMap.needText(hl.spaces.find((x) => x.room === 'Room 214')), 'A scan of it is waiting for the club’s review.');
+  assert.match(campusMap.needText(hl.spaces.find((x) => x.room === 'Main lobby')), /^On the map, but rough: a new scan graded A or B/);
+  assert.equal(campusMap.needText(mu.spaces[0]), 'Good. A new scan graded A could make it Excellent.');
+  assert.equal(campusMap.needText({ score: 0, builds: 0, scans: 0 }), 'Not scanned yet.');
+  assert.deepEqual(campusMap.notGoodYet(phone).map((p) => p.x.room), ['Main lobby'], 'spaces a better scan would improve');
+  assert.equal(campusMap.scanUrl('hayden-library', '2', 'Room 214'), '#/setup?building=hayden-library&floor=2&room=Room+214');
   const near = campusMap.nearby(phone, { lat: mu.c[0], lon: mu.c[1], acc: 10 }, { within: 300 });
   assert.equal(near[0].b.code, 'memorial-union');
   assert.ok(near.every((p) => !p.b.restricted && p.dist <= 300));
@@ -1931,10 +1784,10 @@ await (async () => {
   assert.ok(Math.abs(oldPhone.find((x) => x.code === 'hayden-library').completion - d.buildings.find((x) => x.code === 'hayden-library').completion) < 1e-9);
   assert.equal((await campusLib.publishSummary(c, d)).legacy, false, 'once it has run, sizes go again');
 
-  // Publishing again replaces it: a space whose photos were all rejected goes, and so does a floor count set back.
-  for (const p of fake.db.photos.values()) if (p.room === 'Room 214') p.status = 'rejected';
+  // Publishing again replaces it: a space whose only scan was turned down goes, and so does a floor count set back.
+  fake.db.captures.get('cm-1').status = 'rejected';
   campusLib.saveFloors(workDir, 'memorial-union', null);
-  pub = await campusLib.publishSummary(c, await campusLib.campusData({ club: c, library: [], jobs: [], buildings, workDir }));
+  pub = await campusLib.publishSummary(c, await campusLib.campusData({ club: c, library, jobs: [], buildings, workDir }));
   assert.deepEqual([pub.spaces, fake.db.campus_spaces.size, fake.db.campus_plans.size], [2, 2, 0]);
   assert.ok([...fake.db.campus_spaces.values()].every((x) => x.updated_at === pub.at));
   campusLib.savePublished(workDir, { ...pub, by: 'button' });
@@ -1942,7 +1795,7 @@ await (async () => {
   assert.equal(campusLib.loadPublished(workDir).spaces, 2);
   // A fresh start empties the members' map too.
   campusLib.setSince(workDir, 'now');
-  pub = await campusLib.publishSummary(c, await campusLib.campusData({ club: c, library: [], jobs: [], buildings, workDir }));
+  pub = await campusLib.publishSummary(c, await campusLib.campusData({ club: c, library, jobs: [], buildings, workDir }));
   assert.deepEqual([pub.spaces, fake.db.campus_spaces.size], [0, 0]);
   campusLib.setSince(workDir, null);
 
@@ -1953,7 +1806,340 @@ await (async () => {
   globalThis.fetch = online;
   assert.ok(sm.offline && sm.spaces.length === 3, 'the earlier copy, marked offline');
   passed++;
-  console.log('  ok campus map (phone): SplatStation publishes counts, sizes and needs per space, members read them, floor area covered matches the Campus page (with or without campus-2.sql), stale rows go, offline keeps the last copy');
+  console.log('  ok campus map (phone): SplatStation publishes counts and sizes per space (approved splats, scans in review), members read them, floor area covered matches the Campus page (with or without campus-2.sql), stale rows go, offline keeps the last copy');
+})();
+
+// ---------------------------------------------------------------- building view: captures on a building's footprint
+const CMOD = await import('../station/lib/colmapmodel.mjs');
+const PLACE = await import('../station/web/place.js');
+const PLACEMENT = await import('../station/lib/placement.mjs');
+
+/** COLMAP's pose of a photo taken at C looking along fwd with the image's top along up: world-to-camera quaternion and translation. */
+function colmapPose(C, fwd, up) {
+  const nrm = (v) => v.map((x) => x / Math.hypot(...v));
+  const cr = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const z = nrm(fwd), x = nrm(cr(z, up)), y = cr(z, x); // camera axes in the world: right, down, forward
+  const [[m00, m01, m02], [m10, m11, m12], [m20, m21, m22]] = [x, y, z];
+  let q;
+  const tr = m00 + m11 + m22;
+  if (tr > 0) {
+    const s = Math.sqrt(tr + 1) * 2;
+    q = [0.25 * s, (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s];
+  } else if (m00 > m11 && m00 > m22) {
+    const s = Math.sqrt(1 + m00 - m11 - m22) * 2;
+    q = [(m21 - m12) / s, 0.25 * s, (m01 + m10) / s, (m02 + m20) / s];
+  } else if (m11 > m22) {
+    const s = Math.sqrt(1 + m11 - m00 - m22) * 2;
+    q = [(m02 - m20) / s, (m01 + m10) / s, 0.25 * s, (m12 + m21) / s];
+  } else {
+    const s = Math.sqrt(1 + m22 - m00 - m11) * 2;
+    q = [(m10 - m01) / s, (m02 + m20) / s, (m12 + m21) / s, 0.25 * s];
+  }
+  const t = [x, y, z].map((r) => -(r[0] * C[0] + r[1] * C[1] + r[2] * C[2]));
+  return { q, t, fwd: z, up: y.map((v) => -v) };
+}
+
+/** A small COLMAP model: two lenses, three photos (written out of name order; one with no 2-D points, one with 1,500), five points. */
+function colmapScene() {
+  const cams = [{ id: 1, model: 'PINHOLE', w: 1920, h: 860, params: [1374.76, 1374.1, 960, 430] }, { id: 2, model: 'SIMPLE_RADIAL', w: 860, h: 1920, params: [1374, 430, 960, 0.01] }];
+  const shots = [
+    { id: 3, cam: 1, name: '0003.jpg', C: [-1, 0.15, 0.5], fwd: [0, -1, 0], up: [0, 0, -1], n2: 3 }, // looking at the floor
+    { id: 1, cam: 1, name: '0001.jpg', C: [0.5, 0.1, -0.3], fwd: [0, 0, -1], up: [0, 1, 0], n2: 1500 },
+    { id: 2, cam: 2, name: 'p1/0002.jpg', C: [2, 0.2, -1], fwd: [1, -0.3, -1], up: [0, 1, 0], n2: 0 },
+  ].map((s) => ({ ...s, ...colmapPose(s.C, s.fwd, s.up) }));
+  const pts = [[0, -1.5, 0, 2, 0.5], [1, 0.8, -2, 3, 0.8], [2, 0, -2, 2, 9], [-1, -1.5, 1, 5, 0.3], [3, 1, -1.5, 2, 0.6]].map(([x, y, z, L, err], i) => ({ id: i + 1, xyz: [x, y, z], rgb: [10 * i, 200 - i, 7], err, track: Array.from({ length: L }, (_, k) => [1 + (k % 3), k]) }));
+  return { cams, shots, pts };
+}
+
+function writeColmap(dir, m, format) {
+  mkdirSync(dir, { recursive: true });
+  const ids = { SIMPLE_PINHOLE: 0, PINHOLE: 1, SIMPLE_RADIAL: 2 };
+  if (format === 'txt') {
+    writeFileSync(join(dir, 'cameras.txt'), `# Camera list with one line of data per camera:\n#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n# Number of cameras: ${m.cams.length}\n` + m.cams.map((c) => `${c.id} ${c.model} ${c.w} ${c.h} ${c.params.join(' ')}`).join('\n') + '\n');
+    writeFileSync(join(dir, 'images.txt'), `# Image list with two lines of data per image:\n#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n#   POINTS2D[] as (X, Y, POINT3D_ID)\n# Number of images: ${m.shots.length}\n`
+      + m.shots.map((s) => `${s.id} ${s.q.join(' ')} ${s.t.join(' ')} ${s.cam} ${s.name}\n${Array.from({ length: s.n2 }, (_, k) => `${k} ${k + 0.5} -1`).join(' ')}`).join('\n') + '\n');
+    writeFileSync(join(dir, 'points3D.txt'), `# 3D point list with one line of data per point:\n#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n# Number of points: ${m.pts.length}\n`
+      + m.pts.map((p) => `${p.id} ${p.xyz.join(' ')} ${p.rgb.join(' ')} ${p.err} ${p.track.flat().join(' ')}`).join('\n') + '\n');
+    return;
+  }
+  const u64 = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return b; };
+  const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v); return b; };
+  const i32 = (v) => { const b = Buffer.alloc(4); b.writeInt32LE(v); return b; };
+  const f64 = (...v) => { const b = Buffer.alloc(8 * v.length); v.forEach((x, k) => b.writeDoubleLE(x, 8 * k)); return b; };
+  writeFileSync(join(dir, 'cameras.bin'), Buffer.concat([u64(m.cams.length), ...m.cams.flatMap((c) => [u32(c.id), i32(ids[c.model]), u64(c.w), u64(c.h), f64(...c.params)])]));
+  writeFileSync(join(dir, 'images.bin'), Buffer.concat([u64(m.shots.length), ...m.shots.flatMap((s) => [u32(s.id), f64(...s.q, ...s.t), u32(s.cam), Buffer.from(s.name + '\0'), u64(s.n2),
+    ...Array.from({ length: s.n2 }, (_, k) => Buffer.concat([f64(k, k + 0.5), u64(k % 5)]))])]));
+  writeFileSync(join(dir, 'points3D.bin'), Buffer.concat([u64(m.pts.length), ...m.pts.flatMap((p) => [u64(p.id), f64(...p.xyz), Buffer.from(p.rgb), f64(p.err), u64(p.track.length), ...p.track.flatMap(([a, b]) => [u32(a), u32(b)])])]));
+}
+
+await (async () => {
+  const m = colmapScene(), dir = mkdtempSync(join(tmpdir(), 'ssm-'));
+  writeColmap(join(dir, 'bin'), m, 'bin');
+  writeColmap(join(dir, 'txt'), m, 'txt');
+  const bin = await CMOD.readModel(join(dir, 'bin')), txt = await CMOD.readModel(join(dir, 'txt'));
+  assert.deepEqual([bin.format, txt.format], ['bin', 'txt']);
+  for (const md of [bin, txt]) {
+    assert.deepEqual(md.images.map((i) => i.name), ['0001.jpg', '0003.jpg', 'p1/0002.jpg'], 'sorted by name, subfolders kept');
+    for (const im of md.images) {
+      const s = m.shots.find((x) => x.name === im.name);
+      near(im.C, s.C, 1e-9, `${im.name} centre`);
+      near(im.fwd, s.fwd, 1e-9, `${im.name} looks`);
+      near(im.up, s.up, 1e-9, `${im.name} up`);
+      assert.equal(im.cameraId, s.cam);
+    }
+    assert.equal(md.points.n, 5);
+    assert.deepEqual([...md.points.track], [2, 3, 2, 5, 2]);
+    near([...md.points.xyz.slice(9, 12)], [-1, -1.5, 1], 1e-6, 'a point');
+    assert.deepEqual([...md.points.rgb.slice(3, 6)], [10, 199, 7]);
+    assert.equal(md.cameras.get(2).model, 'SIMPLE_RADIAL');
+  }
+  assert.equal(bin.images.find((i) => i.name === '0001.jpg').points2D, 1500, 'a photo’s 2-D points are skipped, not lost track of');
+  assert.deepEqual([...bin.points.err], [...txt.points.err], 'text and binary agree');
+  const l1 = CMOD.lensOf(bin.cameras.get(1)), l2 = CMOD.lensOf(bin.cameras.get(2));
+  near([l1.tanX, l1.tanY, l2.tanX, l2.tanY], [960 / 1374.76, 430 / 1374.1, 430 / 1374, 960 / 1374], 1e-12, 'lenses');
+  assert.equal((await CMOD.readModel(join(dir, 'bin'), { points: false })).points, null);
+
+  // Thinning: a room's floor and two walls, plus strays far off and badly seen points.
+  const P = [], C = [], T = [], E = [];
+  const add = (x, y, z, t = 2 + (P.length % 9), e = 0.5) => { P.push(x, y, z); C.push(100, 120, 140); T.push(t); E.push(e); };
+  for (let i = 0; i < 40000; i++) add(Math.random() * 6, 0, Math.random() * 4);
+  for (let i = 0; i < 10000; i++) add(Math.random() * 6, Math.random() * 2.6, 0);
+  for (let i = 0; i < 8000; i++) add(0, Math.random() * 2.6, Math.random() * 4);
+  for (let i = 0; i < 30; i++) add(400 + i, 50, -300);
+  for (let i = 0; i < 50; i++) add(3, 1, 2, 9, 10); // in the room, but seen badly
+  const raw = { n: T.length, xyz: Float32Array.from(P), rgb: Uint8Array.from(C), err: Float32Array.from(E), track: Uint32Array.from(T) };
+  const th = CMOD.thinPoints(raw, { max: 3000 });
+  assert.ok(th.n <= 3000 && th.n > 1500 && th.voxel > 0.02, `thinned to ${th.n} points with ${th.voxel.toFixed(3)} m voxels`);
+  let x0 = Infinity, x1 = -Infinity, far = 0, bad = 0;
+  for (let i = 0; i < th.n; i++) {
+    x0 = Math.min(x0, th.xyz[i * 3]);
+    x1 = Math.max(x1, th.xyz[i * 3]);
+    if (Math.abs(th.xyz[i * 3]) > 20) far++;
+    if (th.xyz[i * 3] === 3 && th.xyz[i * 3 + 1] === 1 && th.xyz[i * 3 + 2] === 2) bad++;
+  }
+  assert.deepEqual([far, bad], [0, 0], 'strays and badly seen points are left out');
+  assert.ok(x0 < 0.15 && x1 > 5.85, 'and the room keeps its size');
+  const two = CMOD.thinPoints({ n: 3, xyz: Float32Array.from([0, 0, 0, 0.001, 0, 0, 5, 0, 0]), rgb: new Uint8Array(9), track: Uint32Array.from([2, 9, 3]) }, { max: 2 });
+  assert.deepEqual([...two.xyz.filter((_, i) => i % 3 === 0)].sort(), [0.0010000000474974513, 5], 'the best-seen point stands for its voxel');
+  const packed = CMOD.unpackPoints(CMOD.packPoints(th));
+  assert.equal(packed.n, th.n);
+  assert.deepEqual([...packed.xyz.slice(0, 6)], [...th.xyz.slice(0, 6)]);
+  assert.deepEqual([...packed.rgb.slice(-3)], [...th.rgb.slice(-3)]);
+  assert.ok(CMOD.planSample(th, 500).length <= 1000, 'a floor-plan sample of at most 500 points');
+  passed++;
+  console.log('  ok building view: COLMAP models read the same as text or binary (lenses, photo centres and directions, points), thinned for the browser');
+})();
+
+test('building view: placing a capture on a footprint (frames, two-point fit, guesses, floors, coverage)', () => {
+  // A frame around a point: metres east and north, and back.
+  const f = PLACE.localFrame([33.419111, -111.930622]);
+  const ll = f.toLatLon([25, -40]);
+  near(f.toXY(ll), [25, -40], 1e-6, 'lat/lon round trip');
+  // A 20 × 10 m building, given clockwise: its footprint comes back counter-clockwise, 200 m².
+  const k = 111320 * Math.cos((33.419111 * Math.PI) / 180);
+  const b = { c: [33.419111, -111.930622], poly: [[0, 0], [10, 0], [10, 20], [0, 20]].map(([n, e]) => [33.419111 + n / 110540, -111.930622 + e / k]) };
+  const fp = PLACE.footprintOf(b);
+  assert.ok(PLACE.signedArea(fp) > 0 && Math.abs(PLACE.polygonArea(fp) - 200) < 0.01, 'counter-clockwise, 200 m²');
+  near([PLACE.footprintAngle(fp)], [0], 1e-9, 'walls run east–west and north–south');
+
+  // Seen from above, a model is never mirrored: model x is east and −z is north before turning.
+  const pl0 = { s: 1, theta: 0, e: 0, n: 0, floor: 1, floorY: 0 };
+  near(PLACE.planOf(pl0, 1, 0), [1, 0], 1e-12, 'x → east');
+  near(PLACE.planOf(pl0, 0, -1), [0, 1], 1e-12, '−z → north');
+  near(PLACE.dirOf(pl0, [0, 0, -1]), [0, 1, 0], 1e-12, 'a photo looking along −z looks north');
+  near(PLACE.planOf({ ...pl0, theta: Math.PI / 2 }, 1, 0), [0, 1], 1e-12, 'a quarter turn left takes east to north');
+  const pl = { s: 1.7, theta: 0.65, e: 12, n: -5, floor: 3, floorY: -1.4 };
+  for (const [x, z] of [[0, 0], [3.2, -1.1], [-7, 4]]) near(PLACE.modelOf(pl, ...PLACE.planOf(pl, x, z)), [x, z], 1e-9, 'there and back');
+  near([PLACE.heightOf(pl, -1.4), PLACE.heightOf(pl, 0.6)], [8, 8 + 1.7 * 2], 1e-12, 'floor 3 starts 8 m up; the model is scaled');
+  near(PLACE.toBuilding({ ...pl0, floor: 2, floorY: -1.5 }, [1, 0, -2]), [1, 2, 5.5], 1e-12);
+
+  // Two clicked pairs give the placement back exactly; a model in metres keeps its scale.
+  const a = [1, -2], c2 = [4, 3], to = (p) => PLACE.planOf(pl, ...p);
+  const fit = PLACE.fitPoints([[a, to(a)], [c2, to(c2)]]);
+  near([fit.s, fit.theta, fit.e, fit.n, fit.rms], [1.7, 0.65, 12, -5, 0], 1e-9, 'two pairs fit exactly');
+  const truth = { s: 1, theta: -0.4, e: 3, n: 7 }, noisy = [[0, 0], [5, 0], [5, -3], [0, -3]].map((p, i) => [p, PLACE.planOf(truth, ...p).map((v, j) => v + (i + j) % 2 * 0.04 - 0.02)]);
+  const fixed = PLACE.fitPoints(noisy, { scale: 1 });
+  assert.ok(fixed.s === 1 && Math.abs(fixed.theta + 0.4) < 0.01 && fixed.rms < 0.05, 'scale held at 1, turn found from clicks a few cm off');
+  assert.equal(PLACE.fitPoints([[a, [0, 0]]]), null, 'one pair can’t give a turn');
+  assert.equal(PLACE.fitPoints([[a, [0, 0]], [a, [5, 5]]]), null, 'nor two clicks on the same spot');
+  near(PLACE.planOf(PLACE.moveTo(pl, a, [50, 60]), ...a), [50, 60], 1e-9, 'one pair moves it');
+  const about = [2, 2], turned = PLACE.turnAbout(pl, 0.3, about), sc = PLACE.scaleAbout(pl, 2, about);
+  const fixedPt = PLACE.modelOf(pl, ...about);
+  near(PLACE.planOf(turned, ...fixedPt), about, 1e-9, 'turning keeps its centre');
+  near(PLACE.planOf(sc, ...fixedPt), about, 1e-9, 'and so does scaling');
+  near([turned.theta, sc.s], [0.95, 3.4], 1e-12);
+
+  // Which way walls run: the building's outline, and a room's points seen from above (both mod 90°).
+  const rot = (p, t) => [p[0] * Math.cos(t) - p[1] * Math.sin(t), p[0] * Math.sin(t) + p[1] * Math.cos(t)];
+  near([PLACE.footprintAngle(fp.map((p) => rot(p, -0.5)))], [-0.5], 1e-9);
+  const room = [];
+  for (let i = 0; i < 400; i++) {
+    const t = i / 400;
+    for (const p of [[t * 5, 0], [t * 5, 4], [0, t * 4], [5, t * 4]]) room.push(...rot([p[0] + (Math.random() - 0.5) * 0.02, p[1] + (Math.random() - 0.5) * 0.02], 0.4));
+  }
+  for (let i = 0; i < 300; i++) room.push(...rot([Math.random() * 5, Math.random() * 4], 0.4)); // clutter
+  assert.ok(Math.abs(PLACE.wallAngle(room) - 0.4) < 0.01, `walls found at ${(PLACE.wallAngle(room) * 180 / Math.PI).toFixed(1)}°`);
+  near([PLACE.wrap90(Math.PI / 2 + 0.1), PLACE.wrap90(-0.9)], [0.1, Math.PI / 2 - 0.9], 1e-12);
+
+  // First guesses: a GPS fix 30 m outside lands just inside; captures without GPS are spread out; walls line up.
+  const g = PLACE.guessPlacement({ footprint: fp, gps: [-30, 5], anchor: [0, 0], wall: 0.4, floor: 2 });
+  assert.ok(PLACE.inside(fp, g.e, g.n) && g.from === 'gps' && g.floor === 2, 'GPS outside the outline → inside it');
+  near([PLACE.wrap90(g.theta + 0.4 - PLACE.footprintAngle(fp))], [0], 1e-9, 'turned so its walls run with the building’s');
+  const g0 = PLACE.guessPlacement({ footprint: fp, anchor: [1, 1], index: 0, count: 2 }), g1 = PLACE.guessPlacement({ footprint: fp, anchor: [1, 1], index: 1, count: 2 });
+  assert.ok(g0.from === 'none' && Math.hypot(g0.e - g1.e, g0.n - g1.n) > 5, 'two captures without GPS don’t pile up');
+  assert.ok([g0, g1].every((x) => PLACE.inside(fp, ...PLACE.planOf(x, 1, 1))), 'both inside');
+
+  assert.deepEqual(['1', '2nd', 'Floor 3', 'G', 'Ground', 'B1', 'B2', 'Basement', 'L4', '', null, 'Roof'].map(PLACE.floorNumber), [1, 2, 3, 1, 1, 0, -1, 0, 4, null, null, null]);
+
+  // How much of a floor was photographed: one photo in the middle covers a 1.5 m disc; an outline covers its area.
+  const one = PLACE.floorCoverage(fp, [{ cams: [[10, 5]] }]); // the middle of the 20 m (east) × 10 m (north) footprint
+  assert.ok(Math.abs(one.area - Math.PI * 1.5 * 1.5) < 1.2 && Math.abs(one.footprint - 200) < 1e-9, `${one.area} m² around one photo`);
+  const half = PLACE.floorCoverage(fp, [{ cams: [], outlines: [[[0, 0], [10, 0], [10, 10], [0, 10]]] }]);
+  near([half.share], [0.5], 1e-9, 'an outline over half the floor');
+  assert.equal(PLACE.floorCoverage(fp, [{ cams: [[100, 100]] }]).area, 0, 'photos outside the building don’t count');
+
+  assert.equal(PLACE.cleanPlacement({ s: 0, theta: 0, e: 0, n: 0, floor: 1 }), null);
+  assert.equal(PLACE.cleanPlacement({ s: 1, theta: 0, e: 'x', n: 0, floor: 1 }), null);
+  near([PLACE.cleanPlacement({ s: 1, theta: 7, e: 1, n: 2, floor: '2' }).theta], [7 - 2 * Math.PI], 1e-12, 'turns kept within ±180°');
+});
+
+await (async () => {
+  // A made-up library: one capture of Schwada with its job's COLMAP model, one whose job folder is gone.
+  const ws = mkdtempSync(join(tmpdir(), 'ssb-')), lib = join(ws, 'library'), jobsDir = join(ws, 'jobs');
+  const buildings = new Map(asuList.map((b) => [b.code, b]));
+  const code = 'schwada-classroom-office-building', sb = buildings.get(code);
+  const splats = [];
+  for (let x = -2; x <= 3; x += 0.25) for (let z = -2; z <= 2; z += 0.25) splats.push({ x, y: -1.5, z, a: 0.8, sc: [0.05, 0.01, 0.05], q: [1, 0, 0, 0] });
+  const item = (room, stamp, info) => {
+    const folder = join(lib, 'Schwada Building', room, stamp);
+    mkdirSync(folder, { recursive: true });
+    writeWalkPly(join(folder, 'scene.ply'), splats);
+    writeFileSync(join(folder, 'info.json'), JSON.stringify(info));
+    return { building: 'Schwada Building', room, stamp, path: `Schwada Building/${room}/${stamp}`, info };
+  };
+  const view = { position: [0.5, 0.1, -0.3], lookAt: [0.5, 0.1, -1.8], up: [0, 1, 0] };
+  const A = item('Room 101', '2026-11-01_1200', { building: 'Schwada Building', room: 'Room 101', jobId: 'job1', created: '2026-11-01T19:00:00Z', view, colmap: { mode: 'ar-poses' }, crop: { areas: [{ poly: [[-2, -2], [3, -2], [3, 2], [-2, 2]], floorY: -1.5 }] } });
+  const B = item('Lobby', '2026-10-01_0900', { building: 'Schwada Building', room: 'Lobby', jobId: 'gone', created: '2026-10-01T16:00:00Z', view, colmap: { mode: 'ar-poses' } });
+  const other = item('Practice', '2026-10-02_0900', { building: 'Practice', room: 'Practice', jobId: 'x', colmap: { mode: 'sfm' } });
+  writeColmap(join(jobsDir, 'job1', 'train', 'sparse', '0'), colmapScene(), 'bin');
+  // Its capture: on floor 2, with a GPS fix 30 m west of the building's middle (outside it).
+  const gps = PLACE.localFrame(sb.c).toLatLon([-60, 0]);
+  mkdirSync(join(jobsDir, 'job1', 'dataset'), { recursive: true });
+  writeFileSync(join(jobsDir, 'job1', 'dataset', 'splatscout.json'), JSON.stringify({ capture: { buildingCode: code, floor: '2', geo: { lat: gps[0], lon: gps[1], acc: 12 } } }));
+  campusLib.saveFloors(ws, code, 4);
+  const library = [A, B, other];
+  const look = () => PLACEMENT.buildingView({ code, buildings, library, libraryDir: lib, jobsDir, workDir: ws });
+
+  let v = await look();
+  assert.deepEqual([v.building.floors, v.building.floorsSet, v.captures.map((c) => c.room)], [4, true, ['Lobby', 'Room 101']], 'its captures, oldest first, and the club’s floor count');
+  let a = v.captures[1];
+  assert.deepEqual([a.source, a.cams.length, a.metric, a.floorY, a.floorFrom, a.floorGiven, a.outlines.length, a.slot], ['colmap', 3, true, -1.5, 'outline', 2, 1, 1]);
+  near(a.cams[0].slice(0, 3), [0.5, 0.1, -0.3], 1e-3, 'photo centres in the model (AR: not turned)');
+  assert.ok(a.lenses.length === 2 && a.cams.every((r) => r.length === 10), 'two lenses, so each photo says which');
+  assert.ok(a.guess && a.guess.from === 'gps' && a.guess.floor === 2 && PLACE.inside(v.building.footprint, a.guess.e, a.guess.n), 'guessed at its GPS fix, inside the outline, on its floor');
+  assert.ok(existsSync(join(lib, 'Schwada Building', 'Room 101', '2026-11-01_1200', PLACEMENT.CAMERAS_FILE)) && PLACEMENT.pointsFileOf(lib, A.path), 'cached beside the splat');
+  const b = v.captures[0];
+  assert.deepEqual([b.source, b.cams.length, b.guess.from], ['splat', 0, 'none'], 'no job folder: the splat’s own points, no cameras');
+  assert.ok(b.points > 100 && b.start, 'its points and where its first photo was taken');
+  near([b.floorY], [-1.5], 0.02, 'the floor from its lowest points');
+
+  // The club places it; campus.json keeps its other settings.
+  PLACEMENT.savePlacement(ws, A.path, { s: 1, theta: 0.3, e: 5, n: -3, floor: 3 });
+  v = await look();
+  a = v.captures[1];
+  assert.deepEqual([a.placement.e, a.placement.floor, a.guess, campusLib.loadSettings(ws).floors[code]], [5, 3, undefined, 4], 'placed, and the floor count is still there');
+  assert.throws(() => PLACEMENT.savePlacement(ws, A.path, { s: -1 }), /placement/);
+  // Deleting its job folder keeps its cameras: they were cached.
+  const { rmSync: removeDir } = await import('node:fs');
+  removeDir(join(jobsDir, 'job1'), { recursive: true, force: true });
+  v = await look();
+  assert.deepEqual([v.captures[1].source, v.captures[1].cams.length], ['colmap', 3], 'camera positions outlive the job folder');
+  PLACEMENT.savePlacement(ws, A.path, null);
+  assert.ok(!(await look()).captures[1].placement, 'and a placement can be forgotten');
+  mkdirSync(join(ws, 'outside'), { recursive: true });
+  writeWalkPly(join(ws, 'outside', 'scene.ply'), splats.slice(0, 3));
+  assert.equal(PLACEMENT.libraryFolderOf(lib, '../outside'), null, 'nothing outside the library');
+  assert.ok(PLACEMENT.libraryFolderOf(lib, '../library/Schwada Building/Lobby/2026-10-01_0900'), 'a way round that stays inside is fine');
+  assert.equal(PLACEMENT.libraryFolderOf(lib, 'Schwada Building/Lobby'), null, 'only splat folders');
+  passed++;
+  console.log('  ok building view: a building’s captures with their cameras, cached beside each splat (they outlive the job), guessed at GPS, placed by the club in campus.json, the splat’s points when the model is gone');
+})();
+
+// ---- review: snapping a new capture onto the ones already placed, like a jigsaw piece
+/** Points on a corridor's surfaces (floor, both walls, and a short partition) between e0 and e1, in building metres. */
+function corridorScan(e0, e1, perM2, stub = 5) {
+  const pts = [], jit = () => (Math.random() - 0.5) * 0.02;
+  const area = (a, b) => Math.round(a * b * perM2);
+  for (let i = 0; i < area(e1 - e0, 3); i++) pts.push(e0 + Math.random() * (e1 - e0), Math.random() * 3, jit()); // floor (h = 0)
+  for (const n of [0, 3]) for (let i = 0; i < area(e1 - e0, 2.6); i++) pts.push(e0 + Math.random() * (e1 - e0), n + jit(), Math.random() * 2.6); // side walls
+  if (stub > e0 && stub < e1) for (let i = 0; i < area(1, 2.6); i++) pts.push(stub + jit(), Math.random(), Math.random() * 2.6); // a partition 1 m long
+  return pts;
+}
+
+test('building view: snapping a capture onto its placed neighbours (a turn, a shift and a rise only)', () => {
+  // A is placed (e 0–6 m); B, scanned on another day, runs on to e = 10 and overlaps A between 4 and 6 m, where the
+  // partition at e = 5 pins it along the corridor. B is in the right place when its placement is the identity.
+  const A = corridorScan(0, 6, 200), B = corridorScan(4, 10, 80);
+  const model = []; // B's model points (x, y, z) = (e, h, −n): what its COLMAP model would hold
+  for (let i = 0; i < B.length; i += 3) model.push([B[i], B[i + 2], -B[i + 1]]);
+  const right = { s: 1, theta: 0, e: 0, n: 0, floor: 1, floorY: 0, dh: 0 };
+  // Dropped in by hand: 3° out, 30 cm along, 20 cm across, 4 cm too high.
+  const wrong = { ...PLACE.turnAbout(right, 0.052, [7, 1.5]), floor: 1, floorY: 0 };
+  Object.assign(wrong, { e: wrong.e + 0.3, n: wrong.n - 0.2, dh: 0.04 });
+  const at = (pl) => Float32Array.from(model.flatMap((p) => PLACE.toBuilding(pl, p)));
+  const r = PLACE.snapPoints(at(wrong), Float32Array.from(A));
+  assert.ok(r.ok, r.reason);
+  const fixed = PLACE.applySnap(wrong, r);
+  assert.ok(Math.abs(fixed.theta) < 0.004 && Math.hypot(fixed.e, fixed.n) < 0.03 && Math.abs(fixed.dh) < 0.015, `snapped to θ ${(fixed.theta * 180 / Math.PI).toFixed(2)}°, (${fixed.e.toFixed(3)}, ${fixed.n.toFixed(3)}), rise ${fixed.dh.toFixed(3)}`);
+  // (Two scans never sample a wall at the same spots: at these densities about 3 cm apart is a perfect fit.)
+  assert.ok(r.before.rms > r.rms && r.rms < 0.045 && r.overlap > 0.2 && r.overlap > r.before.overlap, `fit ${r.before.rms.toFixed(3)} → ${r.rms.toFixed(3)} m over ${(r.overlap * 100).toFixed(0)}% of its points`);
+  const f = PLACE.fitOf(at(right), Float32Array.from(A));
+  assert.ok(f.rms < 0.045 && f.overlap > 0.2 && Math.abs(f.rms - r.rms) < 0.005, 'where it belongs, it fits as well as the snap made it');
+  // Nothing to snap to: too far from A, or asked for more than a nudge.
+  const far = PLACE.snapPoints(at({ ...wrong, e: wrong.e + 25 }), Float32Array.from(A));
+  assert.ok(!far.ok && /overlap/.test(far.reason), far.reason);
+  const big = PLACE.snapPoints(at(wrong), Float32Array.from(A), { maxTurn: 0.001 });
+  assert.ok(!big.ok && /nudge/.test(big.reason), 'more than a nudge is refused');
+  assert.ok(!PLACE.snapPoints(at(wrong), new Float32Array(0)).ok, 'nothing placed: nothing to snap to');
+  // The rise is kept in the placement (and saved), within half a metre.
+  near([PLACE.heightOf({ ...right, dh: 0.2 }, 1)], [1.2], 1e-12);
+  assert.deepEqual([PLACE.cleanPlacement({ s: 1, theta: 0, e: 0, n: 0, floor: 1, dh: 3 }).dh, PLACE.cleanPlacement({ s: 1, theta: 0, e: 0, n: 0, floor: 1 }).dh], [0.5, 0]);
+});
+
+await (async () => {
+  // Lighter copies of a splat for the building view: the most important splats inside the capture's box, as .splat rows.
+  const { splatLod, readSplat, quatOf } = await import('../station/lib/splatlod.mjs');
+  const props = ['x', 'y', 'z', 'f_dc_0', 'f_dc_1', 'f_dc_2', 'opacity', 'scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3'];
+  const logit = (a) => Math.log(a / (1 - a));
+  const splats = [ // [x, y, z, opacity, size]
+    [0.2, 0.1, -0.3, 0.9, 0.08], // big and opaque: kept
+    [0.5, 0.5, 0.5, 0.6, 0.01], // small: left out when only two fit
+    [5, 0, 0, 0.95, 0.3], // outside the box
+    [0, 0, 0.1, 0.01, 0.2], // nearly see-through
+    [-0.4, 0.2, 0.6, 0.7, 0.05], // medium: kept
+  ];
+  const head = `ply\nformat binary_little_endian 1.0\nelement vertex ${splats.length}\n${props.map((p) => `property float ${p}\n`).join('')}end_header\n`;
+  const body = Buffer.alloc(splats.length * props.length * 4);
+  splats.forEach(([x, y, z, a, s], i) => [x, y, z, 1, -0.5, 0, logit(a), Math.log(s), Math.log(s / 2), Math.log(s / 4), 1, 0, 0, 0].forEach((v, k) => body.writeFloatLE(v, (i * props.length + k) * 4)));
+  const dir = mkdtempSync(join(tmpdir(), 'ssl-')), ply = join(dir, 'scene.ply'), out = join(dir, 'scene.lod.splat');
+  writeFileSync(ply, Buffer.concat([Buffer.from(head, 'latin1'), body]));
+  const r = await splatLod({ ply, out, max: 2, box: [-1, -1, -1, 1, 1, 1] });
+  assert.deepEqual([r.count, r.kept, readFileSync(out).length], [5, 2, 64]);
+  const rows = readSplat(readFileSync(out));
+  near([rows[0].x, rows[0].y, rows[0].z, rows[1].x], [0.2, 0.1, -0.3, -0.4], 1e-6, 'the two that count most, in file order');
+  near(rows[0].scale, [0.08, 0.04, 0.02], 1e-6, 'sizes in metres, not logs');
+  const C0 = 0.28209479177387814;
+  assert.deepEqual(rows[0].rgba, [Math.round((0.5 + C0) * 255), Math.round((0.5 - 0.5 * C0) * 255), 128, Math.round(0.9 * 255)], 'colour from its first spherical harmonic, opacity as alpha');
+  near(rows[0].rot, [1, 0, 0, 0], 0.01, 'its turn');
+  // A model that isn't upright (COLMAP alone) is levelled like its points: a quarter turn about x.
+  const R = [1, 0, 0, 0, 0, -1, 0, 1, 0];
+  await splatLod({ ply, out, max: 5, rot: R });
+  const turned = readSplat(readFileSync(out));
+  near([turned[0].x, turned[0].y, turned[0].z], [0.2, 0.3, 0.1], 1e-6, 'centre turned');
+  near(turned[0].rot, quatOf(R), 0.01, 'and its own turn with it');
+  assert.equal(turned.length, 4, 'the see-through one is always left out');
+  passed++;
+  console.log('  ok building view: lighter copies of a splat (the most important splats in its box, levelled, as .splat rows)');
 })();
 
 globalThis.fetch = realFetch;

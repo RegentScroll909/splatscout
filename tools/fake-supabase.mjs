@@ -84,22 +84,23 @@ export function createFake() {
   const restricted = (code) => db.restricted_buildings.has(code);
 
   // ---- views
+  // As supabase-scans-only.sql has them: points and counts from approved scans (photos stays, always 0).
   const leaderboard = (since = 0) => {
     const pts = new Map();
-    const add = (row, kind) => {
-      const e = pts.get(row.user_id) || { points: 0, photos: 0, scans: 0 };
-      e.points += row.points;
-      e[kind]++;
-      pts.set(row.user_id, e);
-    };
-    for (const p of db.photos.values()) if (p.status === 'accepted' && (!since || Date.parse(p.reviewed_at) >= since)) add(p, 'photos');
-    for (const c of db.captures.values()) if (['approved', 'processed'].includes(c.status) && (!since || Date.parse(c.reviewed_at) >= since)) add(c, 'scans');
+    for (const c of db.captures.values()) {
+      if (c.status !== 'approved' || (since && !(Date.parse(c.reviewed_at) >= since))) continue;
+      const e = pts.get(c.user_id) || { points: 0, photos: 0, scans: 0 };
+      e.points += c.points;
+      e.scans++;
+      pts.set(c.user_id, e);
+    }
     return [...db.profiles.values()].filter((p) => !p.banned)
       .map((p) => ({ handle: p.handle, ...(pts.get(p.user_id) || { points: 0, photos: 0, scans: 0 }) }))
       .sort((a, b) => b.points - a.points || a.handle.localeCompare(b.handle));
   };
+  const norm = (s) => String(s || '').trim().toLowerCase();
   const missionsOpen = () => [...db.missions.values()].filter((m) => m.active && (!m.ends_at || Date.parse(m.ends_at) > db.clock()))
-    .map((m) => ({ ...m, done: [...db.photos.values()].filter((p) => p.status === 'accepted' && p.mission_id === m.id).length }));
+    .map((m) => ({ ...m, done: [...db.captures.values()].filter((c) => c.status === 'approved' && c.building_code === m.building_code && (!m.room || norm(c.room) === norm(m.room)) && Date.parse(c.created_at) >= Date.parse(m.created_at || 0)).length }));
 
   async function handle(req) {
     const url = new URL(req.url);
@@ -182,13 +183,14 @@ export function createFake() {
         for (const row of rows) {
           if (!admin) {
             if (!['photos', 'captures'].includes(name)) return json({ code: '42501', message: `permission denied for table ${name}` }, 403);
+            // supabase-scans-only.sql: no new single photos, and a scan only when it's graded A or B.
+            if (name === 'photos' || !['A', 'B'].includes(row.grade)) return rls(name);
             if (!member(uid) || restricted(row.building_code) || row.status !== 'uploading' || (row.points || 0) !== 0 || row.reviewed_at || row.review_note) return rls(name);
-            if (name === 'photos' && [...db.photos.values()].filter((x) => x.user_id === uid && db.clock() - Date.parse(x.created_at) < 864e5).length >= 400) return rls(name);
             row.user_id = uid;
           }
           if (map.has(row[pk]) && !(req.headers.get('prefer') || '').includes('merge-duplicates')) return json({ code: '23505', message: 'duplicate key value violates unique constraint' }, 409);
           const defaults = name === 'photos' ? { points: 0, file_removed: false, review_note: null, reviewed_at: null }
-            : name === 'captures' ? { points: 0, reviewed_at: null }
+            : name === 'captures' ? { points: 0, reviewed_at: null, review_note: null }
             : name === 'missions' ? { id: crypto.randomUUID(), detail: '', light: 'any', bonus: 2, wanted: 20, active: true, floor: '', room: '', building_code: null, ends_at: null }
             : name === 'invites' ? { label: '', max_uses: 25, uses: 0, active: true }
             : {};

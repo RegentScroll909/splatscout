@@ -4,10 +4,13 @@
 //    plus a shift). It's the identity until something goes wrong.
 //  * After tracking was lost, after an impossible jump in the pose, or when the AR reference space
 //    resets, photos pause while the next second of depth is checked against the map. If it still
-//    fits, capture carries on; if not, the scan is searched for where the phone really is.
+//    fits, capture carries on; if not, it offers to keep scanning as a new part (session.js
+//    startNewPart) instead of making you search: the parts are joined on the PC, from the photos.
+//  * While a part hasn't been lined up with the earlier scan, it is searched for in the background
+//    (watch), without holding photos. When it's found, the coverage map is put back together.
 //  * While capturing, recent depth is compared with older parts of the map every few seconds, so
 //    slow drift is corrected before it smears the coverage map.
-//  * A new AR session (resuming a capture) starts by searching the whole scan.
+//  * Searching while photos wait (begin) is left for the Align tool and "Find my place".
 //  * Along a plain hallway depth can't tell one stretch from the next: the camera image is compared
 //    with the photos taken there earlier (photomatch.js), which can.
 
@@ -21,13 +24,17 @@ const SEARCH_INTERVAL = 0.8; // s between solves while searching
 const DRIFT_INTERVAL = 2.5; // s between drift checks
 const OLD_MAP = 6; // s: drift is checked against map parts at least this old
 const MIN_MAP = 150; // solid voxels: below this there's nothing worth protecting
+const CHECK_TIME = 4; // s the quick check after a loss may take before a new part is offered
+const BG_INTERVAL = 2.5; // s between background solves (each takes ~50-300 ms on the main thread)
+const BG_MIN = 6; // depth frames from different spots before a background solve is worth trying
 
 export class Relocalizer {
   /** @param {import('./session.js').CaptureSession} session */
   constructor(session) {
     this.s = session;
     this.xf = { yaw: 0, t: [0, 0, 0] };
-    this.mode = null; // null | 'check' (holding photos while verifying) | 'search'
+    this.mode = null; // null | 'check' (holding photos while verifying) | 'offer' (a new part is offered) | 'search'
+    this.bg = null; // background search for an earlier map (see watch)
     this.state = null; // search state for the UI
     this.recent = []; // latest depth frames (live coordinates) for drift checks
     this.images = []; // camera images since the check or search started (live coordinates)
@@ -82,7 +89,12 @@ export class Relocalizer {
       if (moved > Math.max(0.3, 3 * dt) || turned > Math.max(20, 600 * dt)) reason = reason || 'jump';
     }
     this.prevRaw = raw;
-    if (reason && !this.mode && this._mapSize() >= MIN_MAP) this._startCheck(reason, raw, t);
+    if (reason && !this.mode) {
+      if (this._mapSize() >= MIN_MAP) this._startCheck(reason, raw, t);
+      // Nothing to check against (no depth, or a part that has only just started), but photos were
+      // taken in it: carrying on could put the next ones somewhere else entirely. Offer a new part.
+      else if (this.s.partPhotos() >= 5) this.pending = this._offer(reason, t);
+    }
     if (!this.mode) this.lastGood = fi.pose.slice();
   }
 
@@ -93,28 +105,28 @@ export class Relocalizer {
     this.recent.push(f);
     if (this.recent.length > 8) this.recent.shift();
     const st = this.state;
-    if (this.mode && st) {
-      const last = st.frames[st.frames.length - 1];
-      const moved = !last || v3.dist(posePosition(last.pose), posePosition(raw)) > 0.03 || rotationDelta(last.pose, raw) > 4 * DEG;
-      if (moved) st.frames.push(f);
-      else st.frames[st.frames.length - 1] = f;
-      if (st.frames.length > 30) st.frames.shift();
-    }
+    if (this.mode && st) keepMoved(st.frames, f, 30);
+    // The background search works in this part's own coordinates (what's shown while it isn't lined
+    // up): a quick check after another loss keeps those steady, where the raw AR frame may jump.
+    if (!this.mode && this.bg) keepMoved(this.bg.frames, { ...f, pts: g.xyz, pose: xfPose(this.xf, raw) }, 24);
   }
 
   /** A camera image (photomatch.liveImage) while checking or searching. */
   addImage(img) {
     if (!this.mode || !img.raw) return;
-    const last = this.images[this.images.length - 1];
-    const moved = !last || v3.dist(posePosition(last.raw), posePosition(img.raw)) > 0.05 || rotationDelta(last.raw, img.raw) > 6 * DEG;
-    if (moved) this.images.push(img);
-    else this.images[this.images.length - 1] = img;
-    if (this.images.length > 3) this.images.shift();
+    keepImage(this.images, img);
   }
 
-  /** Earlier photos of this map and the latest camera images, or null without enough of either. */
+  /** A camera image for the background search, its pose in this part's coordinates (as shown). */
+  addBgImage(img) {
+    if (this.mode || !this.bg || !img.raw) return;
+    keepImage(this.bg.imgs, img);
+  }
+
+  /** Earlier photos of the map shown and the latest camera images, or null without enough of either. */
   _photo() {
-    const keys = this.s.photoKeys ? this.s.photoKeys.filter((k) => k.space === this.s.space) : [];
+    const space = this.s.viewSpace != null ? this.s.viewSpace : this.s.space;
+    const keys = this.s.photoKeys ? this.s.photoKeys.filter((k) => k.space === space) : [];
     return keys.length >= 3 && this.images.length ? { keys, imgs: this.images.slice() } : null;
   }
 
@@ -126,8 +138,18 @@ export class Relocalizer {
 
   /** Per frame: run checks and solves when they're due. Returns an event or null. */
   tick(t) {
+    if (this.pending) {
+      const ev = this.pending;
+      this.pending = null;
+      return ev;
+    }
     if (this.mode === 'check') return this._tickCheck(t);
+    if (this.mode === 'offer') return this._tickOffer(t);
     if (this.mode === 'search') return this._tickSearch(t);
+    if (this.bg && this.s.recording) {
+      const ev = this._tickBg(t);
+      if (ev) return ev;
+    }
     if (t - this.lastDrift > DRIFT_INTERVAL && this.s.recording && !this.s.paused) {
       this.lastDrift = t;
       return this._driftCheck(t);
@@ -165,10 +187,39 @@ export class Relocalizer {
 
   _tickCheck(t) {
     const st = this.state;
-    if (st.frames.length < 4) {
-      if (t - st.t0 > 6) return this._startSearch(st.reason, st.priors, t);
-      return null;
-    }
+    const r = this._tryFit(t);
+    if (r && r.type) return r;
+    // It doesn't line up (or there's too little to tell): offer to carry on as a new part at once.
+    if (r === 'fail' || t - st.t0 > CHECK_TIME) return this._offer(st.reason, t);
+    return null;
+  }
+
+  /** While the new part is offered, keep checking: aimed at something you scanned, it may fit after all. */
+  _tickOffer(t) {
+    const r = this._tryFit(t);
+    return r && r.type ? r : null;
+  }
+
+  /** Photos wait while "Keep scanning (new part)" is offered (UI: captureScreen's offer card). */
+  _offer(reason, t) {
+    const st = this.state || {};
+    this.mode = 'offer';
+    this.state = {
+      ...st, reason, t0: st.t0 || t, frames: st.frames || [], priors: st.priors || [], status: 'offer', confidence: 0, offered: t, lastTry: 0,
+      kept: st.kept || { ...this.xf, t: this.xf.t.slice() }, stayed: st.stayed || null,
+    };
+    this.log.push({ t, kind: 'offer', reason });
+    return { type: 'newPartOffer', reason };
+  }
+
+  /**
+   * Fit the latest depth to the map under the hypotheses that ARCore kept its coordinates, or moved
+   * them while the phone stayed put. Returns an event when it lines up for sure, 'fail' when it
+   * doesn't, or null while there's too little to tell (or it's too soon to try again).
+   */
+  _tryFit(t) {
+    const st = this.state;
+    if (st.frames.length < 4) return null;
     if (st.lastTry && t - st.lastTry < 0.5) return null;
     st.lastTry = t;
     const frames = st.frames.slice(-8);
@@ -200,10 +251,8 @@ export class Relocalizer {
     }
     const good = fits.filter((f) => f.ok);
     if (!good.length) {
-      // Nothing fits: the live depth sees through mapped walls or lands off them. Search properly.
-      if (fits.length && fits.every((f) => f.r.through0 > 0.2 || f.r.inlierFrac < 0.4)) return this._startSearch(st.reason, st.priors, t);
-      if (t - st.t0 > 6) return this._startSearch(st.reason, st.priors, t);
-      return null;
+      // Nothing fits: the live depth sees through mapped walls or lands off them.
+      return fits.length && fits.every((f) => f.r.through0 > 0.2 || f.r.inlierFrac < 0.4) ? 'fail' : null;
     }
     // Both fit (a hallway): when the photos clearly prefer the other one, the coordinates did move.
     let pick = good[0];
@@ -214,13 +263,13 @@ export class Relocalizer {
     }
     // Only carry straight on when nothing moved: ARCore kept its coordinates and the view still fits
     // where it was, confirmed by the photos (along a hallway, the photo match peaks right there).
-    // Anything that needs a correction gets the full search: a few seconds longer, but it compares far
-    // more of the view, while over a narrow view a turn and a slide can pass for each other.
+    // Anything that needs a correction is a new part: over a narrow view a turn and a slide can pass
+    // for each other, and a wrong guess would put every photo after it in the wrong place.
     const still = pick.kept && pick.r.delta.dist < 0.05 && pick.r.delta.yaw < 1;
     const sure = still && (!photo
       ? !good.some((g) => g !== pick && xfDelta(g.x, pick.x, at).dist > 0.15)
       : pick.r.weakDir ? pick.placed && pick.slid < 0.06 : pick.ph == null || pick.ph >= 0.5);
-    if (!sure) return this._startSearch(st.reason, st.priors, t);
+    if (!sure) return 'fail';
     const cm = Math.round(xfDelta(pick.x, st.kept, at).dist * 100);
     this.xf = pick.x;
     this._end();
@@ -249,8 +298,7 @@ export class Relocalizer {
       }
       if (++this.misses >= 2) {
         this.misses = 0;
-        const raw = frames[frames.length - 1].pose;
-        return this._startSearch('drift', [{ xf: { ...this.xf, t: this.xf.t.slice() }, radius: 1.5, yawRange: 25 }], t, raw);
+        return this._offer('drift', t);
       }
       return null;
     }
@@ -410,10 +458,62 @@ export class Relocalizer {
     return this._lock(x, t, null);
   }
 
-  /** Give up on lining up: carry on in this session's own coordinates (a new map). */
-  abandon() {
+  /** Carry on as a new part: its coordinates are the AR frame as it is now, and its map starts empty. */
+  newPart() {
     this.xf = { yaw: 0, t: [0, 0, 0] };
     this._end();
+    this.pending = null;
+    this.recent = [];
+    this.clock = [];
+    this.images = [];
+    this.lossT = 0;
+    this.lastGood = null;
+    this.misses = 0;
+    this.pendingDrift = null;
+  }
+
+  /**
+   * Keep looking for where this part is in an earlier map, in the background: photos carry on, and
+   * nothing is held. When it's found, tick() returns {type: 'partsLinked', xf} (this part's
+   * coordinates → the map's), for the coverage map only.
+   * @param {{voxels, space, floorY}} target the earlier map
+   */
+  watch(target, t = 0) {
+    this.bg = { voxels: target.voxels, space: target.space, floorY: target.floorY, plan: null, frames: [], imgs: [], lastSolve: t, lastOk: null, status: 'more', confidence: 0, tries: 0 };
+  }
+
+  unwatch() {
+    this.bg = null;
+  }
+
+  _tickBg(t) {
+    const bg = this.bg;
+    if (bg.frames.length < BG_MIN || t - bg.lastSolve < BG_INTERVAL || this.s.paused) return null;
+    bg.lastSolve = t;
+    if (!bg.plan) bg.plan = new FloorPlan(bg.voxels, bg.floorY);
+    const keys = this.s.photoKeys ? this.s.photoKeys.filter((k) => k.space === bg.space) : [];
+    const photo = keys.length >= 3 && bg.imgs.length ? { keys, imgs: bg.imgs.slice() } : null;
+    const r = solveAlignment(bg.voxels, bg.frames.slice(-12), { plan: bg.plan, floorY: bg.floorY, global: true, photo });
+    bg.tries++;
+    bg.status = r.status;
+    bg.confidence = r.confidence;
+    if (!r.ok) {
+      bg.lastOk = null;
+      return null;
+    }
+    // Found when two solves in a row, a few seconds apart, agree.
+    if (bg.lastOk) {
+      const at = posePosition(bg.frames[bg.frames.length - 1].pose);
+      const d = xfDelta(bg.lastOk, r.xf, at);
+      if (d.dist < 0.08 && d.yaw < 2) {
+        const m = r.metrics || {};
+        this.bg = null;
+        this.log.push({ t, kind: 'linked', tries: bg.tries, rms: m.rms != null ? m.rms : null, photo: m.photo, weak: m.weak });
+        return { type: 'partsLinked', xf: r.xf, metrics: r.metrics };
+      }
+    }
+    bg.lastOk = r.xf;
+    return null;
   }
 
   /** Coordinates of the current alignment for the record. */
@@ -423,6 +523,25 @@ export class Relocalizer {
 }
 
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+
+/**
+ * Keep views from different spots: each one kept is a step on (3 cm or 4°) from the one kept before it, and the
+ * newest stands in at the end until the phone has moved that far. (Comparing with the latest sample instead, a
+ * slow, steady sweep never got anywhere: two samples a fifth of a second apart are always closer than a step, so
+ * checks and searches waited for frames that never came.)
+ */
+function keepStep(list, f, max, poseOf, dist, deg) {
+  if (list.length && list[list.length - 1].standIn) list.pop();
+  const base = list[list.length - 1];
+  const step = !base || v3.dist(posePosition(poseOf(base)), posePosition(poseOf(f))) > dist || rotationDelta(poseOf(base), poseOf(f)) > deg * DEG;
+  list.push(step ? f : { ...f, standIn: true });
+  if (list.length > max) list.shift();
+}
+
+const keepMoved = (list, f, max) => keepStep(list, f, max, (x) => x.pose, 0.03, 4);
+
+/** The same for camera images (the last three from different views). */
+const keepImage = (list, img) => keepStep(list, img, 3, (x) => x.raw, 0.05, 6);
 
 function rotateAbout(x, ang, p) {
   // Turn the whole scan frame by `ang` about the vertical line through p (scan coordinates).

@@ -7,6 +7,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { run, capture } from './run.mjs';
+import { quatFromRotation } from '../../app/js/core/math.js';
 
 /**
  * Where to start a viewer: the first photo's position/direction, plus the average "up" of all
@@ -313,6 +314,155 @@ export function mergePairs(parts, across = parts.length > 2 ? 80 : 120) {
 }
 
 /**
+ * Pairs for a scan in parts (tracking was lost and it carried on as a new part, in new AR coordinates): each part
+ * with itself (neighbours in time, and pairs from its own AR poses) and against the others through thinned sets,
+ * as when merging captures, plus every photo against every other where one part ends and the next begins: a new
+ * part starts with photos of what was covered just before, which is what joins the two.
+ * @param {Array<{names: string[], frames?: Array<{name, pose}>}>} parts photo names in capture order (sorting by
+ *   name puts every photo in capture order)
+ */
+export function segmentPairs(parts, edge = 30) {
+  const set = new Set(mergePairs(parts));
+  const all = parts.flatMap((s, k) => s.names.map((n) => [n, k])).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  for (let i = 1; i < all.length; i++) {
+    const was = all[i - 1][1], now = all[i][1];
+    if (was === now) continue;
+    const before = [], after = [];
+    for (let j = i - 1; j >= 0 && before.length < edge; j--) if (all[j][1] === was) before.push(all[j][0]);
+    for (let j = i; j < all.length && after.length < edge; j++) if (all[j][1] === now) after.push(all[j][0]);
+    for (const a of before) for (const b of after) set.add(a < b ? `${a} ${b}` : `${b} ${a}`);
+  }
+  return [...set];
+}
+
+// ---- Placing a part of a scan by its own AR poses
+// Camera-to-world rotation (OpenCV axes: x right, y down, z forward, as columns) and centre of a COLMAP pose.
+function colmapCamera(qt) {
+  const [qw, qx, qy, qz, tx, ty, tz] = qt;
+  const R = [ // world-to-camera
+    [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+    [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+    [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+  ];
+  return { R: [0, 1, 2].map((i) => [0, 1, 2].map((j) => R[j][i])), C: [0, 1, 2].map((j) => -(R[0][j] * tx + R[1][j] * ty + R[2][j] * tz)) };
+}
+
+// The same for a phone's AR pose (camera-to-world 4 x 4, column-major, OpenGL axes).
+function arCamera(m) {
+  return { R: [0, 1, 2].map((i) => [m[i], -m[4 + i], -m[8 + i]]), C: [m[12], m[13], m[14]] };
+}
+
+const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+const turn = (yaw, p) => [Math.cos(yaw) * p[0] + Math.sin(yaw) * p[2], p[1], -Math.sin(yaw) * p[0] + Math.cos(yaw) * p[2]];
+
+/**
+ * Where a part of a scan sits in the model, from its photos the model has placed: a turn about the vertical and
+ * a shift taking its AR coordinates into the model's (both are AR frames in metres with gravity up, the model
+ * being in the main part's). Each placed photo gives its own turn (from how it's rotated) and shift; the ones
+ * that agree are kept, so a photo registered in the wrong place doesn't move the part.
+ * @param {Array<{name: string, pose: number[]}>} frames the part's photos with their AR poses
+ * @param {Map<string, {qt: number[]}>} images the model's photos by name
+ * @returns {{yaw: number, t: number[], inliers: number, placed: number, err: number}|null}
+ */
+export function fitPart(frames, images, { minPlaced = 4, far = 0.3, turnTol = 5 } = {}) {
+  const pairs = [];
+  for (const f of frames) {
+    const im = images.get(f.name);
+    if (!im || !f.pose) continue;
+    const a = arCamera(f.pose), m = colmapCamera(im.qt);
+    // The turn taking this photo's AR rotation onto the model's: m.R · a.Rᵀ.
+    const T = [0, 1, 2].map((i) => [0, 1, 2].map((j) => m.R[i][0] * a.R[j][0] + m.R[i][1] * a.R[j][1] + m.R[i][2] * a.R[j][2]));
+    const tilt = Math.acos(Math.max(-1, Math.min(1, T[1][1]))) * 180 / Math.PI;
+    pairs.push({ a: a.C, m: m.C, yaw: Math.atan2(T[0][2] - T[2][0], T[0][0] + T[2][2]), tilt });
+  }
+  if (pairs.length < minPlaced) return null;
+  const level = pairs.filter((q) => q.tilt < turnTol);
+  if (level.length < minPlaced) return null;
+  // The median turn, then the median shift under it, then the photos that agree with both.
+  const ref = level[0].yaw;
+  const offs = level.map((q) => wrapAngle(q.yaw - ref)).sort((x, y) => x - y);
+  const yaw0 = wrapAngle(ref + offs[offs.length >> 1]);
+  const shifts = level.map((q) => {
+    const r = turn(yaw0, q.a);
+    return [q.m[0] - r[0], q.m[1] - r[1], q.m[2] - r[2]];
+  });
+  const t0 = [0, 1, 2].map((k) => shifts.map((s) => s[k]).sort((x, y) => x - y)[shifts.length >> 1]);
+  const resid = (q, yaw, t) => {
+    const r = turn(yaw, q.a);
+    return Math.hypot(r[0] + t[0] - q.m[0], r[1] + t[1] - q.m[1], r[2] + t[2] - q.m[2]);
+  };
+  const ok = level.filter((q) => Math.abs(wrapAngle(q.yaw - yaw0)) < (turnTol * Math.PI) / 180 && resid(q, yaw0, t0) < far);
+  if (ok.length < minPlaced || ok.length < pairs.length * 0.5) return null;
+  const yaw = wrapAngle(yaw0 + ok.reduce((s, q) => s + wrapAngle(q.yaw - yaw0), 0) / ok.length);
+  const t = [0, 1, 2].map((k) => ok.reduce((s, q) => s + (q.m[k] - turn(yaw, q.a)[k]), 0) / ok.length);
+  const errs = ok.map((q) => resid(q, yaw, t)).sort((x, y) => x - y);
+  return { yaw, t, inliers: ok.length, placed: pairs.length, err: errs[errs.length >> 1] };
+}
+
+/**
+ * How far apart a COLMAP pose (QW QX QY QZ TX TY TZ) and an AR pose are: centres (m) and turn (degrees).
+ */
+export function posesApart(qt, pose) {
+  const m = colmapCamera(qt), a = arCamera(pose);
+  let tr = 0;
+  for (let i = 0; i < 3; i++) for (let k = 0; k < 3; k++) tr += m.R[k][i] * a.R[k][i];
+  return { dist: Math.hypot(m.C[0] - a.C[0], m.C[1] - a.C[1], m.C[2] - a.C[2]), deg: (Math.acos(Math.max(-1, Math.min(1, (tr - 1) / 2))) * 180) / Math.PI };
+}
+
+/** An AR pose (OpenGL camera-to-world, column-major) moved by a fit: turned about the vertical, then shifted. */
+export function movePose(fit, m) {
+  const c = Math.cos(fit.yaw), s = Math.sin(fit.yaw);
+  const out = m.slice();
+  for (const k of [0, 4, 8, 12]) {
+    out[k] = c * m[k] + s * m[k + 2];
+    out[k + 2] = -s * m[k] + c * m[k + 2];
+  }
+  out[12] += fit.t[0];
+  out[13] += fit.t[1];
+  out[14] += fit.t[2];
+  return out;
+}
+
+/** COLMAP's QW QX QY QZ TX TY TZ for an AR pose (the same conversion as the phone's export). */
+export function colmapQt(m) {
+  const c0 = [m[0], m[1], m[2]], c1 = [-m[4], -m[5], -m[6]], c2 = [-m[8], -m[9], -m[10]];
+  const q = quatFromRotation(c0[0], c0[1], c0[2], c1[0], c1[1], c1[2], c2[0], c2[1], c2[2]);
+  const C = [m[12], m[13], m[14]];
+  return [...q, ...[c0, c1, c2].map((r) => -(r[0] * C[0] + r[1] * C[1] + r[2] * C[2]))];
+}
+
+/**
+ * The model with some photos added at given poses (COLMAP text model, COLMAP 4 rigs and frames included): each
+ * photo under its database ids, as point_triangulator needs. Photos the model already has, or whose camera or rig
+ * it doesn't have, are left out.
+ * @param {{images: string, frames: string, cameras: string, rigs: string}} model
+ * @param {Array<{name: string, qt: number[]}>} add
+ * @param {Map<string, {image_id, camera_id, frame_id?, rig_id?}>} byName the database's images
+ * @returns {{images: string, frames: string, added: number}}
+ */
+export function addToModel(model, add, byName) {
+  const ids = (txt) => new Set(txt.split(/\r?\n/).filter((l) => l.trim() && !l.startsWith('#')).map((l) => l.trim().split(/\s+/)[0]));
+  const cams = ids(model.cameras), rigs = ids(model.rigs || ''), frames = ids(model.frames || '');
+  const have = new Set(imagesFromText(model.images).map((im) => im.name));
+  const imageIds = new Set();
+  model.images.split(/\r?\n/).filter((l) => !l.startsWith('#')).forEach((l, i) => i % 2 === 0 && l.trim() && imageIds.add(l.trim().split(/\s+/)[0]));
+  let images = '', fr = '', added = 0;
+  for (const { name, qt } of add) {
+    const db = byName.get(name);
+    if (!db || have.has(name) || imageIds.has(String(db.image_id)) || !cams.has(String(db.camera_id))) continue;
+    const rig = db.rig_id ?? db.camera_id, frame = db.frame_id ?? db.image_id;
+    if (model.rigs != null && !rigs.has(String(rig))) continue;
+    if (frames.has(String(frame))) continue;
+    const q = qt.map((v) => +v.toFixed(9)).join(' ');
+    images += `${db.image_id} ${q} ${db.camera_id} ${name}\n\n`;
+    fr += `${frame} ${rig} ${q} 1 CAMERA ${db.camera_id} ${db.image_id}\n`;
+    added++;
+  }
+  const end = (s) => (s && !s.endsWith('\n') ? s + '\n' : s || '');
+  return { images: end(model.images) + images, frames: end(model.frames) + fr, added };
+}
+
+/**
  * @param {object} p
  * @param {string} p.colmap path to colmap.exe
  * @param {string} p.imagesDir folder with the photos
@@ -324,6 +474,8 @@ export function mergePairs(parts, across = parts.length > 2 ? 80 : 120) {
  * @param {object|null} [p.rig] views cut from 360 video: {config} COLMAP rig configuration; the
  *   images sit in one folder per view, and p.camera holds the views' exact (PINHOLE) lens
  * @param {Array|null} [p.parts] captures being merged: [{names, camera, frames?}], one folder each
+ * @param {Array|null} [p.segments] a scan in parts (one camera; tracking was lost between them): [{names, frames,
+ *   main, part}], each part's AR poses in its own coordinates; the main part's are `posed`
  * @param {(stage:string, fraction:number, note?:string)=>void} p.progress
  * @param {(msg:string)=>void} p.say
  * @param {object} p.token cancellation token
@@ -389,7 +541,8 @@ export async function reconstruct(p) {
   let mode = p.matcher;
   if (p.parts) mode = 'merge';
   else if (mode === 'auto') mode = rig ? 'sequential' : nImages <= 700 ? 'exhaustive' : posed ? 'poses' : 'sequential';
-  say(`Matching features (${mode === 'poses' ? 'pairs chosen from AR poses' : mode === 'merge' ? 'within each capture, and across them' : mode})…`);
+  const segs = !p.parts && p.segments && p.segments.length > 1 ? p.segments : null;
+  say(`Matching features (${mode === 'poses' ? `pairs chosen from AR poses${segs ? ', within each part of the scan and across them' : ''}` : mode === 'merge' ? 'within each capture, and across them' : mode})…`);
   const onMatch = (l) => {
     // Exhaustive matching works in blocks: "Processing block [i/n, j/n]".
     const b = /block \[(\d+)\/(\d+),\s*(\d+)\/(\d+)\]/.exec(l);
@@ -402,7 +555,7 @@ export async function reconstruct(p) {
   } else if (mode === 'poses' || mode === 'merge') {
     const pairsFile = join(work, 'pairs.txt');
     const all = () => readdirSync(imagesDir).filter((f) => /\.(jpe?g|png)$/i.test(f));
-    writeFileSync(pairsFile, (mode === 'merge' ? mergePairs(p.parts) : posedPairs(posed.frames, all())).join('\n') + '\n');
+    writeFileSync(pairsFile, (mode === 'merge' ? mergePairs(p.parts) : segs ? segmentPairs(segs) : posedPairs(posed.frames, all())).join('\n') + '\n');
     await run(colmap, ['matches_importer', '--database_path', db, '--match_list_path', pairsFile, '--match_type', 'pairs',
       '--FeatureMatching.use_gpu', '1'], { log, token, onLine: onMatch });
   } else {
@@ -507,20 +660,32 @@ async function posedReconstruction(p, db, nImages) {
     // rounds: each round places the photos that see enough of what has been triangulated so far, then
     // triangulates what they add, so the next can place photos of parts the AR poses never saw. (One pass placed
     // 207 of 233 photos of a club test room; three rounds placed all of them.)
+    // The other parts of a scan (tracking was lost between them) have AR poses of their own, in their own
+    // coordinates: once a few of a part's photos are placed, they say where the part sits, and all its other
+    // photos go where its AR poses put them, plain walls included (see fitPart).
+    const parts = (p.segments || []).filter((s) => !s.main && s.frames && s.frames.length >= 3);
+    const moved = []; // those parts' AR poses, moved into the model (for the check after the last adjustment)
     if (posed.frames.length < nImages) {
-      say(`Registering ${nImages - posed.frames.length} photos that had no AR pose…`);
+      say(parts.length
+        ? `Joining the scan's other ${parts.length > 1 ? `${parts.length} parts` : 'part'} (${nImages - posed.frames.length} photos in their own AR coordinates, or without an AR pose)…`
+        : `Registering ${nImages - posed.frames.length} photos that had no AR pose…`);
       let placed = (await modelStats(colmap, tri2)).images;
-      for (let k = 1; k <= 4 && placed < nImages; k++) {
-        progress('mapping', 0.6 + 0.05 * k, `adding photos without AR poses (round ${k})`);
+      for (let k = 1; k <= (parts.length ? 6 : 4) && placed < nImages; k++) {
+        progress('mapping', 0.6 + 0.04 * k, `${parts.length ? 'joining the parts' : 'adding photos without AR poses'} (round ${k})`);
         const reg = fresh(join(work, `posed_reg${k}`)), tri = fresh(join(work, `posed_reg${k}_tri`));
         await run(colmap, ['image_registrator', '--database_path', db, '--input_path', model, '--output_path', reg], { log, token });
         await run(colmap, ['point_triangulator', '--database_path', db, '--image_path', imagesDir, '--input_path', reg,
           '--output_path', tri, '--clear_points', '0', '--refine_intrinsics', '0'], { log, token });
-        const n = (await modelStats(colmap, tri)).images;
+        let n = (await modelStats(colmap, tri)).images;
         model = tri;
+        if (parts.some((s) => !s.fit)) {
+          const r = await placeParts(p, db, model, parts, k, moved);
+          if (r) [model, n] = [r.dir, r.images];
+        }
         if (n <= placed) break;
         placed = n;
       }
+      for (const s of parts) if (!s.fit) say(`Part ${s.part || '?'} of the scan (${s.names.length} photos) couldn't be joined: too few of its photos match the rest. Its first photos should show what was scanned just before tracking was lost.`);
     }
     const fin = fresh(join(work, 'posed_final')), kept = fresh(join(work, 'posed_kept')), clean = fresh(join(work, 'posed_clean'));
     await step(0.85, 'final refinement', ['bundle_adjuster', '--input_path', model, '--output_path', fin, ...BA_ARGS]);
@@ -528,7 +693,7 @@ async function posedReconstruction(p, db, nImages) {
     // couldn't hold (in a club test, one moved 3 m on 12 points): it goes, rather than teach the splat a wrong view.
     let held = fin;
     try {
-      const strays = strayedFromAR(modelImages(fin), posed.frames);
+      const strays = strayedFromAR(modelImages(fin), [...posed.frames, ...moved]);
       if (strays.length) {
         const list = join(work, 'strayed.txt');
         writeFileSync(list, strays.join('\n') + '\n');
@@ -562,6 +727,61 @@ async function posedReconstruction(p, db, nImages) {
     say('AR-pose reconstruction failed: ' + e.message.split('\n')[0]);
     return null;
   }
+}
+
+/**
+ * Each part of the scan with enough photos placed in the model by now (and not placed yet): fit where it sits,
+ * then add its other photos at their moved AR poses and triangulate what they see. Returns the new model, or
+ * null when no part could be placed this round.
+ */
+async function placeParts(p, db, model, parts, k, moved) {
+  const { colmap, imagesDir, work, say, token, log } = p;
+  const toText = async (dir, name) => {
+    const txt = fresh(join(work, name));
+    await run(colmap, ['model_converter', '--input_path', dir, '--output_path', txt, '--output_type', 'TXT'], { log, token });
+    const read = (n) => (existsSync(join(txt, `${n}.txt`)) ? readFileSync(join(txt, `${n}.txt`), 'utf8') : null);
+    return { txt, m: { cameras: read('cameras') || '', images: read('images') || '', rigs: read('rigs'), frames: read('frames') } };
+  };
+  let { txt, m } = await toText(model, `posed_parts${k}`);
+  const images = new Map(imagesFromText(m.images).map((im) => [im.name, im]));
+  const add = [], wrong = [];
+  for (const s of parts) {
+    if (s.fit) continue;
+    const fit = fitPart(s.frames, images);
+    if (!fit) continue;
+    s.fit = fit;
+    // Photos of the part COLMAP registered far from where the part's AR poses put them were matched to a look-alike
+    // spot: along the plain walls of a real test room, a run of 23 photos landed 1-4 m off on hundreds of points
+    // each, where their AR poses, moved, were within 30 cm. They go back where their AR poses say. (Closer than
+    // that, it's the AR tracking's own drift, which the adjustment corrects.)
+    const off = s.frames.filter((f) => {
+      if (!images.has(f.name)) return false;
+      const d = posesApart(images.get(f.name).qt, movePose(fit, f.pose));
+      return d.dist > 0.6 || d.deg > 8;
+    });
+    const rest = s.frames.filter((f) => !images.has(f.name) || off.includes(f));
+    for (const f of s.frames) moved.push({ name: f.name, pose: movePose(fit, f.pose) });
+    for (const f of rest) add.push({ name: f.name, qt: colmapQt(movePose(fit, f.pose)) });
+    wrong.push(...off.map((f) => f.name));
+    say(`Part ${s.part || '?'} of the scan joined: ${fit.inliers} of its ${fit.placed} registered photos agree on where it sits (within ${Math.max(1, Math.round(fit.err * 100))} cm). Its other ${rest.length - off.length} photos go where its AR poses put them` +
+      (off.length ? `, and so do ${off.length} it had registered over 60 cm from there (matched to a look-alike spot).` : '.'));
+  }
+  if (!add.length) return null;
+  if (wrong.length) {
+    const list = join(work, `posed_parts${k}_wrong.txt`);
+    writeFileSync(list, wrong.join('\n') + '\n');
+    const kept = fresh(join(work, `posed_parts${k}_kept`));
+    await run(colmap, ['image_deleter', '--input_path', model, '--output_path', kept, '--image_names_path', list], { log, token });
+    ({ txt, m } = await toText(kept, `posed_parts${k}_b`));
+  }
+  const out = addToModel(m, add, new Map((await databaseImages(db)).map((r) => [r.name, r])));
+  if (!out.added) return null;
+  writeFileSync(join(txt, 'images.txt'), out.images);
+  if (m.frames != null) writeFileSync(join(txt, 'frames.txt'), out.frames);
+  const tri = fresh(join(work, `posed_parts${k}_tri`));
+  await run(colmap, ['point_triangulator', '--database_path', db, '--image_path', imagesDir, '--input_path', txt,
+    '--output_path', tri, '--clear_points', '0', '--refine_intrinsics', '0'], { log, token });
+  return { dir: tri, images: (await modelStats(colmap, tri)).images };
 }
 
 async function unposedReconstruction(p, db, nImages) {

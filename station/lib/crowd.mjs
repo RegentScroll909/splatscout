@@ -72,11 +72,12 @@ export async function setStatus(c, id, status) {
 const slug = (s) => (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'capture';
 
 /**
- * Download an upload into the inbox as a SplatScout ZIP (filed under the building, floor and room
- * it was uploaded as) and mark it approved. Returns the ZIP's path.
+ * Download an upload into the inbox as a SplatScout ZIP (filed under the building, floor and room it was
+ * uploaded as) and mark it 'processed': SplatStation has it, and the member sees it as being built and
+ * reviewed. Points come later, when the club approves the splat. Returns the ZIP's path.
  * @param onProgress (fraction, text)
  */
-export async function importUpload(c, id, inbox, onProgress = () => {}, award = null) {
+export async function importUpload(c, id, inbox, onProgress = () => {}) {
   const [row] = await call(c, `/rest/v1/captures?select=${COLUMNS}&id=eq.${encodeURIComponent(id)}`);
   if (!row) throw new Error('That upload is no longer in the club database');
   if (row.status === 'uploading') throw new Error('That upload hasn’t finished yet (the phone is still sending it, or stopped part way)');
@@ -107,7 +108,7 @@ export async function importUpload(c, id, inbox, onProgress = () => {}, award = 
       // File it under the building name everyone shares (the phone may have typed it differently).
       const m = JSON.parse(Buffer.from(data).toString('utf8'));
       m.capture = { ...m.capture, typedBuilding: m.capture.building, building: row.building_name, floor: row.floor, room: row.room };
-      m.club = { id: row.id, buildingCode: row.building_code, contributor: row.contributor, uploaded: row.created_at };
+      m.club = { id: row.id, buildingCode: row.building_code, contributor: row.contributor, uploaded: row.created_at, grade: row.grade || null };
       data = JSON.stringify(m, null, 1);
     }
     await zip.add(`${base}/${list.files[i].name}`, data);
@@ -121,10 +122,7 @@ export async function importUpload(c, id, inbox, onProgress = () => {}, award = 
     rmSync(tmp, { force: true });
     throw e;
   }
-  // Imported scans earn points (SplatStation decides how many from the capture's photos and grade).
-  const patch = { status: 'approved', reviewed_at: new Date().toISOString() };
-  if (award) patch.points = award({ photos: row.photo_count, grade: row.grade || '' });
-  await call(c, `/rest/v1/captures?id=eq.${encodeURIComponent(row.id)}`, { method: 'PATCH', body: patch, headers: { Prefer: 'return=minimal' } });
+  if (row.status === 'new') await setStatus(c, row.id, 'processed');
   return dest;
 }
 

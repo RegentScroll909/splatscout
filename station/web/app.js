@@ -430,7 +430,8 @@ function viewerFromPath(it) {
 // ------------------------------------------------------------------ club uploads
 // Captures phones uploaded to the club database, grouped by building. Import brings one into
 // "Ready to process" (nothing runs until you press Process there).
-const CROWD_STATUS = { uploading: ['Still uploading', 'run'], new: ['New', 'new'], approved: ['Imported', ''], processed: ['Processed', ''] };
+// Members' scans: imported ones wait for your review of their splat on the Club page (approving awards the points).
+const CROWD_STATUS = { uploading: ['Still uploading', 'run'], new: ['New', 'new'], processed: ['Imported · review on the Club page', ''], approved: ['Approved', 'done'] };
 
 async function loadCrowd() {
   const el = $('#crowd');
@@ -446,7 +447,7 @@ async function loadCrowd() {
   }
   const ups = r.uploads, busy = new Set(r.importing);
   $('#crowdCount').textContent = String(ups.filter((u) => u.status === 'new').length).padStart(2, '0') + ' new';
-  if (!ups.length) return put(el, empty('Nothing uploaded yet. Captures sent from SplatScout (Upload on the review screen) appear here, by building.'));
+  if (!ups.length) return put(el, empty('Nothing uploaded yet. Scans members send from SplatScout (graded B or better) appear here, by building. Review their splats on the Club page.'));
   const byB = new Map();
   for (const u of ups) {
     if (!byB.has(u.building_name)) byB.set(u.building_name, []);

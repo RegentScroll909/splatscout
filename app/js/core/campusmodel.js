@@ -1,15 +1,15 @@
-// How far along each space and building is, and how good a splat to expect from the photos and scans so
-// far. Rules of thumb from photogrammetry practice, checked against the club's own finished splats;
-// SplatStation's Campus page shows how every number was reached. Plain functions, no DOM, so SplatStation
-// and the phone can share them.
+// How far along each space and building is, and how good each splat is. Rules of thumb from photogrammetry
+// practice, checked against the club's own finished splats; SplatStation's Campus page shows how every number
+// was reached. Plain functions, no DOM, so SplatStation and the phone can share them.
 //
-// A space is one room or area of a building (building + floor + room, as members tag their photos).
-// Its expected quality (0–100) comes from whichever evidence is strongest:
-//   photos   accepted single photos: more photos in one kind of light help, mixed light hurts
-//   scan     a full AR scan's grade from the capture coach
+// A space is one room or area of a building (building + floor + room, as a scan is tagged). The club takes
+// full scans only, so a space's quality (0–100) comes from its splats:
 //   built    a finished splat: measured when SplatStation held photos back from its training (PSNR on
-//            them), otherwise what its photos promised, discounted for photos COLMAP couldn't place,
-//            a poor reprojection error, or the quick training preset
+//            them), otherwise what its scan's grade (or its photo count) promised, discounted for photos
+//            COLMAP couldn't place, a poor reprojection error, or the quick training preset
+//   scan     a scan's grade from the capture coach, before it is built
+// The photo-count curve (photoCurve) is the rule of thumb behind how many photos a scan of a room, a hallway or
+// a large space needs; photoEstimate still applies it to photos of one space (single photos were retired).
 // A building's completion is the share of its floor area (footprint × floors) that its spaces cover: each
 // space covers its own floor area (measured by a scan, set by the club, or typical for its size) in
 // proportion to how close it is to Good. So one small room in a big library is a fraction of a percent.
@@ -210,8 +210,7 @@ export function spaceEstimate(s, { advice = true } = {}) {
   const predicted = Math.round(clamp(Math.max(ph.score, sc.score) + (ph.score && sc.score ? 0.1 * Math.min(ph.score, sc.score) : 0)));
   const score = Math.max(predicted, built ? built.score : 0);
   const source = built && built.score >= predicted ? 'built' : !ph.score && !sc.score ? 'none' : sc.score > ph.score ? 'scan' : 'photos';
-  const pending = (s.photos && s.photos.pending) || 0;
-  return { kind, score, band: bandOf(score), source, predicted, built, photos: ph, scan: sc, advice: advice ? advise(s, { score, ph, sc, built, predicted, pending, sinceBuild: (s.photos && s.photos.sinceBuild) || 0 }) : [] };
+  return { kind, score, band: bandOf(score), source, predicted, built, photos: ph, scan: sc, advice: advice ? advise({ score, sc, built }) : [] };
 }
 
 /**
@@ -240,20 +239,13 @@ export function photosNeeded(s, target = GOOD) {
   return { n: hi, light };
 }
 
-function advise(s, { score, ph, sc, built, predicted, pending, sinceBuild }) {
+/** What would improve a space, now that the club takes full scans only. */
+function advise({ score, sc, built }) {
   const out = [];
-  if (!ph.n && !sc.score && !built) {
-    out.push(`Nothing yet. About ${photosNeeded(s, GOOD).n} photos in one kind of light, or one full scan with the AR coach (10–20 minutes), would make a good splat.`);
-  } else if (ph.n && score < EXCELLENT && !built) {
-    const need = photosNeeded(s, score < GOOD ? GOOD : EXCELLENT).n;
-    if (need > 0) out.push(`About ${need} more photos in ${ph.dominant} light would make it ${score < GOOD ? 'Good' : 'Excellent'}.`);
-  }
-  if (ph.n && ph.share < 0.7) out.push(`Photos are spread over several kinds of light. Build from the ${ph.dominant} ones, or add more in that light.`);
-  if (sc.score && sc.grade && /[CDF]/.test(sc.grade)) out.push(`The scan graded ${sc.grade}: fill the gaps the coach flagged, or add photos.`);
-  if (pending) out.push(`${pending} photo${pending === 1 ? ' is' : 's are'} waiting for review on the Club page (counted for now).`);
-  if (built && sinceBuild) out.push(`${sinceBuild} photo${sinceBuild === 1 ? '' : 's'} accepted since the last build: build it again.`);
-  if (built && built.score < predicted - 10) out.push('The last build came out below what the photos promise: check it in the viewer and build again.');
-  if (!ph.n && !built && sc.score && sc.score >= GOOD) out.push('The scan looks good: process it on the dashboard to get the splat.');
+  if (!built && !sc.score) out.push('Not on the map yet: one scan graded B or better (10–20 minutes with the capture coach) puts it there.');
+  else if (!built) out.push(sc.score >= GOOD ? 'The scan looks good: process it on the dashboard to get the splat.' : `The scan graded ${sc.grade || '?'}: fill the gaps the coach flagged, then send it again.`);
+  else if (score < GOOD) out.push(`On the map, but ${bandOf(score).label.toLowerCase()}: a new scan graded A or B would make it better.`);
+  else if (score < EXCELLENT) out.push('Good. A new scan graded A could make it Excellent.');
   return out;
 }
 

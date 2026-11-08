@@ -62,7 +62,10 @@ export async function processJob(job, ctx) {
     ctx.update({
       building: c.building || job.building,
       room: c.room || job.room,
+      floor: c.floor || job.floor || '',
       capture: { grade: manifest.score && manifest.score.grade, score: manifest.score && manifest.score.score, engine: c.engine, tracking: c.tracking, author: c.author },
+      // A member's scan from the club database: its row, so the club's review can approve the splat built from it.
+      club: manifest.club && manifest.club.id ? { id: manifest.club.id, buildingCode: manifest.club.buildingCode || null, contributor: manifest.club.contributor || null, grade: manifest.club.grade || null } : null,
     });
   }
   ctx.update({ nImages });
@@ -79,6 +82,7 @@ export async function processJob(job, ctx) {
     rig,
     parts: src.parts || null,
     lenses: src.lenses || null,
+    segments: src.segments || null,
     align: arFrames,
     matcher: cfg.matcher || 'auto',
     progress: (stage, f, note) => ctx.stage(stage, f, note),
@@ -88,6 +92,13 @@ export async function processJob(job, ctx) {
   });
   ctx.stage('mapping', 1, `${rec.stats.images}/${nImages} photos placed · ${(rec.stats.reprojError || 0).toFixed(2)} px`);
   ctx.update({ colmap: { ...rec.stats, mode: rec.mode } });
+  // A scan in parts: how much of each part made it into the one model.
+  let partsPlaced = null;
+  if (src.segments) {
+    const inModel = new Set(readCameras(rec.modelDir).map((c) => c.name));
+    partsPlaced = src.segments.map((s) => ({ part: s.part, main: s.main, photos: s.names.length, placed: s.names.filter((n) => inModel.has(n)).length }));
+    ctx.say(`Scan in ${partsPlaced.length} parts, solved as one: ${partsPlaced.map((s) => `part ${s.part}${s.main ? ' (main)' : ''} ${s.placed} of ${s.photos} photos`).join(', ')}.`);
+  }
   if (!rec.undistorted) ctx.stage('undistort', 1, 'not needed');
 
   // ---------------------------------------------------------------- training dataset
@@ -148,6 +159,9 @@ export async function processJob(job, ctx) {
   if (/^(ar-poses|sfm-ar)$/.test(rec.mode)) {
     if (src.parts) areas = partAreas(src.parts, readCameras(rec.modelDir));
     else if (manifest && manifest.bounds && manifest.bounds.poly && manifest.bounds.poly.length >= 3) areas = [manifest.bounds];
+    // A scan in parts: the splat is in the main part's coordinates, like its outline; an outline marked in another
+    // part is moved in by where that part's photos ended up.
+    if (src.segments) areas.push(...partAreas(src.segments.filter((s) => !s.main), readCameras(rec.modelDir)));
   }
   if (src.parts) writeFileSync(join(dataset, 'merge.json'), JSON.stringify({ areas }, null, 1));
   const cropOn = job.crop != null ? job.crop : cfg.cropToBounds !== false;
@@ -187,8 +201,11 @@ export async function processJob(job, ctx) {
     // The outline the crop used (in splat coordinates), so the viewer can show and change it.
     crop: crop ? { removed: crop.removed, margin: CROP_MARGIN, areas: areas.map((a) => ({ poly: a.poly, floorY: a.floorY, top: a.top ?? null })), uncropped: tr.ply } : areas.length ? { off: true, margin: CROP_MARGIN, areas: areas.map((a) => ({ poly: a.poly, floorY: a.floorY, top: a.top ?? null })) } : null,
     capture: job.capture || null, pano: !!job.pano,
+    level: job.floor || '', // the building floor it was tagged with ('2'); `floor` below is the walk map's measured floor
+    club: job.club || null, // a member's scan: the club reviews the splat before it goes on the campus map
     source: job.source.kind === 'merge' ? job.source.name : basename(job.source.file),
     merged: src.parts ? src.parts.map((p) => ({ name: p.name, photos: p.names.length, ar: !!(p.frames && p.frames.length) })) : undefined,
+    scanParts: partsPlaced || undefined, // a scan in parts (tracking was lost): each part's photos and how many were placed
     sizeMB: +(statSync(finalPly).size / 1048576).toFixed(1),
   };
   writeFileSync(join(lib, 'info.json'), JSON.stringify(info, null, 2));
@@ -250,7 +267,7 @@ async function prepareSource(source, outDir, ctx, { log, usePoses = true, progre
   const nImages = countImages(photos);
 
   // Camera hint & AR poses
-  let posed = null, lenses = null;
+  let posed = null, lenses = null, segments = null;
   let arFrames = null; // AR camera poses, also used to put an SfM solve into the AR frame
   if (manifest && manifest.frames && manifest.frames.length) {
     const intrs = manifest.frames.map((f) => f.intrinsics).filter(Boolean);
@@ -279,8 +296,46 @@ async function prepareSource(source, outDir, ctx, { log, usePoses = true, progre
       // Club photos: one outing's AR poses, with other photos placed around them (see posedReconstruction's `hold`).
       if (usePoses && frames.length >= 20) posed = { modelDir: sparseIn, frames, hold: (manifest.capture && manifest.capture.engine) === 'club-photos' };
     }
+    // A scan in parts (tracking was lost, and it carried on as a new part): the main part's poses are the ones
+    // above; the others are joined to it (colmap.mjs segmentPairs, fitPart).
+    if (tracking === '6dof') segments = scanParts(manifest, arFrames);
   }
-  return { photos, nImages, manifest, camera, rig, pano, posed, arFrames, lenses };
+  return { photos, nImages, manifest, camera, rig, pano, posed, arFrames, lenses, segments };
+}
+
+/**
+ * A scan's parts from its manifest: its photos by AR coordinates (`space`; SplatScout 2.7 also lists `parts`),
+ * the main part first (the one whose poses are in poses/colmap/sparse/0, else the biggest), each with its photos'
+ * AR poses in its own coordinates and its own scan outline. Null for a scan in one part.
+ * @param {object} manifest splatscout.json
+ * @param {Array<{name}>|null} mainFrames the photos with poses in poses/colmap/sparse/0
+ * @returns {Array<{part, space, names: string[], frames: Array<{name, pose}>, main: boolean, bounds}>|null}
+ */
+export function scanParts(manifest, mainFrames) {
+  const frames = (manifest.frames || []).filter((f) => f.file);
+  const spaceOf = (f) => (f.space != null ? f.space : f.segment != null ? f.segment * 100 : null);
+  const groups = new Map();
+  for (const f of frames) {
+    const s = spaceOf(f);
+    if (s == null) return null;
+    if (!groups.has(s)) groups.set(s, []);
+    groups.get(s).push(f);
+  }
+  if (groups.size < 2) return null;
+  const listed = new Map(((manifest.parts || [])).map((p) => [p.space, p]));
+  const mainNames = new Set((mainFrames || []).map((f) => f.name));
+  let main = [...groups].find(([, fs]) => fs.some((f) => mainNames.has(basename(f.file))));
+  if (!main) main = [...groups].sort((a, b) => b[1].filter((f) => f.tracked).length - a[1].filter((f) => f.tracked).length)[0];
+  const ok = (b) => (b && b.poly && b.poly.length >= 3 ? b : null);
+  const parts = [...groups].map(([space, fs], i) => ({
+    part: (listed.get(space) && listed.get(space).part) || i + 1,
+    space,
+    names: fs.map((f) => basename(f.file)),
+    frames: fs.filter((f) => f.tracked && f.pose).map((f) => ({ name: basename(f.file), pose: f.pose })),
+    main: space === main[0],
+    bounds: ok(listed.get(space) && listed.get(space).bounds) || (space === main[0] ? ok(manifest.bounds) : null),
+  }));
+  return parts.sort((a, b) => b.main - a.main || a.part - b.part);
 }
 
 /**

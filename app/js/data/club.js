@@ -1,6 +1,7 @@
-// The club (beta): who you are in it, the leaderboard and missions, and leaving. Talks to the same
-// Supabase project as crowd.js (see crowd/supabase-beta.sql). You join with an invite code and a handle;
-// without that, the database accepts no uploads at all.
+// The club (beta): who you are in it, your scans and what the club made of them, the leaderboard and
+// missions, and leaving. Talks to the same Supabase project as crowd.js (see crowd/supabase-beta.sql and
+// supabase-scans-only.sql). You join with an invite code and a handle; without that, the database accepts no
+// uploads at all.
 
 import { api, why, listObjects, removeObjects } from './crowd.js';
 import { CONSENT_VERSION } from '../core/clubrules.js';
@@ -59,8 +60,20 @@ export async function restrictedCodes() {
   return new Map((await list('/rest/v1/restricted_buildings?select=code,reason')).map((r) => [r.code, r.reason]));
 }
 
-/** Your photos as the club database has them (status, points, review note). */
-export const myPhotos = () => list('/rest/v1/photos?select=id,status,points,review_note,building_name,room,created_at,mission_id&order=created_at.desc&limit=300');
+const SCAN_COLUMNS = 'id,status,points,grade,photo_count,building_code,building_name,floor,room,created_at,reviewed_at';
+/**
+ * Your scans as the club database has them, newest first: [{id, status ('new': waiting for the club,
+ * 'processed': being built and reviewed, 'approved', 'rejected'), points, review_note, grade, building_name,
+ * floor, room, created_at, reviewed_at}]. Scans still uploading are left out.
+ */
+export async function myScans() {
+  const path = (cols) => `/rest/v1/captures?select=${cols}&status=neq.uploading&order=created_at.desc&limit=100`;
+  const r = await api(path(SCAN_COLUMNS + ',review_note'));
+  if (r.ok) return r.body;
+  // A club database without supabase-scans-only.sql has no review notes yet.
+  if (/review_note/.test(why(r))) return (await list(path(SCAN_COLUMNS))).map((s) => ({ ...s, review_note: null }));
+  throw new Error(why(r));
+}
 
 /**
  * Leave the club and delete everything you sent: photos and their files, scans and theirs, then the

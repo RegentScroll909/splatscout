@@ -1,4 +1,5 @@
-// SplatStation club page: review photos from phones, missions, invites, members, restricted places.
+// SplatStation club page: the scans members send and your review of the splats built from them (approving one
+// awards its points and puts it on the campus map), missions, invites, members, restricted places.
 
 const $ = (s) => document.querySelector(s);
 
@@ -30,8 +31,7 @@ const put = (el, ...kids) => el.replaceChildren(...kids.flat().filter((k) => k !
 const fmtTime = (t) => new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 const alertErr = (e) => alert(e.message || String(e));
 
-const S = { photos: [], tab: 'review', sel: new Set(), buildings: [], missions: [], invites: [], members: [], restricted: [], ffmpeg: true };
-const LIGHT = { morning: 'morning', afternoon: 'afternoon', evening: 'evening', night: 'night' };
+const S = { scans: [], tab: 'review', buildings: [], missions: [], invites: [], members: [], restricted: [] };
 
 // ------------------------------------------------------------------ load
 async function load() {
@@ -39,202 +39,132 @@ async function load() {
   const o = await api('/api/club');
   if (o.configured === false) {
     put($('#notice'), h('div', { class: 'err' }, o.error));
-    for (const s of ['#overview', '#review']) $(s).classList.add('hidden');
-    $('#overview').classList.remove('hidden');
-    $('#sync').disabled = $('#free').disabled = true;
+    $('#review').classList.add('hidden');
     return;
   }
   $('#notice').replaceChildren();
-  S.ffmpeg = o.ffmpeg;
   renderStats(o.stats);
-  const [photos, missions, invites, members, restricted] = await Promise.all([
-    api('/api/club/photos'), api('/api/club/missions'), api('/api/club/invites'), api('/api/club/members'), api('/api/club/restricted'),
+  const [scans, missions, invites, members, restricted] = await Promise.all([
+    api('/api/club/scans'), api('/api/club/missions'), api('/api/club/invites'), api('/api/club/members'), api('/api/club/restricted'),
   ]);
-  S.photos = photos.photos;
+  S.scans = scans.scans;
   S.missions = missions.missions;
   S.invites = invites.invites;
   S.members = members.members;
   S.restricted = restricted.restricted;
-  for (const id of [...S.sel]) if (!S.photos.some((p) => p.id === id)) S.sel.delete(id);
-  renderReview();
+  renderScans();
   renderMissions();
   renderPeople();
   renderRestricted();
 }
 
 const reload = () => load().catch(alertErr);
+$('#refresh').addEventListener('click', reload);
 
 function renderStats(s) {
   put($('#stats'),
-    ...[['Members', s.members], ['Sending now', s.uploading], ['To review', s.new, s.new > 0], ['Accepted', s.accepted], ['Rejected', s.rejected]]
+    ...[['Members', s.members], ['Sending now', s.uploading], ['Not on this PC yet', s.new, s.new > 0], ['On this PC', s.processed, s.processed > 0], ['Approved', s.approved], ['Not approved', s.rejected]]
       .map(([label, n, hot]) => h('div', { class: 'stat' + (hot ? ' hot' : '') }, h('b', {}, String(n)), h('span', {}, label))));
 }
 
-// ------------------------------------------------------------------ sync
-let syncTimer = 0;
-async function pollSync() {
-  const s = await api('/api/club/sync').catch(() => null);
-  if (!s) return;
-  $('#syncText').textContent = s.running ? `Downloading ${s.text}…` : s.error ? s.error : s.result ? `${s.result.downloaded} new photo(s) downloaded${s.result.failed ? `, ${s.result.failed} failed` : ''}` : '';
-  $('#syncText').classList.toggle('note-ok', !s.running && !s.error && !!s.result);
-  $('#sync').disabled = s.running;
-  if (s.running) syncTimer = setTimeout(pollSync, 700);
-  else if (s.result && !s.error) {
-    s.result = null;
-    reload();
-  }
+// ------------------------------------------------------------------ scans and their review
+/** Where a scan is: sent, imported, built and waiting for you, or decided. */
+function stage(x) {
+  if (x.status === 'approved') return 'approved';
+  if (x.status === 'rejected') return 'rejected';
+  if (x.splat) return 'review'; // its splat is built: your turn
+  if (x.status === 'new') return 'new'; // not on this PC yet
+  return 'building'; // imported: on the dashboard, or being processed
 }
-$('#sync').addEventListener('click', async () => {
-  if (!S.ffmpeg && !confirm('ffmpeg was not found, so photos can\'t be checked. Try anyway?')) return;
-  try {
-    await api('/api/club/sync', {});
-    clearTimeout(syncTimer);
-    pollSync();
-  } catch (e) {
-    alertErr(e);
-  }
-});
-$('#refresh').addEventListener('click', reload);
-$('#free').addEventListener('click', async () => {
-  if (!confirm('Delete the cloud copies of accepted photos that are saved on this PC? (They stay here, and still count for points.)')) return;
-  try {
-    const r = await api('/api/club/free-cloud', {});
-    $('#syncText').textContent = `Freed ${(r.bytes / 1048576).toFixed(0)} MB (${r.photos} photos)`;
-  } catch (e) {
-    alertErr(e);
-  }
-});
-
-// ------------------------------------------------------------------ review
-const level = (p) => (p.status === 'accepted' ? 'accepted' : p.verdict ? p.verdict.level : 'review');
 const TABS = [
-  ['review', 'To review', (p) => p.status === 'new'],
-  ['accept', 'Look fine', (p) => p.status === 'new' && level(p) === 'accept'],
-  ['look', 'Need a look', (p) => p.status === 'new' && level(p) === 'review'],
-  ['reject', 'Suggest reject', (p) => p.status === 'new' && level(p) === 'reject'],
-  ['accepted', 'Accepted', (p) => p.status === 'accepted'],
+  ['review', 'Splats to review', (x) => stage(x) === 'review'],
+  ['new', 'Not on this PC yet', (x) => stage(x) === 'new'],
+  ['building', 'Being built', (x) => stage(x) === 'building'],
+  ['approved', 'Approved', (x) => stage(x) === 'approved'],
+  ['rejected', 'Not approved', (x) => stage(x) === 'rejected'],
 ];
 
-function renderReview() {
-  const tab = TABS.find((t) => t[0] === S.tab);
-  $('#reviewCount').textContent = String(S.photos.filter((p) => p.status === 'new').length).padStart(2, '0') + ' to review';
+function renderScans() {
+  const waiting = S.scans.filter((x) => ['review', 'new'].includes(stage(x))).length;
+  $('#reviewCount').textContent = `${String(waiting).padStart(2, '0')} need you`;
   put($('#tabs'), ...TABS.map(([id, label, fn]) =>
-    h('button', { class: 'tab' + (S.tab === id ? ' on' : ''), onclick: () => { S.tab = id; renderReview(); } }, `${label} `, h('span', { class: 'mono muted' }, String(S.photos.filter(fn).length)))));
-  const list = S.photos.filter(tab[2]);
-  if (!list.length) {
-    put($('#places'), h('p', { class: 'empty' }, S.tab === 'accepted' ? 'Nothing accepted yet.' : S.photos.length ? 'Nothing here.' : 'No photos yet. Photos sent from phones appear here after you press Sync.'));
-    return renderBulk();
+    h('button', { class: 'tab' + (S.tab === id ? ' on' : ''), onclick: () => { S.tab = id; renderScans(); } }, `${label} `, h('span', { class: 'mono muted' }, String(S.scans.filter(fn).length)))));
+  const list = S.scans.filter(TABS.find((t) => t[0] === S.tab)[2]);
+  put($('#scans'), list.length ? list.map(scanCard) : h('p', { class: 'empty' }, {
+    review: 'No splats waiting for you. When a member’s scan has been built, it appears here to approve or not.',
+    new: 'Nothing new. Scans members send (graded B or better) appear here to import.',
+    building: 'Nothing being built. Imported scans wait in Ready to process on the dashboard.',
+    approved: 'Nothing approved yet.',
+    rejected: 'Nothing turned down.',
+  }[S.tab]));
+}
+
+const viewerUrl = (sp) => {
+  const q = new URLSearchParams({ ply: '/files/library/' + sp.path.split('/').map(encodeURIComponent).join('/') + '/scene.ply', title: sp.title });
+  if (sp.view) q.set('view', JSON.stringify(sp.view));
+  return '/viewer.html?' + q;
+};
+
+function scanCard(x) {
+  const st = stage(x);
+  const title = [x.building_name, x.floor && `floor ${x.floor}`, x.room].filter(Boolean).join(' · ');
+  const meta = [`@${x.handle}`, `grade ${x.grade || '?'}`, `${x.photo_count} photos`, `sent ${fmtTime(x.created_at)}`, x.lat != null ? `GPS ±${Math.round(x.gps_accuracy_m || 0)} m` : null].filter(Boolean).join(' · ');
+  const act = async (op, extra = {}) => {
+    try {
+      await api('/api/club/scan', { op, id: x.id, ...extra });
+      await reload();
+    } catch (e) {
+      alertErr(e);
+    }
+  };
+  const del = h('button', { class: 'btn small ghost danger', onclick: () => confirm(`Delete this scan of ${title} from the club database (its photos and its row)? A splat already built from it stays on this PC.`) && act('delete') }, 'Delete from the cloud');
+  let status, actions = [];
+  if (st === 'new') {
+    status = h('span', { class: 'badge' }, 'Sent');
+    actions = [h('button', { class: 'btn small primary', disabled: x.busy, onclick: (e) => { e.target.disabled = true; e.target.textContent = 'Downloading…'; act('import'); } }, 'Import and build'), del];
+  } else if (st === 'building') {
+    status = h('span', { class: 'badge' }, x.job ? `On the dashboard: ${x.job.status}` : 'Imported');
+    actions = [x.job ? h('a', { class: 'btn small', href: '/' }, 'Open the dashboard') : h('button', { class: 'btn small', onclick: () => act('import') }, 'Import again'), del];
+  } else if (st === 'review') {
+    const a = x.award, f = a && a.facts;
+    status = h('span', { class: 'badge new' }, 'Your review');
+    actions = [
+      h('a', { class: 'btn small', href: viewerUrl(x.splat), target: '_blank' }, 'View the splat'),
+      h('a', { class: 'btn small', href: `/building.html?code=${encodeURIComponent(x.building_code)}&review=${encodeURIComponent(x.splat.path)}`, target: '_blank', title: 'See it among the building’s other splats and line it up' }, 'Place it in the building'),
+      h('button', { class: 'btn small primary', title: a ? a.parts.map(([t, v]) => `${t}: +${v}`).join('\n') : '', onclick: () => confirm(`Approve this splat of ${title}? It goes on the campus map and @${x.handle} gets ${a ? a.points : 0} points.`) && act('approve') }, `Approve${a ? ` (+${a.points})` : ''}`),
+      h('button', { class: 'btn small ghost danger', onclick: () => decline(x, title, act) }, 'Don’t approve'),
+    ];
+    if (f) actions.push(h('span', { class: 'muted small' }, `Splat ${f.score}/100 (${f.measured ? 'measured' : 'estimated'})${f.rescan ? ' · its space was Good already' : f.newArea ? ` · adds about ${f.newArea} m² to the map` : ''}`));
+  } else if (st === 'approved') {
+    status = h('span', { class: 'badge done' }, `Approved · +${x.points}`);
+    actions = x.splat ? [h('a', { class: 'btn small ghost', href: viewerUrl(x.splat), target: '_blank' }, 'View the splat')] : [];
+  } else {
+    status = h('span', { class: 'badge failed' }, 'Not approved');
+    actions = [x.review_note ? h('span', { class: 'muted small' }, `Told them: ${x.review_note}`) : null, del];
   }
-  const groups = new Map();
-  for (const p of list) {
-    const k = [p.building_name, p.floor, p.room].join('|');
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(p);
-  }
-  put($('#places'), ...[...groups.entries()].sort().map(([k, ps]) => place(ps)));
-  renderBulk();
+  return h('div', { class: 'job' },
+    h('div', { class: 'job-head' }, h('div', { class: 'job-title' }, title), status),
+    h('div', { class: 'meta muted small' }, meta, x.reviewed_at ? ` · reviewed ${fmtTime(x.reviewed_at)}` : ''),
+    h('div', { class: 'actions' }, actions));
 }
 
-function place(ps) {
-  const p0 = ps[0];
-  const title = [p0.building_name, p0.floor && `floor ${p0.floor}`, p0.room].filter(Boolean).join(' · ');
-  const allSel = ps.every((p) => S.sel.has(p.id));
-  const accepted = S.photos.filter((p) => p.status === 'accepted' && p.building_code === p0.building_code && p.floor === p0.floor && p.room === p0.room);
-  return h('div', { class: 'place' },
-    h('div', { class: 'place-head' },
-      h('b', {}, title), h('span', { class: 'muted small mono' }, `${ps.length} photo${ps.length === 1 ? '' : 's'}`),
-      h('button', { class: 'btn small ghost', onclick: () => { ps.forEach((p) => (allSel ? S.sel.delete(p.id) : S.sel.add(p.id))); renderReview(); } }, allSel ? 'Clear' : 'Select all'),
-      S.tab === 'accepted' || accepted.length >= 10
-        ? h('button', { class: 'btn small', title: 'Put this room\'s accepted photos into Ready to process', onclick: () => build(p0, accepted.length) }, `Build a capture from ${accepted.length} accepted`)
-        : null),
-    h('div', { class: 'pgrid' }, ps.map(tile)));
-}
-
-function tile(p) {
-  const lv = level(p);
-  const why = p.status === 'accepted' ? (p.review_note || '') : p.verdict ? p.verdict.reasons.join(' · ') : '';
-  const box = h('input', { type: 'checkbox', checked: S.sel.has(p.id), onclick: (e) => e.stopPropagation(), onchange: (e) => { e.target.checked ? S.sel.add(p.id) : S.sel.delete(p.id); renderBulk(); tileEl.classList.toggle('sel', S.sel.has(p.id)); } });
-  const tileEl = h('div', { class: 'ptile' + (S.sel.has(p.id) ? ' sel' : ''), onclick: () => lightbox(p) },
-    box,
-    h('span', { class: 'lv ' + (lv === 'accepted' ? 'accept' : lv) }, lv === 'accepted' ? `+${p.points}` : lv === 'accept' ? 'ok' : lv),
-    p.local ? h('img', { src: `/api/club/thumb/${p.id}`, loading: 'lazy', alt: '' }) : h('div', { class: 'noimg' }, 'press Sync'),
-    h('div', { class: 'pbody' },
-      h('span', {}, `@${p.handle} · ${LIGHT[p.lightSlot] || ''}`),
-      p.mission ? h('span', { class: 'muted' }, `mission: ${p.mission}`) : null,
-      why ? h('span', { class: 'why' }, why) : null));
-  return tileEl;
-}
-
-function renderBulk() {
-  const n = S.sel.size, el = $('#bulk');
-  el.classList.toggle('hidden', !n);
-  if (!n) return;
-  const sel = S.photos.filter((p) => S.sel.has(p.id));
-  const fresh = sel.filter((p) => p.status === 'new').length;
-  put(el,
-    h('b', {}, `${n} selected`),
-    h('span', { class: 'grow' }),
-    fresh ? h('button', { class: 'btn primary', onclick: () => act('accept') }, `Accept ${fresh}`) : null,
-    h('button', { class: 'btn danger', onclick: () => reject() }, `Reject and delete ${n}`),
-    sel.some((p) => p.status === 'accepted') ? h('button', { class: 'btn ghost', onclick: () => act('reopen') }, 'Move back to review') : null,
-    h('button', { class: 'btn ghost', onclick: () => { S.sel.clear(); renderReview(); } }, 'Clear'));
-}
-
-async function act(action, note) {
-  const ids = [...S.sel];
-  try {
-    const r = await api('/api/club/review', { ids, action, note });
-    S.sel.clear();
-    $('#syncText').textContent = action === 'accept' ? `Accepted ${r.changed}, ${r.points} points awarded` : `${r.changed} updated`;
-    await load();
-  } catch (e) {
-    alertErr(e);
-  }
-}
-
-const REASONS = ['A person is in the frame', 'Blurry', 'Not a public area', 'Screen or document in frame', 'Duplicate view', 'Other'];
-function reject() {
+const REASONS = ['A person is in the scan', 'Too blurry or patchy', 'Not a public area', 'Screen or document in view', 'Wrong building or room', 'Other'];
+/** Don't approve: the member is told why (their scan stays listed as not approved; nothing is deleted). */
+function decline(x, title, act) {
   const sel = h('select', {}, REASONS.map((r) => h('option', {}, r)));
+  const more = h('input', { type: 'text', placeholder: 'Anything to add (optional)', maxlength: 300 });
   const back = h('div', { id: 'lightbox', class: 'on', onclick: (e) => e.target === back && back.remove() },
-    h('div', { class: 'panel', style: 'max-width:420px' },
-      h('h3', {}, `Reject ${S.sel.size} photo(s)`),
-      h('p', { class: 'muted small', style: 'margin:0' }, 'Rejected photos are deleted from this PC and from the club database, and the member is told why. This can\'t be undone.'),
+    h('div', { class: 'panel', style: 'max-width:440px' },
+      h('h3', {}, `Don’t approve: ${title}`),
+      h('p', { class: 'muted small', style: 'margin:0' }, `@${x.handle} gets no points for it and sees the reason in the app. The splat stays on this PC, off the campus map.`),
       h('label', { class: 'field' }, h('span', { class: 'lbl' }, 'Reason shown to the member'), sel),
+      h('label', { class: 'field' }, h('span', { class: 'lbl' }, 'Note'), more),
       h('div', { style: 'display:flex;gap:8px;justify-content:flex-end' },
         h('button', { class: 'btn ghost', onclick: () => back.remove() }, 'Cancel'),
-        h('button', { class: 'btn danger', onclick: () => { back.remove(); act('reject', sel.value); } }, 'Reject and delete'))));
+        h('button', { class: 'btn danger', onclick: () => { back.remove(); act('reject', { note: [sel.value, more.value.trim()].filter(Boolean).join(': ') }); } }, 'Don’t approve'))));
   document.body.append(back);
 }
-
-function lightbox(p) {
-  const box = $('#lightbox');
-  box.classList.add('on');
-  put(box,
-    p.local ? h('img', { src: `/api/club/image/${p.id}`, alt: '' }) : h('p', {}, 'Not on this PC yet: press Sync.'),
-    h('div', { class: 'small muted' }, `@${p.handle} · ${p.building_name}${p.floor ? ` · floor ${p.floor}` : ''}${p.room ? ` · ${p.room}` : ''} · ${LIGHT[p.lightSlot]} · ${fmtTime(p.taken_at)}${p.meta ? ` · ${p.meta.w}×${p.meta.h}, sharpness ${p.meta.sharp}, brightness ${Math.round(p.meta.mean)}` : ''}`),
-    p.verdict && p.verdict.reasons.length ? h('div', { class: 'small', style: 'color:var(--warn)' }, p.verdict.reasons.join(' · ')) : null,
-    h('div', { style: 'display:flex;gap:8px' },
-      p.status === 'new' ? h('button', { class: 'btn primary', onclick: () => { S.sel = new Set([p.id]); box.classList.remove('on'); act('accept'); } }, 'Accept') : null,
-      h('button', { class: 'btn danger', onclick: () => { S.sel = new Set([p.id]); box.classList.remove('on'); reject(); } }, 'Reject'),
-      h('button', { class: 'btn ghost', onclick: () => box.classList.remove('on') }, 'Close')));
-}
-$('#lightbox').addEventListener('click', (e) => e.target.id === 'lightbox' && $('#lightbox').classList.remove('on'));
-document.addEventListener('keydown', (e) => e.key === 'Escape' && $('#lightbox').classList.remove('on'));
-
-/** What the photos' AR positions bring (Track position on the phone), for the build message. */
-const arNote = (r) => !r.ar ? ''
-  : r.ar.session ? `AR positions: ${r.ar.photos} photos from one AR session set the coordinates, so COLMAP starts from them and the splat is in metres${r.ar.posed > r.ar.photos ? ` (${r.ar.posed - r.ar.photos} more from ${r.ar.sessions - 1} other AR session(s) are placed by COLMAP)` : ''}.\n`
-  : `${r.ar.posed} photos have AR positions, but no AR session has the 10 it takes to set the coordinates: COLMAP works it out from the photos alone.\n`;
-
-async function build(p, n) {
-  if (!confirm(`Put ${n} accepted photos of ${p.room || p.building_name} into Ready to process? You can then process them like any capture.`)) return;
-  try {
-    const r = await api('/api/club/build', { building_code: p.building_code, floor: p.floor, room: p.room });
-    alert(`${r.photos} photos from ${r.contributors.map((c) => '@' + c).join(', ')} are in Ready to process on the dashboard (${r.file}).${r.sharedCamera ? '' : '\nTheir lenses differ (different phones, or AR and ordinary photos), so COLMAP will work out each one.'}\n${arNote(r)}Light: ${r.lightSlots.join(', ')}.`);
-  } catch (e) {
-    alertErr(e);
-  }
-}
+document.addEventListener('keydown', (e) => e.key === 'Escape' && document.querySelectorAll('#lightbox').forEach((b) => b.remove()));
 
 // ------------------------------------------------------------------ missions
 const nameOf = (code) => (S.buildings.find((b) => b.code === code) || {}).name || code || 'Anywhere';
@@ -244,19 +174,18 @@ function renderMissions() {
   const f = {};
   const field = (key, label, el) => h('label', { class: 'field' }, h('span', { class: 'lbl' }, label), (f[key] = el));
   put($('#missionForm'),
-    field('title', 'Title', h('input', { type: 'text', placeholder: 'Hayden lobby in evening light', maxlength: 80 })),
+    field('title', 'Title', h('input', { type: 'text', placeholder: 'Scan the Hayden reading room', maxlength: 80 })),
     field('building', 'Building', h('select', {}, h('option', { value: '' }, 'Anywhere'), S.buildings.filter((b) => !b.restricted).map((b) => h('option', { value: b.code }, b.name)))),
-    field('room', 'Room or area', h('input', { type: 'text', placeholder: 'Main lobby' })),
-    field('floor', 'Floor', h('input', { type: 'text', placeholder: '1' })),
+    field('room', 'Room or area', h('input', { type: 'text', placeholder: 'Reading room' })),
+    field('floor', 'Floor', h('input', { type: 'text', placeholder: '2' })),
     field('light', 'Light', h('select', {}, ['any', 'morning', 'afternoon', 'evening', 'night'].map((l) => h('option', { value: l }, l === 'any' ? 'Any light' : l)))),
-    field('bonus', 'Bonus per photo', h('input', { type: 'number', value: '2', min: 0, max: 50 })),
-    field('wanted', 'Photos wanted', h('input', { type: 'number', value: '20', min: 1, max: 5000 })),
-    field('detail', 'Details (optional)', h('input', { type: 'text', placeholder: 'Where to stand, what to cover', maxlength: 400 })),
+    field('bonus', 'Bonus for an approved scan', h('input', { type: 'number', value: '15', min: 0, max: 50 })),
+    field('detail', 'Details (optional)', h('input', { type: 'text', placeholder: 'Where to start, what to cover', maxlength: 400 })),
     h('button', {
       class: 'btn primary',
       onclick: async () => {
         try {
-          await api('/api/club/mission', { op: 'create', title: f.title.value, detail: f.detail.value, building_code: f.building.value, room: f.room.value, floor: f.floor.value, light: f.light.value, bonus: f.bonus.value, wanted: f.wanted.value });
+          await api('/api/club/mission', { op: 'create', title: f.title.value, detail: f.detail.value, building_code: f.building.value, room: f.room.value, floor: f.floor.value, light: f.light.value, bonus: f.bonus.value });
           await reload();
         } catch (e) {
           alertErr(e);
@@ -265,11 +194,11 @@ function renderMissions() {
     }, 'Add mission'));
   put($('#missions'), ...(S.missions.length ? S.missions.map((m) => h('div', { class: 'job' },
     h('div', { class: 'job-head' }, h('div', { class: 'job-title' }, m.title), h('span', { class: 'badge ' + (m.active ? 'new' : '') }, m.active ? 'Open' : 'Off')),
-    h('div', { class: 'meta muted small' }, [nameOf(m.building_code), m.floor && `floor ${m.floor}`, m.room, m.light !== 'any' && `${m.light} light`, `+${m.bonus} each`, `${m.wanted} wanted`].filter(Boolean).join(' · ')),
+    h('div', { class: 'meta muted small' }, [nameOf(m.building_code), m.floor && `floor ${m.floor}`, m.room, m.light !== 'any' && `${m.light} light`, `+${m.bonus} for an approved scan`].filter(Boolean).join(' · ')),
     m.detail ? h('div', { class: 'small muted' }, m.detail) : null,
     h('div', { class: 'actions' },
       h('button', { class: 'btn small ghost', onclick: async () => { await api('/api/club/mission', { op: 'toggle', id: m.id, active: !m.active }).catch(alertErr); reload(); } }, m.active ? 'Switch off' : 'Switch on'),
-      h('button', { class: 'btn small ghost danger', onclick: async () => { if (confirm('Delete this mission? Photos taken for it keep their points.')) { await api('/api/club/mission', { op: 'delete', id: m.id }).catch(alertErr); reload(); } } }, 'Delete')))) : [h('p', { class: 'empty' }, 'No missions yet. A mission asks for a view, in a kind of light, and adds bonus points.')]));
+      h('button', { class: 'btn small ghost danger', onclick: async () => { if (confirm('Delete this mission? Scans approved for it keep their points.')) { await api('/api/club/mission', { op: 'delete', id: m.id }).catch(alertErr); reload(); } } }, 'Delete')))) : [h('p', { class: 'empty' }, 'No missions yet. A mission asks for a scan of a space (in a kind of light, if you like) and adds bonus points when one is approved.')]));
 }
 
 // ------------------------------------------------------------------ invites and members
@@ -298,13 +227,13 @@ function renderPeople() {
         h('td', {}, h('button', { class: 'btn small ghost', onclick: async () => { await api('/api/club/invite', { op: 'toggle', code: i.code, active: !i.active }).catch(alertErr); reload(); } }, i.active ? 'Switch off' : 'Switch on')))))
     : h('p', { class: 'empty' }, 'No invite codes yet. Make one and give it to the people you want in the beta.'));
   put($('#members'), S.members.length
-    ? h('table', { class: 'rows' }, h('tr', {}, h('th', {}, 'Handle'), h('th', {}, 'Points'), h('th', {}, 'Photos'), h('th', {}, 'Joined'), h('th', {})),
+    ? h('table', { class: 'rows' }, h('tr', {}, h('th', {}, 'Handle'), h('th', {}, 'Points'), h('th', {}, 'Scans approved'), h('th', {}, 'Joined'), h('th', {})),
       S.members.map((m) => h('tr', { class: m.banned ? 'off' : '' },
-        h('td', {}, `@${m.handle}`, m.banned ? h('span', { class: 'tag' }, ' paused') : null), h('td', { class: 'mono' }, String(m.points)), h('td', { class: 'mono' }, String(m.photos)), h('td', { class: 'muted small' }, fmtTime(m.created_at)),
+        h('td', {}, `@${m.handle}`, m.banned ? h('span', { class: 'tag' }, ' paused') : null), h('td', { class: 'mono' }, String(m.points)), h('td', { class: 'mono' }, String(m.scans || 0)), h('td', { class: 'muted small' }, fmtTime(m.created_at)),
         h('td', { style: 'text-align:right;white-space:nowrap' },
           h('button', { class: 'btn small ghost', onclick: async () => { const hn = prompt('New handle for @' + m.handle, m.handle); if (hn && hn !== m.handle) { await api('/api/club/member', { op: 'rename', user_id: m.user_id, handle: hn }).catch(alertErr); reload(); } } }, 'Rename'),
           ' ', h('button', { class: 'btn small ghost', onclick: async () => { await api('/api/club/member', { op: 'ban', user_id: m.user_id, banned: !m.banned }).catch(alertErr); reload(); } }, m.banned ? 'Resume' : 'Pause'),
-          ' ', h('button', { class: 'btn small ghost danger', onclick: async () => { if (confirm(`Remove @${m.handle} and delete everything they sent (photos here and in the cloud, scans, profile)? This can't be undone.`)) { await api('/api/club/member', { op: 'purge', user_id: m.user_id }).catch(alertErr); reload(); } } }, 'Remove')))))
+          ' ', h('button', { class: 'btn small ghost danger', onclick: async () => { if (confirm(`Remove @${m.handle} and delete everything they sent (their scans in the cloud, and their profile)? Splats already built stay on this PC. This can't be undone.`)) { await api('/api/club/member', { op: 'purge', user_id: m.user_id }).catch(alertErr); reload(); } } }, 'Remove')))))
     : h('p', { class: 'empty' }, 'Nobody has joined yet.'));
 }
 
@@ -319,8 +248,8 @@ function renderRestricted() {
     h('button', { class: 'btn', onclick: async () => { await api('/api/club/restricted', { op: 'set', code: pick.value, reason: why.value }).catch(alertErr); reload(); } }, 'Add'),
     h('button', { class: 'btn ghost', title: 'Copy the flags from the ASU building list into the database', onclick: async () => { const r = await api('/api/club/restricted', { op: 'sync' }).catch(alertErr); if (r) alert(`${r.count} buildings from the ASU list are restricted in the club database.`); reload(); } }, 'Sync from ASU list'));
   put($('#restricted'), S.restricted.length
-    ? h('div', { style: 'display:flex;flex-wrap:wrap;gap:6px' }, S.restricted.map((r) => h('span', { class: 'tag' }, `${nameOf(r.code)} · ${r.reason} `, h('button', { class: 'link', title: 'Allow photos again', onclick: async () => { await api('/api/club/restricted', { op: 'set', code: r.code, reason: null }).catch(alertErr); reload(); } }, '✕'))))
+    ? h('div', { style: 'display:flex;flex-wrap:wrap;gap:6px' }, S.restricted.map((r) => h('span', { class: 'tag' }, `${nameOf(r.code)} · ${r.reason} `, h('button', { class: 'link', title: 'Allow scans here again', onclick: async () => { await api('/api/club/restricted', { op: 'set', code: r.code, reason: null }).catch(alertErr); reload(); } }, '✕'))))
     : h('p', { class: 'empty' }, 'None yet. Press "Sync from ASU list" to enforce the residence-hall, health and police flags in the club database.'));
 }
 
-load().catch((e) => put($('#notice'), h('div', { class: 'err' }, e.message))).then(() => pollSync());
+load().catch((e) => put($('#notice'), h('div', { class: 'err' }, e.message)));

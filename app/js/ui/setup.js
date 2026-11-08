@@ -15,16 +15,18 @@ export async function setupScreen(root, { navigate, query }) {
   const [buildings, asu] = await Promise.all([store.listBuildings(), campus.buildings()]);
   const names = [...new Set([...buildings.map((b) => b.name), ...asu.map((b) => b.name)])];
   const xr = await xrSupport();
+  // From the Campus map or a mission ("Scan here"): the building, floor and room filled in.
+  const pre = !practice && query.get('building') ? asu.find((b) => b.code === query.get('building') && !b.restricted) || null : null;
 
   const st = {
-    buildingCode: practice ? null : settings.lastBuildingCode || null,
+    buildingCode: practice ? null : pre ? pre.code : settings.lastBuildingCode || null,
     geo: null,
     near: null, // [{b, dist}] from the last GPS fix
     locating: false,
     geoMsg: '',
-    building: practice ? 'Practice' : settings.lastBuilding || '',
-    room: practice ? 'Demo classroom' : '',
-    floor: '',
+    building: practice ? 'Practice' : pre ? pre.name : settings.lastBuilding || '',
+    room: practice ? 'Demo classroom' : pre ? (query.get('room') || '').slice(0, 80) : '',
+    floor: pre ? (query.get('floor') || '').slice(0, 20) : '',
     notes: '',
     template: practice ? 'room' : settings.lastTemplate || 'room',
     engine: practice ? 'demo6' : settings.engine === 'camera' || !xr.ok ? 'camera' : 'xr',

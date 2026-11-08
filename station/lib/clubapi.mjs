@@ -1,13 +1,15 @@
-// The club's admin API for the SplatStation page (/club.html): review photos, points, missions, invites,
-// members, restricted buildings, and building a capture from a room's accepted photos. Everything here
-// uses the project's secret key, so it only answers requests from this PC (not from the Wi-Fi).
+// The club's admin API for the SplatStation page (/club.html): the scans members send and the review of the
+// splats built from them (approve: points and the campus map; or not, with a note), missions, invites,
+// members and restricted buildings. Everything here uses the project's secret key, so it only answers
+// requests from this PC (not from the Wi-Fi).
 
-import { readFileSync, existsSync, createReadStream } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { networkInterfaces } from 'node:os';
 import * as crowd from './crowd.mjs';
 import * as club from './club.mjs';
+import { approvalFacts, normRoom } from './campus.mjs';
 import { scoreScan } from '../../app/js/core/clubrules.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -27,16 +29,33 @@ let buildingList = null;
 export const buildings = () =>
   (buildingList ||= new Map(JSON.parse(readFileSync(join(HERE, '..', '..', 'app', 'data', 'asu-buildings.json'), 'utf8')).buildings.map((b) => [b.code, b])));
 
-export const awardScan = (o) => scoreScan(o);
+const busy = new Set(); // scans being imported or reviewed (two clicks must not award twice)
 
-const syncState = { running: false, fraction: 0, text: '', result: null, error: null };
-const busy = new Set(); // photo ids being reviewed (two clicks must not award twice)
+/** The job and the library splat made from a member's scan (the ZIP's name carries its id). */
+function localOf(row, library, jobs) {
+  const tag = `club-${row.id.slice(0, 8)}`;
+  const job = jobs.find((j) => (j.club && j.club.id === row.id) || String((j.source && (j.source.name || (j.source.file && basename(j.source.file)))) || '').includes(tag)) || null;
+  const item = library.find((it) => it.info && it.info.club && it.info.club.id === row.id) || null;
+  return { job, item };
+}
 
 /**
- * @param {object} ctx {req, res, path, url, cfg, readBody, sendJson, say, scanInbox, version}
+ * What approving a scan would earn: its grade, the floor it adds to the campus map (none for a space already
+ * Good, a rescan) and an open mission for its space. From the campus view, where its splat still waits.
+ */
+function pointsFor(row, item, data, missions) {
+  const f = item && data ? approvalFacts(data, item.path) : null;
+  const mission = missions.find((m) => m.active && (!m.ends_at || Date.parse(m.ends_at) > Date.now()) && m.building_code === row.building_code && (!m.room || normRoom(m.room) === normRoom(row.room))) || null;
+  const pts = scoreScan({ grade: row.grade || '', newArea: f ? f.newArea : 0, rescan: f ? f.rescan : false, mission });
+  return { ...pts, facts: f ? { score: f.build.score, band: f.build.band || null, measured: !!f.build.measured, newArea: Math.round(f.newArea), rescan: f.rescan, space: f.space.key } : null };
+}
+
+/**
+ * @param {object} ctx {req, res, path, url, cfg, readBody, sendJson, say, scanInbox, version,
+ *   library(): this PC's splats, jobs(): its jobs, campus(c): the campus view, onCampusChanged(): publish for members}
  */
 export async function handleClub(ctx) {
-  const { req, res, path, cfg, readBody, sendJson, say, scanInbox, version } = ctx;
+  const { req, res, path, cfg, readBody, sendJson, say, scanInbox } = ctx;
   if (!isLocal(req)) return sendJson(res, { error: 'The club tools only work on the PC running SplatStation.' }, 403);
   if (path === '/api/club/buildings') {
     return sendJson(res, [...buildings().values()].map(({ code, name, campus, restricted }) => ({ code, name, campus, restricted: restricted || null })));
@@ -45,62 +64,78 @@ export async function handleClub(ctx) {
   if (c.error) return sendJson(res, { configured: false, error: c.error });
   const post = req.method === 'POST' ? await readBody(req) : {};
   try {
-    // Local copies of photos, for the review grid.
-    const f = path.match(/^\/api\/club\/(thumb|image)\/([0-9a-f-]{36})$/);
-    if (f) {
-      const dir = club.clubDir(cfg.workDir);
-      const file = (f[1] === 'thumb' ? club.thumbFile : club.photoFile)(dir, f[2]);
-      if (!existsSync(file)) return sendJson(res, { error: 'Not on this PC yet: press Sync' }, 404);
-      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=3600' });
-      return createReadStream(file).pipe(res);
-    }
-
     switch (path) {
       case '/api/club': {
-        const [photos, profiles] = await Promise.all([crowd.listAll(c, '/rest/v1/photos?select=status'), crowd.listAll(c, '/rest/v1/profiles?select=user_id')]);
-        const n = (s) => photos.filter((p) => p.status === s).length;
-        return sendJson(res, { configured: true, stats: { members: profiles.length, uploading: n('uploading'), new: n('new'), accepted: n('accepted'), rejected: n('rejected') }, ffmpeg: !!(cfg.tools && cfg.tools.ffmpeg) });
+        const [scans, profiles] = await Promise.all([crowd.listAll(c, '/rest/v1/captures?select=status'), crowd.listAll(c, '/rest/v1/profiles?select=user_id')]);
+        const n = (s) => scans.filter((x) => x.status === s).length;
+        return sendJson(res, { configured: true, stats: { members: profiles.length, uploading: n('uploading'), new: n('new'), processed: n('processed'), approved: n('approved'), rejected: n('rejected') } });
       }
-      case '/api/club/photos':
-        return sendJson(res, { photos: await club.reviewList(c, cfg, buildings()) });
 
-      case '/api/club/sync':
-        if (req.method === 'GET') return sendJson(res, syncState);
-        if (syncState.running) return sendJson(res, { error: 'Already syncing' }, 409);
-        Object.assign(syncState, { running: true, fraction: 0, text: 'Starting…', result: null, error: null });
-        club.sync(c, cfg, { say, onProgress: (fr, text) => Object.assign(syncState, { fraction: fr, text }) })
-          .then((r) => {
-            syncState.result = r;
-            say(`Club photos: ${r.downloaded} downloaded${r.failed ? `, ${r.failed} failed` : ''}.`);
-          })
-          .catch((e) => (syncState.error = e.message))
-          .finally(() => (syncState.running = false));
-        return sendJson(res, { started: true });
+      case '/api/club/scans': {
+        // Every scan with what this PC made of it, and what approving its splat would earn.
+        const [rows, missions] = await Promise.all([club.listScans(c), club.listMissions(c)]);
+        const library = ctx.library(), jobs = ctx.jobs();
+        const data = rows.some((r) => localOf(r, library, []).item) ? await ctx.campus(c) : null;
+        return sendJson(res, {
+          scans: rows.map((row) => {
+            const { job, item } = localOf(row, library, jobs);
+            return {
+              ...row, busy: busy.has(row.id),
+              job: job ? { id: job.id, status: job.status, stage: job.stage || null, error: job.error || null } : null,
+              splat: item ? { path: item.path, title: `${item.info.building || item.building} · ${item.info.room || item.room}`, created: item.info.created || null, view: item.info.view || null, review: item.info.review || null } : null,
+              award: item && row.status !== 'approved' && row.status !== 'rejected' ? pointsFor(row, item, data, missions) : null,
+            };
+          }),
+        });
+      }
 
-      case '/api/club/review': {
-        const ids = (post.ids || []).filter((id) => /^[0-9a-f-]{36}$/.test(id));
-        if (!ids.length) return sendJson(res, { error: 'No photos chosen' }, 400);
-        if (ids.some((id) => busy.has(id))) return sendJson(res, { error: 'Those photos are being reviewed already' }, 409);
-        ids.forEach((id) => busy.add(id));
+      case '/api/club/scan': {
+        const id = String(post.id || '');
+        if (!/^[0-9a-f-]{36}$/.test(id)) return sendJson(res, { error: 'Bad scan id' }, 400);
+        if (busy.has(id)) return sendJson(res, { error: 'Already working on that scan' }, 409);
+        busy.add(id);
         try {
-          const r = await club.review(c, cfg, { ids, action: post.action, note: String(post.note || '').slice(0, 200) });
-          say(`Club review: ${post.action} ${r.changed} photo(s)${r.points ? `, ${r.points} points awarded` : ''}.`);
-          if (r.changed && ctx.onPhotosChanged) ctx.onPhotosChanged(); // members' Campus map follows
-          return sendJson(res, { ok: true, ...r });
+          const [row] = await crowd.call(c, `/rest/v1/captures?select=id,user_id,building_code,building_name,floor,room,grade,status,points,contributor&id=eq.${encodeURIComponent(id)}`);
+          if (!row && post.op !== 'delete') return sendJson(res, { error: 'That scan is no longer in the club database' }, 404);
+          const place = row ? [row.building_name, row.room].filter(Boolean).join(' · ') : 'a scan';
+          if (post.op === 'import') {
+            let last = 0;
+            const file = await crowd.importUpload(c, id, cfg.dirs.inbox, (p) => {
+              if (p - last >= 0.25) say(`Club scan: downloading ${Math.round((last = p) * 100)}%`);
+            });
+            say(`Club scan of ${place} is in Ready to process: ${basename(file)}`);
+            setTimeout(scanInbox, 100);
+            return sendJson(res, { ok: true, file: basename(file) });
+          }
+          if (post.op === 'delete') {
+            await crowd.deleteUpload(c, id);
+            say(`Club: deleted the scan of ${place} from the club database.`);
+            if (ctx.onCampusChanged) ctx.onCampusChanged();
+            return sendJson(res, { ok: true });
+          }
+          const { item } = localOf(row, ctx.library(), []);
+          if (post.op === 'approve') {
+            if (!item) return sendJson(res, { error: 'Build its splat first: approving puts the splat on the campus map.' }, 400);
+            if (row.status === 'approved') return sendJson(res, { error: 'Already approved' }, 409);
+            const award = pointsFor(row, item, await ctx.campus(c), await club.listMissions(c));
+            await club.approveScan(c, id, award.points);
+            club.setReview(join(cfg.dirs.library, item.path), { status: 'approved', points: award.points, parts: award.parts });
+            say(`Club: approved the scan of ${place} (+${award.points} points).`);
+            if (ctx.onCampusChanged) ctx.onCampusChanged();
+            return sendJson(res, { ok: true, points: award.points, parts: award.parts });
+          }
+          if (post.op === 'reject') {
+            const note = String(post.note || '').trim().slice(0, 400);
+            await club.rejectScan(c, id, note);
+            if (item) club.setReview(join(cfg.dirs.library, item.path), { status: 'rejected', note });
+            say(`Club: didn’t approve the scan of ${place}${note ? ` (${note})` : ''}.`);
+            if (ctx.onCampusChanged) ctx.onCampusChanged();
+            return sendJson(res, { ok: true });
+          }
+          return sendJson(res, { error: 'Unknown operation' }, 400);
         } finally {
-          ids.forEach((id) => busy.delete(id));
+          busy.delete(id);
         }
-      }
-      case '/api/club/free-cloud': {
-        const r = await club.freeCloud(c, cfg);
-        say(`Club: removed ${r.photos} photos (${(r.bytes / 1048576).toFixed(0)} MB) from the cloud; they stay on this PC.`);
-        return sendJson(res, { ok: true, ...r });
-      }
-      case '/api/club/build': {
-        const r = await club.buildCapture(c, cfg, { building_code: String(post.building_code || ''), floor: String(post.floor || ''), room: String(post.room || '') }, cfg.dirs.inbox, version);
-        say(`Club photos of ${post.room || post.building_code}: ${r.photos} photos from ${r.contributors.join(', ')} are in Ready to process${r.ar && r.ar.session ? `, ${r.ar.photos} with AR positions to start the camera solve from` : ''}.`);
-        setTimeout(scanInbox, 100);
-        return sendJson(res, { ok: true, ...r, file: r.file.split(/[\\/]/).pop() });
       }
 
       case '/api/club/missions':
@@ -131,7 +166,8 @@ export async function handleClub(ctx) {
         else if (post.op === 'ban') await club.setMember(c, id, { banned: !!post.banned });
         else if (post.op === 'purge') {
           const r = await club.purgeMember(c, cfg, id);
-          say(`Club: removed a member and ${r.photos} photo(s).`);
+          say(`Club: removed a member, ${r.scans} scan(s)${r.photos ? ` and ${r.photos} old photo(s)` : ''}.`);
+          if (ctx.onCampusChanged) ctx.onCampusChanged();
         } else return sendJson(res, { error: 'Unknown operation' }, 400);
         return sendJson(res, { ok: true });
       }

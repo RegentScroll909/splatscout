@@ -34,6 +34,7 @@ export function transformsJson(frames, plyName) {
       ].map((row) => row.map(r6)),
     };
     if (!uniform) Object.assign(fr, { fl_x: r6(f.intr.fx), fl_y: r6(f.intr.fy), cx: r6(f.intr.cx), cy: r6(f.intr.cy), w: f.intr.w, h: f.intr.h });
+    if (f.segment != null) fr.segment = f.segment; // the AR session it was taken in (readers ignore it)
     return fr;
   });
   if (plyName) out.ply_file_path = plyName;

@@ -1,8 +1,8 @@
-// Campus (club beta): where the club still needs photos. A map of ASU buildings coloured by how much of their
-// floor area the club's photos cover, the buildings near you, and for each space about how many more photos, in which
-// light, would make a good splat, with a button that opens Snap already filled in. SplatStation works the
-// numbers out on the club PC and publishes them (data/campusmap.js); the colours follow the same rules as its
-// Campus page. The list of buildings under the map carries the same information without the map.
+// Campus (club beta): where the club still needs scans. A map of ASU buildings coloured by how much of their
+// floor area the club's approved splats cover, the buildings near you, and for each space where it stands,
+// with a Scan here button that opens the capture setup already filled in. SplatStation works the numbers out
+// on the club PC and publishes them (data/campusmap.js); the colours follow the same rules as its Campus page.
+// The list of buildings under the map carries the same information without the map.
 
 import { h, mount, toast } from './dom.js';
 import { icon } from './icons.js';
@@ -10,7 +10,6 @@ import * as campus from '../data/campus.js';
 import * as club from '../data/club.js';
 import * as CM from '../data/campusmap.js';
 import { getSettings, setSettings } from '../data/settings.js';
-import { LIGHT_SLOTS, LIGHT_LABEL } from '../core/clubrules.js';
 
 const NS = 'http://www.w3.org/2000/svg';
 /** Quality bands as status chips: colour + symbol + words, never colour alone (same as SplatStation). */
@@ -58,7 +57,7 @@ export async function campusScreen(root, { navigate, query }) {
   let alive = true;
   const status = h('div.status-line', h('span.status-dot.pending'), h('span.small', 'Loading the campus map…'));
   const seg = h('div.seg.campus-seg', { role: 'group', 'aria-label': 'Campus' });
-  const svg = s('svg', { id: 'cmap', role: 'img', 'aria-label': 'Map of the campus: buildings coloured by how much of their floor area the club’s photos cover. The list of buildings below has the same information.' });
+  const svg = s('svg', { id: 'cmap', role: 'img', 'aria-label': 'Map of the campus: buildings coloured by how much of their floor area the club’s splats cover. The list of buildings below has the same information.' });
   const legend = h('div.c-legend');
   const mapCard = h('section.card.cmap-card',
     h('div.cmap-wrap', svg,
@@ -100,7 +99,7 @@ export async function campusScreen(root, { navigate, query }) {
     else if (sm.missing) [dot, text] = ['warn', 'The club hasn’t switched the campus map on yet. Buildings are shown without colours.'];
     else if (!sm.at) [dot, text] = ['warn', 'The club PC hasn’t published what it needs yet. Buildings are shown without colours.'];
     else if (sm.offline) [dot, text] = ['warn', `Offline: the map as of ${ago(sm.at)} (${n} spaces).`];
-    else text = `Updated by the club PC ${ago(sm.at)} · ${n} space${n === 1 ? '' : 's'} with photos`;
+    else text = `Updated by the club PC ${ago(sm.at)} · ${n} space${n === 1 ? '' : 's'} scanned`;
     mount(status, h('span.status-dot.' + dot + (S.loading ? '.pending' : '')), h('span.small', text));
   }
 
@@ -363,16 +362,13 @@ export async function campusScreen(root, { navigate, query }) {
     } else drawMap(false);
     if (b && zoomTo) setView(focusBox(b));
     renderDetail();
-    // Keep the address up to date, so Snap's back button returns to this building.
+    // Keep the address up to date, so the back button returns to this building.
     history.replaceState(null, '', '#/campus' + (code ? `?b=${encodeURIComponent(code)}` : ''));
     if (code) (zoomTo ? mapCard : detail).scrollIntoView({ behavior: 'smooth', block: zoomTo ? 'start' : 'nearest' });
   }
 
-  const snapUrl = (b, x) => '#/snap?' + new URLSearchParams({
-    building: b.code, floor: x ? x.floor || '' : '1', room: x ? x.room : 'Main entrance',
-    ...(x && x.need_light && x.score < CM.EXCELLENT ? { light: x.need_light } : {}),
-    back: `#/campus?b=${b.code}`,
-  });
+  /** "Scan here": the capture setup with the building (and the space, when there is one) filled in. */
+  const scanHere = (b, x) => navigate(CM.scanUrl(b.code, x ? x.floor : '1', x ? x.room : 'Main entrance'));
 
   // ------------------------------------------------------------------ the panel under the map
   function renderDetail() {
@@ -386,42 +382,34 @@ export async function campusScreen(root, { navigate, query }) {
 
   function overviewPanel() {
     const bs = campusBuildings();
-    const now = CM.lightNow();
-    const shoot = CM.closestToGood(bs, { light: now, limit: 4 });
-    // The quickest wins in other light too: worth knowing when to come back.
-    const other = CM.closestToGood(bs, { limit: 8 }).filter((p) => !shoot.some((q) => q.x === p.x)).slice(0, 3);
+    const better = CM.notGoodYet(bs, { limit: 5 });
     const near = S.fix ? CM.nearby(bs, S.fix, { within: 700, limit: 5 }) : [];
     const withDist = (b, text) => (S.fix ? `${fmtDist(distOf(b))} · ${text}` : text);
     return [
       h('h2', 'Where to go'),
-      h('p.small.muted.c-now', `Now: ${CM.lightWords(now)}`),
       h('h4', 'Near you'),
       S.fix
         ? near.length
-          ? h('div.c-rows', near.map(({ b, dist }) => {
-              const top = CM.closestToGood([b], { limit: 1 })[0];
-              const tip = top ? ` · ${placeName(top.x)}: ~${top.x.need_good}${top.x.need_light ? ' ' + top.x.need_light : ''} photos to Good` : '';
-              return h('button.c-row', { onclick: () => select(b.code, true) },
-                h('span.c-row-main', h('span.c-row-title', b.name), h('span.c-row-meta', `${fmtDist(dist)} · ${b.spaces.length ? `${pct(b.completion)} covered` : 'no photos yet'}${tip}`)),
-                h('span.sw.big', { style: { background: BIN_COLOR[CM.completionBin(b)] || 'transparent' }, 'aria-hidden': 'true' }));
-            }))
-          : h('p.small.muted', `No ASU building that can be photographed within 700 m (GPS good to ${S.fix.acc} m).`)
+          ? h('div.c-rows', near.map(({ b, dist }) =>
+              h('button.c-row', { onclick: () => select(b.code, true) },
+                h('span.c-row-main', h('span.c-row-title', b.name), h('span.c-row-meta', `${fmtDist(dist)} · ${b.spaces.length ? `${pct(b.completion)} covered` : 'not on the map yet'}`)),
+                h('span.sw.big', { style: { background: BIN_COLOR[CM.completionBin(b)] || 'transparent' }, 'aria-hidden': 'true' }))))
+          : h('p.small.muted', `No ASU building that can be scanned within 700 m (GPS good to ${S.fix.acc} m).`)
         : h('div.geo-row', h('button.btn.small', { onclick: () => locate(false), disabled: S.locating }, icon('pin'), S.locating ? 'Finding you…' : 'Show buildings near me'), S.geoMsg ? h('span.small.muted', S.geoMsg) : null),
-      h('h4', `Good to shoot now · ${LIGHT_LABEL[now]} light`),
-      shoot.length
-        ? h('div.c-rows', shoot.map(({ b, x }) => placeRow(b, x, withDist(b, `~${x.need_good} more photo${x.need_good === 1 ? '' : 's'} to Good`))))
-        : h('p.small.muted', S.summary && S.summary.at ? `No space on the ${S.campus} campus is waiting for ${LIGHT_LABEL[now].toLowerCase()} light right now.` : 'Once the club PC publishes what it needs, the spaces closest to a good splat show up here.'),
-      other.length ? [h('h4', 'Closest to Good, other light'), h('div.c-rows', other.map(({ b, x }) => placeRow(b, x, withDist(b, `~${x.need_good} more in ${x.need_light ? CM.lightWords(x.need_light) : 'one kind of light'}`))))] : null,
-      h('p.small.muted', 'Tap a building on the map or in the list for its spaces and what each one needs.'),
+      h('h4', 'On the map, but not Good yet'),
+      better.length
+        ? h('div.c-rows', better.map(({ b, x }) => placeRow(b, x, withDist(b, 'a new scan graded A or B would make it better'))))
+        : h('p.small.muted', S.summary && S.summary.at ? `Every space on the ${S.campus} campus map is Good or better. New spaces are what’s missing.` : 'Once the club publishes its map, spaces that need a better scan show up here.'),
+      h('p.small.muted', 'Tap a building on the map or in the list for its spaces. Every building that isn’t on the map yet needs a first scan, starting with its entrance or lobby.'),
     ];
   }
 
   function buildingPanel(b) {
     const head = h('div.row.space', h('span.kicker', [b.campus, b.ref].filter(Boolean).join(' · ')), h('button.btn.small.ghost', { onclick: () => select(null, false) }, 'All buildings'));
     if (b.restricted) {
-      return [head, h('h3', b.name), h('p.small.muted', `Off limits: this is ${campus.RESTRICTED_TEXT[b.restricted] || 'a building the club doesn’t photograph'}, so the club doesn’t take photos here.`)];
+      return [head, h('h3', b.name), h('p.small.muted', `Off limits: this is ${campus.RESTRICTED_TEXT[b.restricted] || 'a building the club doesn’t scan'}, so the club doesn’t scan here.`)];
     }
-    const sum = (k) => b.spaces.reduce((n, x) => n + (k === 'photos' ? CM.photosOf(x) : x[k] || 0), 0);
+    const sum = (k) => b.spaces.reduce((n, x) => n + (x[k] || 0), 0);
     const dist = distOf(b);
     return [
       head,
@@ -429,36 +417,30 @@ export async function campusScreen(root, { navigate, query }) {
       h('div.c-big', h('span.big', pct(b.completion)), h('span.small.muted', `of its floor area · about ${fmtArea(b.covered)} of ${fmtArea(b.floorArea.area)}`)),
       meter(b.completion),
       h('p.small.muted', [
-        b.spaces.length ? `${sum('photos')} photos accepted` : `${b.floorArea.floors} floor${b.floorArea.floors === 1 ? '' : 's'} of ${fmtArea(b.floorArea.footprint)}`, sum('pending') ? `${sum('pending')} waiting for review` : null,
-        sum('builds') ? `${sum('builds')} splat${sum('builds') === 1 ? '' : 's'} built` : null, dist != null ? fmtDist(dist) + (dist >= 1 ? ' away' : '') : null,
+        sum('builds') ? `${sum('builds')} splat${sum('builds') === 1 ? '' : 's'} on the map` : `${b.floorArea.floors} floor${b.floorArea.floors === 1 ? '' : 's'} of ${fmtArea(b.floorArea.footprint)}`,
+        sum('scans') + sum('queued') ? `${sum('scans') + sum('queued')} scan${sum('scans') + sum('queued') === 1 ? '' : 's'} in review` : null,
+        dist != null ? fmtDist(dist) + (dist >= 1 ? ' away' : '') : null,
       ].filter(Boolean).join(' · ')),
       b.byFloor.length ? h('p.small.muted', 'By floor: ', b.byFloor.map((f) => `${f.floor ? `Floor ${f.floor}` : 'floor not given'} ${pct(f.share)}`).join(' · ')) : null,
       b.spaces.length
         ? [h('h4', `Spaces (${b.spaces.length})`), h('div.c-spaces', b.spaces.map((x) => spaceCard(b, x))),
-            h('button.btn.small.ghost', { onclick: () => navigate(snapUrl(b, { floor: '', room: '' })) }, icon('camera'), 'Photos of another space here')]
-        : [h('p.small', `Nothing yet. Start with the main entrance or lobby: about ${CM.photosForGood('large')} photos in one kind of light make a big space like that Good. Walk a few steps between photos so every wall is seen from several spots.`),
-            h('button.btn.primary', { onclick: () => navigate(snapUrl(b, null)) }, icon('camera'), 'Take photos here')],
+            h('button.btn.small.ghost', { onclick: () => navigate(CM.scanUrl(b.code)) }, icon('camera'), 'Scan another space here')]
+        : [h('p.small', 'Not on the map yet. Start with the main entrance or lobby: one scan graded B or better, about 10–20 minutes with the capture coach.'),
+            h('button.btn.primary', { onclick: () => scanHere(b, null) }, icon('camera'), 'Scan here')],
     ];
   }
 
   function spaceCard(b, x) {
+    const waiting = (x.scans || 0) + (x.queued || 0);
     const extra = [
-      x.pending ? `${x.pending} waiting for review` : null,
-      x.builds ? `${x.builds} splat${x.builds === 1 ? '' : 's'} built` : null,
-      x.queued ? `${x.queued} capture${x.queued === 1 ? '' : 's'} waiting on the club PC` : null,
-      x.scans ? `${x.scans} scan${x.scans === 1 ? '' : 's'}` : null,
+      x.builds ? `${x.builds} splat${x.builds === 1 ? '' : 's'} on the map` : null,
+      waiting ? `${waiting} scan${waiting === 1 ? '' : 's'} in review` : null,
     ].filter(Boolean).join(' · ');
-    const now = CM.lightNow();
     return h('div.c-space',
-      h('div.row.space', h('b', placeName(x)), chip(x)),
-      h('div.lights', { role: 'list', 'aria-label': 'Accepted photos in each kind of light' }, LIGHT_SLOTS.map((k) => {
-        const want = x.need_light === k && x.score < CM.EXCELLENT;
-        return h('div' + (want ? '.want' : ''), { role: 'listitem', title: `${LIGHT_LABEL[k]} light, ${CM.LIGHT_HOURS[k]}` },
-          h('span', LIGHT_LABEL[k]), h('b.mono', String(x[k] || 0)), h('i', want ? 'needed' : k === now ? 'now' : ' '));
-      })),
+      h('div.row.space', h('b', placeName(x)), x.builds ? chip(x) : waiting ? h('span.tag', 'In review') : null),
       h('p.small', CM.needText(x)),
       extra ? h('p.small.muted', extra) : null,
-      x.score < CM.EXCELLENT ? h('button.btn.small', { onclick: () => navigate(snapUrl(b, x)) }, icon('camera'), 'Take photos here') : null);
+      x.score < CM.EXCELLENT ? h('button.btn.small', { onclick: () => scanHere(b, x) }, icon('camera'), 'Scan here') : null);
   }
 
   // ------------------------------------------------------------------ campuses and the list of buildings
@@ -497,9 +479,9 @@ export async function campusScreen(root, { navigate, query }) {
             h('span.sw.big', { style: b.restricted ? { background: 'var(--off)' } : { background: BIN_COLOR[CM.completionBin(b)] || 'transparent', border: CM.completionBin(b) ? '0' : '1px solid rgba(255,255,255,0.22)' }, 'aria-hidden': 'true' }),
             h('span.c-row-main',
               h('span.c-row-title', b.name + (b.ref && b.ref.length >= 2 ? ` (${b.ref})` : '')),
-              h('span.c-row-meta', b.restricted ? 'Off limits' : b.spaces.length ? `${pct(b.completion)} of its floor area · ${b.spaces.length} space${b.spaces.length === 1 ? '' : 's'}, ${b.good} Good · best ${bandOf({ score: b.best }).label}` : `No photos yet · ${fmtArea(b.floorArea.area)} of floor`)),
+              h('span.c-row-meta', b.restricted ? 'Off limits' : b.spaces.length ? `${pct(b.completion)} of its floor area · ${b.spaces.length} space${b.spaces.length === 1 ? '' : 's'}, ${b.good} Good · best ${bandOf({ score: b.best }).label}` : `Not on the map yet · ${fmtArea(b.floorArea.area)} of floor`)),
             b.restricted ? null : icon('chevron', 'dim'))))
-        : h('p.small.muted', S.show === 'started' ? `No building on the ${S.campus} campus has photos yet.` : 'No buildings match.'));
+        : h('p.small.muted', S.show === 'started' ? `No building on the ${S.campus} campus is on the map yet.` : 'No buildings match.'));
   }
 
   function renderAll(fit) {
@@ -520,7 +502,7 @@ export async function campusScreen(root, { navigate, query }) {
   if (!me) {
     mount(root, h('div.page',
       h('header.page-head', h('button.icon-btn', { onclick: () => navigate('#/club'), 'aria-label': 'Back' }, icon('back')), h('div.head-text', h('div.kicker', 'Club beta'), h('h1', 'Campus'))),
-      h('section.card', h('h2', 'Members only'), h('p.small', 'The campus map shows where the club still needs photos. Join the club to see it.'), h('button.btn.primary', { onclick: () => navigate('#/club?join=1&back=' + encodeURIComponent('#/campus')) }, 'Join the club'))));
+      h('section.card', h('h2', 'Members only'), h('p.small', 'The campus map shows where the club still needs scans. Join the club to see it.'), h('button.btn.primary', { onclick: () => navigate('#/club?join=1&back=' + encodeURIComponent('#/campus')) }, 'Join the club'))));
     return () => (alive = false);
   }
   S.list = await campus.buildings();

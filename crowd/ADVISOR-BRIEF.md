@@ -1,89 +1,87 @@
 # SplatScout Club (beta): brief for the club advisor
 
-**In one line:** a closed beta that lets club members contribute sharp photos of shared campus spaces from their
-phones, tagged by building, floor and room, so the club can build 3D models of campus from many people's photos.
-Points, missions and a leaderboard make it a friendly competition.
+**In one line:** a closed beta that lets club members scan shared campus spaces with their phones, one room or
+area at a time, so the club can build a 3D map of campus from many people's scans. A club member reviews every
+3D model before anyone sees it. Points, missions and a leaderboard make it a friendly competition.
 
-## Why this exists
+## Why full scans, not single photos
 
-A full scan of one room by one person takes 10–20 minutes, so few people will do it. A single photo takes seconds.
-The 3D models (Gaussian splats) need photos that overlap, are sharp, and are filed by where they were taken, and
-they look best when a room is covered in several kinds of light (morning, afternoon, evening, night), which one
-person on one visit can't do. Many people each adding a few photos can.
+The 3D models (Gaussian splats) need one consistent scene: one lighting, one arrangement of the furniture, and
+overlapping photos from planned spots all around the space. An earlier version of the beta collected single
+photos from many people instead. That was retired: photos taken by different people at different times mix
+daylight, lamps and moved chairs into blotchy, ghosted models, and photos taken here and there rarely cover a room
+well (a room needs about 100–200 overlapping photos). A full scan with the app's capture coach takes one person
+10–20 minutes and produces exactly that consistent set, graded A to F as it goes.
 
 ## What works today
 
 On the phone (the SplatScout web app):
 - **Join** with an invite code, a handle (shown on the leaderboard) and by agreeing to the rules.
-- **Take photos**: pick the building (GPS suggests it, you confirm), floor and room, then shoot. A photo that is
-  blurry, too dark or almost the same as one just taken is not kept. Camera only, no gallery uploads.
-- Photos are saved on the phone first and sent in the background, so it works with a poor signal.
-- **Club screen**: your points and rank, the leaderboard (this week / all time), missions, and what happened to
-  each photo you sent. **Leave the club** deletes everything you sent.
+- **Scan** a space with the capture coach: pick the building (GPS suggests it, you confirm), floor and room, then
+  follow the guide. The coach grades the scan; **only scans graded B or better can be sent** (the database refuses
+  anything else).
+- **Club screen**: your points and rank, the leaderboard (this week / all time), missions ("Scan the Hayden reading
+  room, +15") with a *Scan here* button, and what happened to each scan you sent. **Leave the club** deletes
+  everything you sent.
+- **Campus map**: ASU's buildings coloured by how much of their floor area the club's approved models cover, and
+  which spaces still need a scan.
 
-On the club PC (SplatStation, a page only that PC can open):
-- **Sync** downloads new photos and checks each one (size, sharpness, light, duplicates, GPS far from the
-  building, wrong phone clock) for a first opinion. A person then looks at each thumbnail and accepts or rejects.
-- **Accepting awards points**; **rejecting deletes the photo** here and in the cloud, with a reason shown to the
-  member.
-- **Missions** ("Hayden lobby, evening light, +3 per photo"), **invite codes**, member pause/rename/remove, and the
-  list of off-limits buildings.
-- **Build a capture**: the accepted photos of one room become a capture that the existing pipeline turns into a
-  3D model. Tested up to the capture appearing in *Ready to process*; training a model from real club photos of a
-  room has not been tried yet (see limits).
+On the club PC (SplatStation, pages only that PC can open):
+- **Import** a member's scan: it becomes a capture the existing pipeline turns into a 3D model (10–25 minutes).
+- **Review**: a club member looks at the finished model, in the viewer and placed among the building's other models,
+  and **approves** it (it goes on the campus map and the member gets their points) or **doesn't** (the member sees
+  the reason in the app; nothing goes on the map).
+- **Missions**, **invite codes**, member pause/rename/remove, and the list of off-limits buildings.
+- **Campus page**: every building's coverage (as a share of its floor area), floor by floor, with where the photos
+  of each model were taken.
 
-## How a photo travels
+## How a scan travels
 
-phone camera → checked on the phone → saved on the phone → sent over HTTPS to the club's private database
-(Supabase) → downloaded by the club PC → looked at by a club member → **accepted** (stays on the club PC, earns
-points) or **rejected** (deleted everywhere) → accepted photos of a room become a 3D model on the club PC.
+phone camera and AR tracking → graded by the coach on the phone → sent over HTTPS to the club's private database
+(Supabase) → downloaded by the club PC → built into a 3D model → looked at by a club member → **approved** (on the
+campus map, points for the member) or **not approved** (off the map, with a reason).
 
 ## Safeguards built in
 
 | Concern | What the beta does |
 |---|---|
 | Who can take part | Invite code, handle and agreed rules. The database accepts nothing from anyone else, and a stranger can't even read the leaderboard. Codes are limited in uses and can be switched off. |
-| Where people may photograph | Residence halls and housing, health and counseling, police and courts, and children's centers can't be picked in the app, and the database refuses them even if someone bypasses the app. The list comes from OpenStreetMap's building types, and the club can add or remove any building. The rules also exclude restrooms, locker rooms, labs, offices and classes in session. |
-| People in photos | Rules say no people. **Photos are checked by a person, not by software**: a photo showing someone is rejected and deleted. There is no automatic face detection or blurring yet. |
-| Screens and documents | Rules say to keep them out of frame; checked in the same human review. |
-| Privacy of the files | Photos go to a private bucket. A phone can read, add and delete only its own. Photos carry no GPS or camera metadata inside the file; the GPS reading, building, room and phone model are stored in the database row. |
-| Withdrawing | Any member can delete all of their photos, scans and profile from the Club screen. The club can also remove a member and everything they sent. Models already built from a photo are not undone automatically (the consent text says so). |
-| Cheating | Points are only ever set by the club PC, after a person has looked: a phone can't give itself points. Near-duplicates, GPS far from the building, and a wrong phone clock are flagged. Base points stop at 100 a day; a phone can add at most 400 photos a day. |
+| Where people may scan | Residence halls and housing, health and counseling, police and courts, and children's centers can't be picked in the app, and the database refuses them even if someone bypasses the app. The list comes from OpenStreetMap's building types, and the club can add or remove any building. The rules also exclude restrooms, locker rooms, labs, offices and classes in session. |
+| People in scans | Rules say no people (pause until they've gone). **Every model is checked by a person before it is published**: one showing someone isn't approved. There is no automatic face detection or blurring yet. |
+| Screens and documents | Rules say to keep them out of view; checked in the same human review. |
+| Privacy of the files | Scans go to a private bucket. A phone can read, add and delete only its own. Photos carry no GPS or camera metadata inside the files; the GPS reading, building, room and phone model are stored in the database row. |
+| Withdrawing | Any member can delete all of their scans and profile from the Club screen. The club can also remove a member and everything they sent. Models already built from a scan are not undone automatically (the consent text says so). |
+| Cheating | Points are only ever set by the club PC, when a person approves a model: a phone can't give itself points or approve itself. Only scans graded B or better can be sent; re-scanning a space already on the map as Good earns little unless a mission asks for it. |
 | Admin access | The database's secret key lives only on the club PC, and the admin tools answer only that PC (not other devices on the Wi-Fi). |
-| Spam and storage | Closed beta; per-phone daily limit; storage on the free plan is about 1 GB (roughly 2,000 photos), and accepted photos can be moved off the cloud to the PC. |
+| Spam and storage | Closed beta; storage on the free plan is about 1 GB (a few scans at a time), and scans move off the cloud to the PC once imported. |
 
-The database rules are tested on a real PostgreSQL (who can add what, points only from the club PC, members-only
-views, the daily limit, bans, leaving) and the apps by 50 automated checks. The beta is also installed on the
-club's own database, where a full run passed: a stranger turned away, joining with an invite code, photos sent
-through the app's queue, a restricted building refused, review and points on the club PC, and leaving the club
-deleting everything.
+The database rules are tested on a real PostgreSQL (who can add what, scans only and graded B or better, points
+only from the club PC, members-only views, bans, leaving) and the apps by 64 automated checks.
 
 ## What we need from you (decisions, not code)
 
-1. **Permission and scope.** May club members photograph shared interior spaces of campus buildings for this
-   purpose? Is there anywhere ASU wants excluded beyond the default list? Who at ASU should be told?
+1. **Permission and scope.** May club members scan shared interior spaces of campus buildings for this purpose? Is
+   there anywhere ASU wants excluded beyond the default list? Who at ASU should be told?
 2. **Consent and rules wording.** The text in the app is a draft, marked as one (`app/js/core/clubrules.js`). It
-   should say who owns the photos and models, how models may be shown, how long data is kept, and how to withdraw.
-3. **People and faces.** Is human review enough for a closed beta of club members? What is required before the
-   beta is opened more widely (automatic face blurring, a privacy review, minors on campus)?
+   should say who owns the scans and models, how models may be shown, how long data is kept, and how to withdraw.
+3. **People and faces.** Is human review of every model enough for a closed beta of club members? What is required
+   before the beta is opened more widely (automatic face blurring, a privacy review, minors on campus)?
 4. **The competition.** Do prizes or public rankings need approval? Should membership be limited to people with an
    asu.edu address? (Accounts today are anonymous plus a handle and invite code, so clearing a phone's browser data
    loses the account and its points; asu.edu verification is not built.)
 5. **Where the data lives.** Free Supabase plan today. For the long term: ASU storage, and a faculty sponsor for
    the ASU supercomputer account (Sol's scratch space is cleared after about 30 days, so it is not an archive).
-6. **Who administers.** Whoever holds the PC with the secret key can see every photo. Who should that be?
+6. **Who administers.** Whoever holds the PC with the secret key can see every scan and approves what is
+   published. Who should that be?
 
 ## Known limits (honest list)
 
-- **Single photos alone don't make a splat indoors.** A room needs roughly 100 or more overlapping photos from
-  several spots. The beta's missions ask for specific views to help, but how many people it takes per room is
-  exactly what a pilot would measure. Outdoor spaces and busy lobbies are the likely first successes.
-- **Tested on a computer, not yet on real phones.** The camera, GPS and sending were exercised with a synthetic
-  camera and a stand-in database in a desktop browser; the database was tested separately on PostgreSQL. A real
-  phone test (indoor GPS accuracy, camera behavior, battery, iPhone) is the first thing to do in the pilot.
-- **Photos taken in different light or with moved furniture** are kept as separate light slots; nothing yet
-  combines them smartly. Building from a single light slot is the safe default.
-- **Review is manual**, so it fits tens to a few hundred photos a day, not thousands.
+- **Phone tracking slips at plain walls.** Scans can lose their place in front of blank walls; work is under way
+  so a scan carries on as a second part that the club PC joins up, and the coach warns earlier. Painter's tape or
+  sticky notes on long blank stretches help (and show in the model).
+- **Fewer, bigger contributions.** A scan takes 10–20 minutes, so fewer people will contribute than with quick
+  photos; missions point them at the spaces the map needs.
+- **Review is manual**, about a few minutes per model; it fits a club beta, not thousands of scans.
 - **GPS indoors** is often off by 10–50 m and can't tell floors apart, so it only suggests the building; floor and
   room are typed by the member.
 - **Two kinds of identity gaps:** handles are not checked against real people, and a handle can't be recovered on
@@ -91,23 +89,22 @@ deleting everything.
 
 ## Suggested pilot
 
-Club members only, one or two buildings, a few weeks. Measure: how many photos are accepted, how long review takes,
-how many rooms reach 100+ photos, and how good the resulting models are. Then decide on asu.edu login, automatic
-face detection and blurring, ASU storage, and processing on the supercomputer.
+Club members only, one or two buildings, a few weeks. Measure: how many scans are sent and approved, how long review
+takes, how much of each building's floor area the approved models cover, and how good they are (the PC measures
+each model's quality on photos held back from training). Then decide on asu.edu login, automatic face detection and
+blurring, ASU storage, and processing on the supercomputer.
 
-## Demo script (about 5 minutes)
+## Demo script (about 5 minutes, plus a model built beforehand)
 
 Before: SplatStation running on the PC with the club key set up; the app open on a phone; an invite code made on
-SplatStation's **Club** page (**Members and invites → New code**).
+SplatStation's **Club** page (**Members and invites → New code**); one member's scan already imported and built.
 
 1. **Phone:** Club → Join (handle, invite code, tick the rules). Point out the rules and the draft consent.
-2. **Phone:** Take photos → *Find my building* → pick the room → shoot a few. Show the ring (green when steady),
-   hold the phone shaking to show a blurry photo being refused, shoot the same spot twice to show the duplicate
-   warning, and try a residence hall to show it can't be chosen.
-3. **PC:** Club page → **Sync photos** → look at the thumbnails → **Accept**. Reject one to show the reason list
-   and that the photo is deleted.
-4. **Phone:** Club screen: points, rank and the leaderboard update; the rejected photo shows why.
-5. **PC:** add a **mission** ("evening light"), then show it on the phone. Make a second member on another device
-   to show the leaderboard.
-6. **PC:** for a room with 10+ accepted photos, **Build a capture** and show it in *Ready to process* on the
-   dashboard. Show a finished splat made earlier (training takes 10–25 minutes).
+2. **Phone:** Start a scan → *Find my building* → pick the room → follow the coach for a minute. Show the grade on
+   the review screen, that **Upload to the club** only appears at B or better, and that a residence hall can't be
+   chosen.
+3. **PC:** Club page → **Scans** → the built model → **View the splat** and **Place it in the building** → **Approve**
+   (the button shows the points: grade, new floor area, mission). Turn another one down to show the reason list.
+4. **Phone:** Club screen: points, rank and the leaderboard update; *My scans* shows the approval, and the reason for
+   the one turned down. Campus map: the space is now on the map.
+5. **PC:** add a **mission** ("Scan the reading room"), then show it on the phone with its *Scan here* button.

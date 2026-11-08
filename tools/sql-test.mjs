@@ -1,4 +1,5 @@
-// Runs crowd/supabase-setup.sql, supabase-beta.sql, supabase-campus.sql, -campus-2.sql and -snap-pose.sql on a local Postgres (PGlite, Postgres
+// Runs crowd/supabase-setup.sql, supabase-beta.sql, supabase-campus.sql, -campus-2.sql and -snap-pose.sql (then, at the
+// end, supabase-scans-only.sql) on a local Postgres (PGlite, Postgres
 // compiled to WebAssembly) with just enough of Supabase stubbed (roles, auth.uid(), storage tables), then checks
 // that the rules do what they say: who can add what, that points can only come from SplatStation, and so on.
 // Not part of `npm run check` (the project has no dependencies). To run it:
@@ -283,6 +284,39 @@ assert.equal(r.n, 1, 'leaving the club');
 assert.ok(!(await as(A, 'select * from public.leaderboard')).rows.some((x) => x.handle === 'Desert_Fox'));
 assert.equal((await as(A, 'select * from public.campus_spaces')).rows.length, 0, 'having left, no campus summary either');
 pass('400-a-day cap, bans, and leaving the club removes your photos, files and profile');
+
+// ---- supabase-scans-only.sql: full scans only (B or better), no new photos, points from approved scans
+await run('supabase-scans-only.sql');
+const scansOnly = (await run('supabase-scans-only.sql')).at(-1).rows[0]; // safe to run again
+assert.deepEqual(scansOnly, { result: 'SplatScout club takes scans only', photo_uploads_open: 0, review_note_column: 1 });
+const D = '44444444-4444-4444-8444-444444444444', E = '55555555-5555-4555-8555-555555555555';
+await db.exec(`insert into auth.users (id) values ('${D}'), ('${E}');
+  insert into public.invites (code, label, max_uses) values ('CLUB-SCAN', 'scans', 5);`);
+ok(await as(D, `select public.join_club('Scan_Hawk', 'CLUB-SCAN', 'beta-2')`), 'joining works as before');
+ok(await as(E, `select public.join_club('Scan_Owl', 'CLUB-SCAN', 'beta-2')`), 'a second member');
+fails(await as(D, ...photoSql(uuid(40))), 'a single photo', /row-level security/);
+const scanSql = (id, grade, room = 'Main lobby') => [`insert into public.captures (id, building_code, building_name, room, storage_prefix, photo_count, grade)
+  values ($1, 'hayden-library', 'Hayden Library', $2, $3, 300, $4)`, [id, room, `hayden-library/floor-1-${room.toLowerCase().replace(/\W+/g, '-')}/${id}`, grade]];
+fails(await as(D, ...scanSql(uuid(41), 'C')), 'a scan graded C', /row-level security/);
+fails(await as(D, ...scanSql(uuid(42), null)), 'a scan with no grade', /row-level security/);
+ok(await as(D, ...scanSql(uuid(43), 'B')), 'a scan graded B');
+ok(await as(E, ...scanSql(uuid(44), 'A', 'Reading room')), 'and one graded A');
+fails(await as(D, `insert into public.captures (id, building_code, building_name, storage_prefix, photo_count, grade, review_note)
+  values ('${uuid(45)}', 'hayden-library', 'Hayden Library', 'hayden-library/x/${uuid(45)}', 300, 'A', 'approve me')`), 'a scan with its own review note', /row-level security/);
+// SplatStation approves one and is still working on the other.
+await db.exec(`update public.captures set status = 'approved', points = 45, reviewed_at = now() where id = '${uuid(43)}';
+  update public.captures set status = 'processed' where id = '${uuid(44)}';`);
+const lb = (await as(E, 'select * from public.leaderboard')).rows.filter((x) => /^Scan_/.test(x.handle));
+assert.deepEqual(lb.map((x) => [x.handle, x.points, x.photos, x.scans]), [['Scan_Hawk', 45, 0, 1], ['Scan_Owl', 0, 0, 0]], 'only approved scans count');
+assert.equal((await as(D, 'select * from public.leaderboard_week')).rows.find((x) => x.handle === 'Scan_Hawk').points, 45, 'this week too');
+fails(await as(D, `update public.captures set points = 500 where id = '${uuid(43)}'`), 'a member raising their points', /permission denied/);
+fails(await as(D, `update public.captures set review_note = 'fine' where id = '${uuid(43)}'`), 'a member writing a review note', /permission denied/);
+ok(await as('service', `update public.captures set status = 'rejected', reviewed_at = now(), review_note = 'People in view' where id = '${uuid(44)}'`), 'SplatStation explains a rejection');
+assert.deepEqual((await as(E, 'select status, points, review_note from public.captures')).rows, [{ status: 'rejected', points: 0, review_note: 'People in view' }], 'members read why');
+ok(await as('service', `insert into public.missions (title, building_code, room, bonus, created_at) values ('Scan the Hayden lobby', 'hayden-library', 'main lobby ', 10, now() - interval '1 day')`), 'a mission');
+const mo = (await as(D, 'select title, done, bonus from public.missions_open')).rows.find((m) => m.title === 'Scan the Hayden lobby');
+assert.deepEqual([mo.done, mo.bonus], [1, 10], 'an approved scan of its space counts towards it (case and spaces aside)');
+pass('scans only: no new photos, scans graded B or better, points and missions from approved scans, review notes');
 
 console.log(`\n${checks} groups of checks passed`);
 await db.close();

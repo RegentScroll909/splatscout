@@ -4,7 +4,7 @@ import { h, mount, toast, fmtBytes, fmtDate, fmtDuration, confirmDialog, gradeCl
 import { icon } from './icons.js';
 import { analyzeCapture } from '../core/score.js';
 import { getTemplate } from '../core/plans.js';
-import { spaceOf } from '../core/spaces.js';
+import { spaceOf, partsOf } from '../core/spaces.js';
 import { drawTopDown, drawPanorama } from '../capture/minimap.js';
 import { buildExport, exportFiles, deliver } from '../data/exporter.js';
 import * as store from '../data/store.js';
@@ -12,6 +12,7 @@ import * as campus from '../data/campus.js';
 import { uploadCapture, deleteUpload } from '../data/crowd.js';
 import * as club from '../data/club.js';
 import { getSettings, setSettings } from '../data/settings.js';
+import { canUpload } from '../core/clubrules.js';
 
 const FLAG_LABEL = {
   blurry: 'blurry', rushed: 'rushed', dark: 'dark', highlights: 'glare', lowtex: 'blank', untracked: 'no pose', rotonly: 'turned only',
@@ -38,7 +39,7 @@ export async function reviewScreen(root, { captureId, navigate }) {
 
     const has3d = capture.tracking === '6dof' && a.vstats.solid > 50;
     const map = h('canvas.review-map', { width: 640, height: has3d ? 640 : 320 });
-    if (has3d) drawTopDown(map, { voxels: a.voxels, frames, pose: null, target: null, space: a.mainSpace, capture, bounds: a.bounds });
+    if (has3d) drawTopDown(map, { voxels: a.voxels, frames: a.shown || frames, pose: null, target: null, space: a.mainSpace, capture, bounds: a.bounds });
     else drawPanorama(map, { sphere: a.sphere, pose: null });
     const totalSize = frames.reduce((s, f) => s + (f.size || 0), 0);
     const flagged = frames.filter((f) => f.flags && f.flags.length);
@@ -69,11 +70,16 @@ export async function reviewScreen(root, { captureId, navigate }) {
           h('div.row',
             h('button.btn.primary', { onclick: () => navigate(`#/capture/${captureId}`) }, icon('camera'), 'Capture more'),
             h('button.btn', { onclick: () => openExport(a) }, icon('download'), 'Export'),
-            h('button.btn', { onclick: () => startUpload(a) }, icon('upload'), uploading() ? 'Resume upload' : 'Upload'),
+            canUpload(a.grade) || uploading()
+              ? h('button.btn', { onclick: () => startUpload(a) }, icon('upload'), uploading() ? 'Resume upload' : 'Upload to the club')
+              : h('button.btn', { disabled: true, title: 'The club takes scans graded B or better' }, icon('upload'), 'Upload to the club'),
             capture.exportedAt ? h('span.tag', `Exported ${fmtDate(capture.exportedAt)}`) : null,
             capture.upload && capture.upload.status === 'done' ? h('span.tag.good', `Uploaded ${fmtDate(capture.upload.finished)}`) : null,
             uploading() ? h('span.tag.warn', `Upload paused · ${(capture.upload.sent || []).length} files sent`) : null,
           ),
+          !canUpload(a.grade) && !uploading()
+            ? h('p.small.muted', `The club takes scans graded B or better, and this one is ${a.grade}. Use Capture more to fix what’s listed above, then upload it.`)
+            : null,
         ),
 
         h('section.card',
@@ -212,10 +218,8 @@ export async function reviewScreen(root, { captureId, navigate }) {
     const sel = { blurry: false, untracked: false, passes: new Set(), spaces: new Set() };
     const passes = [...new Set(frames.map((f) => f.pass))];
     const spaces = [...new Set(frames.filter((f) => f.tracked && f.pose).map((f) => spaceOf(f, capture)))];
-    const spaceName = (sp) => {
-      const segs = new Set(frames.filter((f) => f.tracked && spaceOf(f, capture) === sp).map((f) => f.segment));
-      return `${sp === a.mainSpace ? 'Main map' : 'Other map'} · ${segs.size} session${segs.size === 1 ? '' : 's'}`;
-    };
+    const partNo = new Map(partsOf(frames, capture).map((p) => [p.space, p.part]));
+    const spaceName = (sp) => `Part ${partNo.get(sp) || '?'}${sp === a.mainSpace ? ' (main: sets the coordinates)' : ''}`;
     const chosen = () =>
       frames.filter((f) =>
         !(sel.blurry && isBlurry(f)) &&
@@ -250,8 +254,8 @@ export async function reviewScreen(root, { captureId, navigate }) {
         untrackedN ? check('Photos without an AR position', untrackedN, false, (v) => (sel.untracked = v)) : null,
         passes.length > 1 ? h('h4', 'Passes') : null,
         passes.length > 1 ? passes.map((p) => check(passLabel(template, p), frames.filter((f) => f.pass === p).length, true, (v) => (v ? sel.passes.delete(p) : sel.passes.add(p)))) : null,
-        spaces.length > 1 ? h('h4', 'AR maps') : null,
-        spaces.length > 1 ? h('p.small.muted', 'Sessions that were lined up share a map. Only the main map gets AR positions; photos from other maps still help the camera solve.') : null,
+        spaces.length > 1 ? h('h4', 'Parts') : null,
+        spaces.length > 1 ? h('p.small.muted', 'Tracking was lost (or a later session started on its own), so this scan is in parts, each with its own AR positions. SplatStation joins them from the photos where they overlap. Leave a part out only if it shows somewhere else.') : null,
         spaces.length > 1 ? spaces.map((sp) => check(spaceName(sp), frames.filter((f) => f.tracked && spaceOf(f, capture) === sp).length, true, (v) => (v ? sel.spaces.delete(sp) : sel.spaces.add(sp)))) : null,
         summary,
         h('div.row.end', h('button.btn.ghost', { onclick: () => back.remove() }, 'Cancel'), go),
@@ -266,6 +270,8 @@ export async function reviewScreen(root, { captureId, navigate }) {
   const practice = () => /^demo/.test(capture.engine || '');
 
   async function startUpload(a) {
+    // The club takes scans graded B or better (the database refuses others too).
+    if (!uploading() && !canUpload(a.grade)) return toast('The club takes scans graded B or better');
     // Uploads are for club members (invite code, handle, rules agreed): the database refuses anyone else.
     let me = null;
     try {
