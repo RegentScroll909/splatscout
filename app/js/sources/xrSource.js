@@ -26,13 +26,15 @@ export class XRSource {
    * @param {HTMLElement} o.overlayRoot element shown on top of the AR view (DOM overlay)
    * @param {boolean} [o.flipY] flip camera frames vertically (settings fallback)
    * @param {number} [o.maxDepth] max depth to trust (m)
+   * @param {boolean} [o.depth] ask for ARCore depth (Snap's photos only need the poses)
    */
-  constructor({ overlayRoot, flipY = true, maxDepth = 6 }) {
+  constructor({ overlayRoot, flipY = true, maxDepth = 6, depth = true }) {
     this.kind = 'xr';
     this.tracking = '6dof';
     this.overlayRoot = overlayRoot;
     this.flip = flipY;
     this.maxDepth = maxDepth;
+    this.wantDepth = depth;
     this.info = { label: 'AR camera (ARCore)', camW: 0, camH: 0, depth: false, domOverlay: false };
     this.session = null;
     this._loop = this._loop.bind(this);
@@ -44,16 +46,20 @@ export class XRSource {
     // requestSession must be the first await so it still counts as a user gesture.
     const session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['local', 'camera-access'],
-      optionalFeatures: ['dom-overlay', 'depth-sensing', 'hit-test'],
+      optionalFeatures: this.wantDepth ? ['dom-overlay', 'depth-sensing', 'hit-test'] : ['dom-overlay', 'hit-test'],
       domOverlay: { root: this.overlayRoot },
-      depthSensing: {
-        usagePreference: ['cpu-optimized'],
-        dataFormatPreference: ['luminance-alpha', 'float32'],
-      },
+      ...(this.wantDepth ? { depthSensing: { usagePreference: ['cpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32'] } } : {}),
     });
     this.session = session;
     const feats = session.enabledFeatures ? Array.from(session.enabledFeatures) : null;
-    this.info.depth = feats ? feats.includes('depth-sensing') : !!session.depthUsage;
+    const depthUsage = () => {
+      try {
+        return !!session.depthUsage; // throws when depth sensing wasn't granted
+      } catch {
+        return false;
+      }
+    };
+    this.info.depth = this.wantDepth && (feats ? feats.includes('depth-sensing') : depthUsage());
     this.info.domOverlay = !!session.domOverlayState;
 
     const canvas = document.createElement('canvas');

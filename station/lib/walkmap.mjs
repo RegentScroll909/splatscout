@@ -218,7 +218,7 @@ export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric 
   if (!cams.length) throw new Error('No camera path to find the floor from');
   const R = upRotation(up);
   const sp = await readSplats(plyFile, R);
-  let C = cams.map((c) => ({ C: mul(R, c.C), fwd: mul(R, c.fwd) }));
+  let C = strayless(cams.map((c) => ({ C: mul(R, c.C), fwd: mul(R, c.fwd) })));
   let bx0 = Infinity, bx1 = -Infinity, bz0 = Infinity, bz1 = -Infinity;
   for (const { C: p } of C) {
     bx0 = Math.min(bx0, p[0]); bx1 = Math.max(bx1, p[0]);
@@ -380,15 +380,72 @@ export async function buildWalkMap(plyFile, { cams = [], up = [0, 1, 0], metric 
   for (const v of cells) v === FLOOR ? floorCells++ : v === BLOCK ? blockCells++ : 0;
   const first = C[0];
   const eye = Math.min(1.8, Math.max(1.2, median(C.map((c) => c.C[1] - F))));
+  const spaceCells = spaceOf(cells, W, H, C.map(({ C: p }) => [Math.floor((p[0] - gx0) / cell), Math.floor((p[2] - gz0) / cell)]));
   return {
     version: WALKMAP_VERSION,
     cell, x0: gx0, z0: gz0, W, H,
     floorY: F, eye, floorGuessed, metric,
     rot: R, scale: k,
     start: { x: first.C[0], z: first.C[2], yaw: Math.atan2(first.fwd[0], first.fwd[2]) },
-    stats: { splats: sp.total, used: sp.n, floorCells, blockCells },
+    // floorArea: the floor of the space the photos were taken in (m², in metres only when `metric`); none when the
+    // map had to be coarse to fit (a huge space, or a solve that scattered its cameras)
+    stats: { splats: sp.total, used: sp.n, floorCells, blockCells, floorArea: cell <= 0.25 ? Math.round(spaceCells * cell * cell * 10) / 10 : null },
     cells: encodeCells(cells),
   };
+}
+
+/**
+ * The phone's path without stray cameras. A solve can put the odd photo it barely matched kilometres away;
+ * that one would stretch the map over nothing. Kept: every camera within 6 times the path's typical distance
+ * from its middle (10 m at least), which keeps the whole of a long hallway.
+ */
+export function strayless(C) {
+  if (C.length < 5) return C;
+  const mid = [0, 1, 2].map((k) => median(C.map((c) => c.C[k])));
+  const d = C.map((c) => Math.hypot(c.C[0] - mid[0], c.C[1] - mid[1], c.C[2] - mid[2]));
+  const lim = Math.max(10, 6 * median(d));
+  return C.filter((_, i) => d[i] <= lim);
+}
+
+/**
+ * The cells of the space the photos were taken in: the floor reachable from where the phone went, and what
+ * that floor encloses (furniture, pillars), but not the walls around it. Through an open door it runs on as
+ * far as the map goes (3 m past the phone's path at most); furniture against a wall counts as wall.
+ * @param {Uint8Array} cells the sorted map, W×H
+ * @param {number[][]} starts [i, j] cells along the phone's path
+ */
+export function spaceOf(cells, W, H, starts) {
+  const reached = new Uint8Array(W * H), stack = [];
+  const reach = (i, j) => {
+    if (i < 0 || j < 0 || i >= W || j >= H) return;
+    const c = j * W + i;
+    if (reached[c] || cells[c] !== FLOOR) return;
+    reached[c] = 1;
+    stack.push(c);
+  };
+  for (const [i, j] of starts) reach(i, j);
+  while (stack.length) {
+    const c = stack.pop(), i = c % W, j = (c - i) / W;
+    reach(i + 1, j); reach(i - 1, j); reach(i, j + 1); reach(i, j - 1);
+  }
+  // Everything the map's edge gets to without crossing that floor is outside the space.
+  const out = new Uint8Array(W * H);
+  const leave = (i, j) => {
+    if (i < 0 || j < 0 || i >= W || j >= H) return;
+    const c = j * W + i;
+    if (out[c] || reached[c]) return;
+    out[c] = 1;
+    stack.push(c);
+  };
+  for (let i = 0; i < W; i++) { leave(i, 0); leave(i, H - 1); }
+  for (let j = 0; j < H; j++) { leave(0, j); leave(W - 1, j); }
+  while (stack.length) {
+    const c = stack.pop(), i = c % W, j = (c - i) / W;
+    leave(i + 1, j); leave(i - 1, j); leave(i, j + 1); leave(i, j - 1);
+  }
+  let n = 0;
+  for (let c = 0; c < W * H; c++) if (!out[c]) n++;
+  return n;
 }
 
 /**

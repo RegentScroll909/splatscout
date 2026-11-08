@@ -488,6 +488,15 @@ input[type=checkbox]:checked::after { content: ''; width: 9px; height: 5px; bord
 .snap-flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
 .snap-flash.go { animation: snapflash 0.25s ease-out; }
 @keyframes snapflash { from { opacity: 0.7; } to { opacity: 0; } }
+/* Snap with Track position (AR): the same screen over the AR camera */
+.snap.ar { background: transparent; }
+.snap-shutter.tracking { border-color: var(--warn); }
+.snap-shutter.tracking span { background: #ffe3a8; }
+.snap-floor { position: absolute; top: calc(58px + var(--safe-top)); left: 12px; right: 12px; display: flex; justify-content: center; pointer-events: none; }
+.snap-mission + .snap-floor { top: calc(100px + var(--safe-top)); }
+.snap-floor:empty { display: none; }
+.snap-floor-card { pointer-events: auto; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; max-width: 420px; font-size: 0.86rem; background: var(--glass); border: 1px solid var(--glass-line); border-radius: 12px; padding: 8px 10px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.snap-floor-card span { flex: 1 1 160px; }
 
 /* ---------- campus map (club beta) ---------- */
 /* Chart tokens, the same as SplatStation's Campus page: completion is one blue ramp (darkest = least, validated

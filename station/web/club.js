@@ -221,11 +221,16 @@ function lightbox(p) {
 $('#lightbox').addEventListener('click', (e) => e.target.id === 'lightbox' && $('#lightbox').classList.remove('on'));
 document.addEventListener('keydown', (e) => e.key === 'Escape' && $('#lightbox').classList.remove('on'));
 
+/** What the photos' AR positions bring (Track position on the phone), for the build message. */
+const arNote = (r) => !r.ar ? ''
+  : r.ar.session ? `AR positions: ${r.ar.photos} photos from one AR session set the coordinates, so COLMAP starts from them and the splat is in metres${r.ar.posed > r.ar.photos ? ` (${r.ar.posed - r.ar.photos} more from ${r.ar.sessions - 1} other AR session(s) are placed by COLMAP)` : ''}.\n`
+  : `${r.ar.posed} photos have AR positions, but no AR session has the 10 it takes to set the coordinates: COLMAP works it out from the photos alone.\n`;
+
 async function build(p, n) {
   if (!confirm(`Put ${n} accepted photos of ${p.room || p.building_name} into Ready to process? You can then process them like any capture.`)) return;
   try {
     const r = await api('/api/club/build', { building_code: p.building_code, floor: p.floor, room: p.room });
-    alert(`${r.photos} photos from ${r.contributors.map((c) => '@' + c).join(', ')} are in Ready to process on the dashboard (${r.file}).${r.sharedCamera ? '' : '\nThey come from different phones, so COLMAP will work out each lens.'}\nLight: ${r.lightSlots.join(', ')}.`);
+    alert(`${r.photos} photos from ${r.contributors.map((c) => '@' + c).join(', ')} are in Ready to process on the dashboard (${r.file}).${r.sharedCamera ? '' : '\nTheir lenses differ (different phones, or AR and ordinary photos), so COLMAP will work out each one.'}\n${arNote(r)}Light: ${r.lightSlots.join(', ')}.`);
   } catch (e) {
     alertErr(e);
   }

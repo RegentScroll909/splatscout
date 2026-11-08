@@ -109,17 +109,23 @@ async function sendOne(s) {
   const fatalAt = (state, e) => (e.fatal ? Object.assign(e, { resume: state }) : e);
   if (s.state === 'queued') {
     const g = s.geo || {};
-    const r = await api('/rest/v1/photos', {
-      method: 'POST',
-      headers: { Prefer: 'return=minimal' },
-      body: {
-        id: s.id, taken_at: new Date(s.takenAt).toISOString(), building_code: s.building.code, building_name: s.building.name,
-        floor: s.floor || '', room: s.room || '', storage_path: path, session: s.session, mission_id: s.missionId || null,
-        lat: g.lat ?? null, lon: g.lon ?? null, gps_accuracy_m: g.acc ?? null, width: s.w, height: s.h, bytes: s.bytes,
-        device: (s.device || '').slice(0, 120), camera: (s.camera || '').slice(0, 120), sharp: s.sharp, brightness: s.brightness,
-        phash: s.phash, light: s.light, status: 'uploading',
-      },
-    });
+    const body = {
+      id: s.id, taken_at: new Date(s.takenAt).toISOString(), building_code: s.building.code, building_name: s.building.name,
+      floor: s.floor || '', room: s.room || '', storage_path: path, session: s.session, mission_id: s.missionId || null,
+      lat: g.lat ?? null, lon: g.lon ?? null, gps_accuracy_m: g.acc ?? null, width: s.w, height: s.h, bytes: s.bytes,
+      device: (s.device || '').slice(0, 120), camera: (s.camera || '').slice(0, 120), sharp: s.sharp, brightness: s.brightness,
+      phash: s.phash, light: s.light, status: 'uploading',
+    };
+    if (s.pose) body.pose = s.pose; // taken in AR: where the phone was (core/snappose.js)
+    const add = () => api('/rest/v1/photos', { method: 'POST', headers: { Prefer: 'return=minimal' }, body });
+    let r = await add();
+    // A club database without photo positions yet (crowd/supabase-snap-pose.sql), or a position it won't take:
+    // the photo still counts, so it goes without one.
+    if (!r.ok && body.pose && r.status === 400 && /'pose' column|photo_pose|column[^\n]*\bpose\b/i.test(why(r))) {
+      delete body.pose;
+      s.poseDropped = why(r).slice(0, 200);
+      r = await add();
+    }
     if (!r.ok && r.status !== 409) throw fatalAt('queued', failure(r, 'Could not add the photo'));
     s.state = 'row';
     await store.putSnap(s);

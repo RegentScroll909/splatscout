@@ -98,7 +98,7 @@ export async function handleClub(ctx) {
       }
       case '/api/club/build': {
         const r = await club.buildCapture(c, cfg, { building_code: String(post.building_code || ''), floor: String(post.floor || ''), room: String(post.room || '') }, cfg.dirs.inbox, version);
-        say(`Club photos of ${post.room || post.building_code}: ${r.photos} photos from ${r.contributors.join(', ')} are in Ready to process.`);
+        say(`Club photos of ${post.room || post.building_code}: ${r.photos} photos from ${r.contributors.join(', ')} are in Ready to process${r.ar && r.ar.session ? `, ${r.ar.photos} with AR positions to start the camera solve from` : ''}.`);
         setTimeout(scanInbox, 100);
         return sendJson(res, { ok: true, ...r, file: r.file.split(/[\\/]/).pop() });
       }

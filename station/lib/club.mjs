@@ -15,6 +15,8 @@ import { analyzeImage } from '../../app/js/core/analyzer.js';
 import { ZipWriter } from '../../app/js/core/zip.js';
 import { distanceTo } from '../../app/js/data/campus.js';
 import { dhash, hamming, NEAR_DUPLICATE, photoChecks, scorePhoto, lightSlot, phoenixDay, POINTS, validHandle } from '../../app/js/core/clubrules.js';
+import { usablePose } from '../../app/js/core/snappose.js';
+import { colmapText } from '../../app/js/core/formats.js';
 
 const BUCKET = 'club-photos';
 const run = promisify(execFile);
@@ -353,44 +355,84 @@ export async function syncRestricted(c, buildings) {
 // ------------------------------------------------------------------------------------ photos → a capture
 const slug = (s) => (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'capture';
 const LENS_FOV = 68; // degrees across the long side: a phone's main camera
+export const AR_MIN = 10; // photos one AR session needs to set the coordinates (the pipeline starts COLMAP from 20 or more)
+const lensKey = (i) => [i.w, i.h, i.fx.toFixed(1), i.fy.toFixed(1), i.cx.toFixed(1), i.cy.toFixed(1)].join('|');
 
 /**
- * Put the accepted photos of one room into a ZIP in the inbox, like a camera-mode capture without AR
- * positions, so the usual pipeline can make a splat from them. Photos from one phone in one orientation
- * share a camera; otherwise COLMAP works out each photo's lens by itself.
+ * Put the accepted photos of one room into a ZIP in the inbox, so the usual pipeline can make a splat from
+ * them. Photos taken with Track position (AR) carry their AR pose: the AR session with the most photos here
+ * sets the coordinates, its photos come first, and its poses go in as a COLMAP model (poses/colmap/sparse/0)
+ * like a scan's, so COLMAP starts from them: it solves faster, and in metres. Photos from other outings, or
+ * without a pose, are placed by COLMAP. AR photos bring their exact lens; ordinary photos from one phone in
+ * one orientation share a camera; otherwise COLMAP works out each photo's lens by itself.
  */
 export async function buildCapture(c, cfg, { building_code, floor = '', room = '' }, inbox, version = '2.5.0') {
   const dir = clubDir(cfg.workDir), idx = loadIndex(dir);
+  const where = `status=eq.accepted&building_code=eq.${encodeURIComponent(building_code)}&floor=eq.${encodeURIComponent(floor)}&room=eq.${encodeURIComponent(room)}`;
   const [rows, profiles] = await Promise.all([
-    listAll(c, `/rest/v1/photos?select=${SELECT}&status=eq.accepted&building_code=eq.${encodeURIComponent(building_code)}&floor=eq.${encodeURIComponent(floor)}&room=eq.${encodeURIComponent(room)}`),
+    // With their AR poses, once the club database has them (crowd/supabase-snap-pose.sql).
+    listAll(c, `/rest/v1/photos?select=${SELECT},pose&${where}`).catch((e) => {
+      if (!/\bpose\b/.test(e.message)) throw e;
+      return listAll(c, `/rest/v1/photos?select=${SELECT}&${where}`);
+    }),
     listAll(c, '/rest/v1/profiles?select=user_id,handle'),
   ]);
   const have = rows.filter((r) => idx[r.id] && existsSync(photoFile(dir, r.id)));
   if (have.length < 10) throw new Error(`Only ${have.length} accepted photos of this room are on this PC (sync first); at least 10 are needed, 100 or more make a good splat.`);
-  have.sort((a, b) => (a.session || '').localeCompare(b.session || '') || effectiveTaken(a) - effectiveTaken(b));
   const handle = new Map(profiles.map((p) => [p.user_id, p.handle]));
 
-  const cams = new Set(have.map((r) => `${r.device}|${idx[r.id].w}x${idx[r.id].h}`));
-  const intr = (m) => {
+  // AR poses that fit their photo, by AR session. The session with the most photos sets the coordinates.
+  const pose = new Map();
+  for (const r of have) {
+    const p = r.pose ? usablePose(r.pose, idx[r.id]) : null;
+    if (p) pose.set(r.id, p);
+  }
+  const perSession = new Map();
+  for (const p of pose.values()) perSession.set(p.session, (perSession.get(p.session) || 0) + 1);
+  const [best, bestN] = [...perSession].sort((a, b) => b[1] - a[1])[0] || [null, 0];
+  const arSession = bestN >= AR_MIN ? best : null;
+  const inAr = (r) => !!arSession && pose.has(r.id) && pose.get(r.id).session === arSession;
+  have.sort((a, b) => inAr(b) - inAr(a) || (a.session || '').localeCompare(b.session || '') || effectiveTaken(a) - effectiveTaken(b));
+
+  // Lenses: AR photos bring their own, exactly; ordinary ones get a shared guess when they're all one camera
+  // (one phone, one orientation). The pipeline gives each lens one camera.
+  const plainCams = new Set(have.filter((r) => !pose.has(r.id)).map((r) => `${r.device}|${idx[r.id].w}x${idx[r.id].h}`));
+  const guess = (m) => {
     const f = Math.max(m.w, m.h) / 2 / Math.tan((LENS_FOV / 2) * (Math.PI / 180));
     return { w: m.w, h: m.h, fx: +f.toFixed(2), fy: +f.toFixed(2), cx: m.w / 2, cy: m.h / 2 };
   };
+  const lens = (r) => (pose.has(r.id) ? pose.get(r.id).intr : plainCams.size === 1 ? guess(idx[r.id]) : null);
+  const lenses = have.map(lens);
+  const sharedCamera = lenses.every((l) => l && lensKey(l) === lensKey(lenses[0]));
   const names = have.map((_, i) => `${String(i + 1).padStart(4, '0')}.jpg`);
   const first = have[0];
   const day = new Date(effectiveTaken(first) - 7 * 3600e3).toISOString().slice(0, 10).replace(/-/g, '');
   const base = `${slug(first.building_name)}_${slug(room || 'photos')}_${day}_club-photos`;
+  const outings = new Set(have.map((r) => r.session)).size;
+  const arInfo = pose.size ? { session: arSession, photos: arSession ? bestN : 0, posed: pose.size, sessions: perSession.size } : null;
   const manifest = {
     app: 'SplatScout club photos', version, exportedAt: new Date().toISOString(),
-    capture: { building: first.building_name, buildingCode: building_code, room, floor, tracking: 'none', engine: 'club-photos', createdAt: new Date(effectiveTaken(first)).toISOString(), author: null,
-      notes: `${have.length} single photos from ${new Set(have.map((r) => r.user_id)).size} contributor(s), in ${new Set(have.map((r) => r.session)).size} outing(s)` },
-    club: { contributors: [...new Set(have.map((r) => handle.get(r.user_id) || '?'))], lightSlots: [...new Set(have.map(effectiveLight))], photos: have.map((r) => r.id) },
-    frames: have.map((r, i) => ({ file: `images/${names[i]}`, seq: i + 1, session: r.session, pass: 'club', takenAt: new Date(effectiveTaken(r)).toISOString(), light: effectiveLight(r), device: r.device,
-      // A camera model is only offered when every photo can share it (same phone, same orientation).
-      ...(cams.size === 1 ? { intrinsics: intr(idx[r.id]) } : {}) })),
+    capture: { building: first.building_name, buildingCode: building_code, room, floor, tracking: arSession ? '6dof' : 'none', engine: 'club-photos', createdAt: new Date(effectiveTaken(first)).toISOString(), author: null,
+      notes: `${have.length} single photos from ${new Set(have.map((r) => r.user_id)).size} contributor(s), in ${outings} outing(s)${arSession ? `; AR positions for ${bestN} of them (one AR session) set the coordinates` : ''}` },
+    club: { contributors: [...new Set(have.map((r) => handle.get(r.user_id) || '?'))], lightSlots: [...new Set(have.map(effectiveLight))], photos: have.map((r) => r.id), ar: arInfo },
+    conventions: { pose: 'camera-to-world 4x4, column-major, OpenGL camera (x right, y up, looks down -z), world y-up, metres', intrinsics: 'pixels, top-left origin',
+      arPose: 'a pose in another AR session’s coordinates (club.ar.session sets the capture’s)' },
+    frames: have.map((r, i) => {
+      const p = pose.get(r.id);
+      return { file: `images/${names[i]}`, seq: i + 1, session: r.session, pass: 'club', takenAt: new Date(effectiveTaken(r)).toISOString(), light: effectiveLight(r), device: r.device,
+        ...(lenses[i] ? { intrinsics: lenses[i], lens: p ? 'exact' : 'guess' } : {}),
+        ...(p ? { arSession: p.session, tracked: inAr(r), ...(inAr(r) ? { pose: p.m } : { arPose: p.m }) } : {}) };
+    }),
   };
   const zip = new ZipWriter();
   for (let i = 0; i < have.length; i++) await zip.add(`${base}/images/${names[i]}`, readFileSync(photoFile(dir, have[i].id)));
   await zip.add(`${base}/splatscout.json`, JSON.stringify(manifest, null, 1));
+  if (arSession) {
+    // The same COLMAP model a scan's export carries: the pipeline triangulates from these cameras.
+    const posed = have.map((r, i) => (inAr(r) ? { name: names[i], pose: pose.get(r.id).m, intr: pose.get(r.id).intr } : null)).filter(Boolean);
+    const col = colmapText(posed, null);
+    for (const k of ['cameras', 'images', 'points3D', 'rigs', 'frames']) await zip.add(`${base}/poses/colmap/sparse/0/${k}.txt`, col[k]);
+  }
   const dest = join(inbox, base + '.zip'), tmp = join(inbox, '.club-' + base + '.zip');
   try {
     await pipeline(Readable.fromWeb(zip.finish().stream()), createWriteStream(tmp));
@@ -399,5 +441,5 @@ export async function buildCapture(c, cfg, { building_code, floor = '', room = '
     rmSync(tmp, { force: true });
     throw e;
   }
-  return { file: dest, photos: have.length, contributors: manifest.club.contributors, sharedCamera: cams.size === 1, lightSlots: manifest.club.lightSlots };
+  return { file: dest, photos: have.length, contributors: manifest.club.contributors, sharedCamera, lightSlots: manifest.club.lightSlots, ar: arInfo };
 }

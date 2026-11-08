@@ -135,6 +135,16 @@ what is still open (permission, consent wording, faces); it also has a five-minu
   or washed out, or almost the same view as a photo you just took. The shutter ring turns green when the camera is
   steady. Photos are saved on the phone first and sent in the background, so it works without a signal; once
   sent, only a thumbnail stays on the phone. Camera only: there is no gallery upload.
+- **Track position (AR)** (Take photos → *Camera*): the photos are taken inside an AR session (the scan's WebXR
+  tracking, without depth) and each one keeps where the phone was: its AR pose (position and direction, in metres),
+  the AR camera's lens and the AR session it belongs to. Within one session the poses agree to centimetres, so
+  SplatStation starts COLMAP from them (below): the photos line up faster and the splat comes out in metres, so the
+  Campus page gets the space's real floor area. AR photos are the AR camera's own frames, smaller than ordinary
+  ones (860×1920, about 1.7 MP, on the club's Pixel; ordinary photos are kept at about 2–3 MP), so which makes the
+  better splat is for **Measure quality** on SplatStation to settle (the held-back PSNR of splats of the same
+  space). No photo while AR is unsure of its position (the ring turns amber). Going up or down the stairs, the
+  height change suggests the new floor ("You went up about 4.2 m. Now on floor 2?"): one tap confirms it, *Same
+  floor* counts from there. A new AR session starts whenever tracking starts over somewhere else.
 - **Which building:** *Find my building* uses GPS to pick from ASU's buildings (outlines from OpenStreetMap, all
   four campuses). It only picks by itself when the fix is good to 40 m and inside one building; indoors GPS is
   often off by 10–50 m, so it offers the nearby buildings to tap instead. Typed names are matched to the same
@@ -171,7 +181,10 @@ what is still open (permission, consent wording, faces); it also has a five-minu
   [`crowd/supabase-setup.sql`](crowd/supabase-setup.sql), then [`crowd/supabase-beta.sql`](crowd/supabase-beta.sql),
   then [`crowd/supabase-campus.sql`](crowd/supabase-campus.sql) (the Campus map's summary: members read it, only
   SplatStation writes it) and [`crowd/supabase-campus-2.sql`](crowd/supabase-campus-2.sql) (each space's floor
-  area and the floor counts the club sets; without it phones use typical sizes). Each ends with a one-row result saying it was installed; "Success. No rows returned"
+  area and the floor counts the club sets; without it phones use typical sizes), and
+  [`crowd/supabase-snap-pose.sql`](crowd/supabase-snap-pose.sql) (photo positions from Track position: a `pose`
+  column members write only with their own new photo, in a checked shape; without it AR photos are sent without
+  their position). Each ends with a one-row result saying it was installed; "Success. No rows returned"
   means an older saved query ran instead. The project URL and publishable key are in `app/js/data/crowd.js`;
   make invite codes on SplatStation's Club page.
 
@@ -252,7 +265,12 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   the photo** here and in the cloud (it may show a person), with the reason shown to the member. Accepted photos
   stay on this PC; *Free cloud space* removes their cloud copies. For a room with 10 or more accepted photos,
   **Build a capture** puts them into *Ready to process* like a camera-mode capture, so they become a splat the
-  usual way. The page also makes **missions**, **invite codes** (who can join and how many times), pauses, renames
+  usual way. Photos taken with *Track position (AR)* bring their AR poses: the AR session with the most photos of
+  the room (10 or more) sets the coordinates, its photos go first, and its poses go into the ZIP as the same COLMAP
+  model a scan carries, so COLMAP starts from them (with 20 or more) and the splat is in metres. Every AR photo,
+  from any session, shares its exact lens; COLMAP places the other photos (other AR sessions, ordinary photos,
+  other phones) in rounds, each round triangulating what the last one added (see *What was tested*).
+  The page also makes **missions**, **invite codes** (who can join and how many times), pauses, renames
   or removes members (removing deletes everything they sent), and edits the list of off-limits buildings.
 - **Campus map** (dashboard header, or `/campus.html`, this PC only): every ASU building on a map, coloured by
   how much of its floor area is covered, with the GPS points where photos and scans were taken. Click a building
@@ -270,8 +288,10 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   light counts less), from a scan's grade, or from a finished splat (measured, or what it promised less for photos
   COLMAP couldn't place, a high reprojection error or quick training). A building's completion is the share of its
   floor area (footprint from OpenStreetMap × floors) that its spaces cover: each space counts for its own floor
-  area, in proportion to how close it is to Good. A space's area is measured from its scan's outline when the
-  splat was lined up with the phone's AR tracking; otherwise it's typical for its size (small room 20 m², room 60,
+  area, in proportion to how close it is to Good. A space's area is measured when its splat was lined up with the
+  phone's AR tracking (so is in metres): from its scan's outline, or, for club photos taken with Track position,
+  from the floor the splat shows where the photos were taken (the walk map's floor reachable from the phone's
+  path, and the furniture it surrounds; through an open door it runs on up to 3 m); otherwise it's typical for its size (small room 20 m², room 60,
   big room 120, hallway 150, lobby 400, very large space 1,000), guessed from its name until you pick one on the
   space's panel. Floors come from OpenStreetMap, or 2 until you set them on the building's panel. So one small room
   in a four-floor library is a fraction of a percent, and the building's panel shows each floor's share. Offices and
@@ -391,7 +411,7 @@ The original captures stay as they are. 360° videos can't be merged yet.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (55 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (58 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
@@ -415,12 +435,19 @@ Tested on this PC:
   space; campus totals, map points and daily activity), and the phone's campus map (exact photo counts to Good,
   mixed light and scans included; the published summary leaving out names, GPS and off-limits buildings; never
   publishing when the database couldn't be read; members only; building completion on the phone equal to the
-  Campus page's, with or without supabase-campus-2.sql; stale rows removed on the next publish; the last copy kept offline). They run against an in-memory stand-in for Supabase
+  Campus page's, with or without supabase-campus-2.sql; stale rows removed on the next publish; the last copy kept offline),
+  and Track position (the pose saved with an AR photo and the shape the database takes, poses the PC can use or
+  must refuse, the floor suggested from the height change; AR photos sent with their pose, and without it to a
+  database that doesn't take positions yet; a capture built from AR photos with the biggest session's poses as
+  COLMAP's model, numbered as COLMAP numbers the files, every AR session sharing its exact lens; the AR model
+  renumbered to COLMAP's database; the floor area measured on a walk map, a stray camera kilometres off
+  changing nothing). They run against an in-memory stand-in for Supabase
   (`tools/fake-supabase.mjs`; `tools/fake-supabase-server.mjs` serves it so the phone app and SplatStation can be
   tried together; `--demo` fills it with made-up members and photos to try the Campus map). The database rules themselves are tested on a real Postgres with `tools/sql-test.mjs`
   (needs `npm install --no-save @electric-sql/pglite`): who can add what, that points only come from
-  SplatStation, members-only views, the daily limit, bans, leaving, and the campus summary (members read it,
-  strangers and the bare public key see nothing, only the secret key writes it).
+  SplatStation, members-only views, the daily limit, bans, leaving, the campus summary (members read it,
+  strangers and the bare public key see nothing, only the secret key writes it), and photo positions (written
+  only with your own new photo, in the right shape, never changed afterwards; restricted places still refused).
 - **The guide loop (2.3)**, with a simulated person following every pass of the Practice hallway and room
   (walking, turning, taking the photos the app asks for, pressing Skip when it offers). Before: the last pass
   never ended (in the hallway, still going after 15 minutes with 83 turn reversals and 96 trips back), and since
@@ -432,6 +459,19 @@ Tested on this PC:
   Library tile and the Campus map), then six of the club's captures trained on Quick and Standard with every 12th
   photo held back. The renders of the held-back views were checked by eye against the photos to set the PSNR
   thresholds: see the table under *Measure quality*. Brush prints nothing to a pipe unless `RUST_LOG` is set.
+- **Track position on SplatStation**, with the real Schwada "Dd" scan's 233 photos (860×1920) made into club
+  photos: 120 from one AR session (their real AR poses), 80 from a second session in other coordinates (turned 70°
+  and moved 6 m) and 33 ordinary photos (smaller, no pose), built by *Build a capture*'s code and processed by the
+  usual pipeline (Quick, *Measure quality* on). The AR-pose solve placed 232 of 233 photos at 0.41 px and in
+  metres (distances between photos 0.98 of the AR tracking's), the second session's photos a median 10 cm and the
+  ordinary ones 9 cm from where AR tracking had them, and the walk map measured 32 m² of floor. The job took 427 s
+  against 542 s for the same photos without usable poses (COLMAP's own solve, then lined up with the AR coordinates).
+  The splat's held-back PSNR was 20.7–22.4 dB over four runs against 23.1 dB for the one run without poses: here the
+  poses bought metres and speed, not a sharper splat, so real club rooms with *Measure quality* on should decide.
+  It took four fixes, each now in the self-checks: COLMAP 4.2 refuses a pose model numbered other than its database,
+  or with another kind of camera; `image_registrator` never triangulates, so one pass placed only 207 photos; each
+  of the second session's photos started from COLMAP's default lens guess (2,304 px for 1,374) and one settled 9 m
+  off; and adjusting one outing's poses freely let a weakly linked stretch slide (18 photos over a metre in one run).
 - **Cropping** on the Schwada "Snall" splat (2.2 million splats), whose plain white walls came out dark and
   see-through. The walls sat right on the outline and the crop removed only 0.1% of the solid splats at wall
   height, but cropping at 0.5, 1 or 2 m all left them dark: 73,000 large faint splats 7–28 m away outweighed
@@ -495,13 +535,19 @@ Not yet tested, because it needs real hardware: a live ARCore session on your Pi
 - Photo matching (2.2) was tuned on rendered scenes. Real hallways have exposure changes, motion blur and
   identical doors. If re-aligning in a real hallway still struggles, the capture's `alignLog` in the export
   records each lock with its photo score, which says whether the threshold needs moving.
+- **Track position (AR)** on Snap ran against a simulated WebXR session in a desktop browser (poses, a test
+  picture, a 4.2 m climb), not yet in a real AR session. On the Pixel: the AR view behind the Snap screen, the ring
+  going green, AR photos the right way up, and whether the floor suggestion holds up on real stairs (in a lift,
+  ARCore usually loses tracking, and a new AR session starts with no suggestion). Then process one room shot in AR
+  and one in ordinary photos with *Measure quality* on, to see which makes the better splat.
 
 ## 5. For developers
 
 ```
 app/js/core/      platform-independent logic (analysis, coverage, depth filter, scan bounds, guide, walkable floor
                   plan, re-alignment + photo matching, keyframes, coaching, plans, scoring, export formats,
-                  clubrules: club points and checks, campusmodel: expected quality and building completion)
+                  clubrules: club points and checks, campusmodel: expected quality and building completion,
+                  snappose: the AR pose kept with a Snap photo, and the floor from the height change)
 app/js/sources/   xrSource (WebXR/ARCore), cameraSource (getUserMedia + orientation), demoSource/demoScene (practice room, hallway)
 app/js/capture/   session engine, 3D overlay (+ guide geometry), minimap, audio
 app/js/data/      IndexedDB storage, settings, ZIP export, campus (ASU buildings + GPS), crowd (club uploads),
@@ -511,6 +557,7 @@ app/js/ui/        screens
 app/data/         asu-buildings.json (from OpenStreetMap: node tools/asu-buildings.mjs refreshes it)
 crowd/            supabase-setup.sql + supabase-beta.sql (the club database: tables, private buckets, rules, views),
                   supabase-campus.sql + supabase-campus-2.sql (the summary behind the phone's Campus map),
+                  supabase-snap-pose.sql (photo positions from Track position),
                   ADVISOR-BRIEF.md
 tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mjs, asu-buildings.mjs,
                   fake-supabase.mjs / fake-supabase-server.mjs (stand-in database), sql-test.mjs (database rules on Postgres)

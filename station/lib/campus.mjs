@@ -84,12 +84,17 @@ function manifestOf(jobsDir, jobId) {
 
 /**
  * The floor area (m²) a splat's scan outline covers, when its reconstruction is in metres (lined up with the
- * phone's AR tracking); null otherwise (a COLMAP-only solve has no scale).
+ * phone's AR tracking); null otherwise (a COLMAP-only solve has no scale). With no outline (club photos taken
+ * with Track position), the floor of the space as measured on the splat itself (info.floor, from its walk map).
  */
 export function measuredArea(info) {
   const mode = info && info.colmap && info.colmap.mode;
   const areas = info && info.crop && info.crop.areas;
-  if (!/^(ar-poses|sfm-ar)$/.test(mode || '') || !Array.isArray(areas) || !areas.length) return null;
+  if (!/^(ar-poses|sfm-ar)$/.test(mode || '')) return null;
+  if (!Array.isArray(areas) || !areas.length) {
+    const a = info.floor && info.floor.area;
+    return Number.isFinite(a) && a >= 2 && a <= 20000 ? Math.round(a) : null;
+  }
   let sum = 0;
   for (const a of areas) {
     const p = (a && a.poly) || [];

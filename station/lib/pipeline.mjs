@@ -78,6 +78,7 @@ export async function processJob(job, ctx) {
     posed,
     rig,
     parts: src.parts || null,
+    lenses: src.lenses || null,
     align: arFrames,
     matcher: cfg.matcher || 'auto',
     progress: (stage, f, note) => ctx.stage(stage, f, note),
@@ -193,7 +194,14 @@ export async function processJob(job, ctx) {
   writeFileSync(join(lib, 'info.json'), JSON.stringify(info, null, 2));
   // Map of where you can walk, so the viewer's walk mode opens straight away.
   try {
-    await walkMapFor(finalPly, walkInputs({ jobDir: dir, mode: rec.mode, view, pano: !!job.pano, areas: info.crop && info.crop.areas }));
+    const walk = await walkMapFor(finalPly, walkInputs({ jobDir: dir, mode: rec.mode, view, pano: !!job.pano, areas: info.crop && info.crop.areas }));
+    // In metres (lined up with the phone's AR tracking), the map also measures the space's floor: what the
+    // Campus page counts when there's no scan outline (club photos taken with Track position, for one).
+    if (walk && walk.metric && walk.stats && walk.stats.floorArea >= 1) {
+      info.floor = { area: Math.round(walk.stats.floorArea), from: 'walk map' };
+      writeFileSync(join(lib, 'info.json'), JSON.stringify(info, null, 2));
+      if (!areas.length) ctx.say(`Measured on the splat: about ${info.floor.area} m² of floor where the photos were taken.`);
+    }
   } catch (e) {
     ctx.say('No walk map: ' + e.message);
   }
@@ -242,7 +250,7 @@ async function prepareSource(source, outDir, ctx, { log, usePoses = true, progre
   const nImages = countImages(photos);
 
   // Camera hint & AR poses
-  let posed = null;
+  let posed = null, lenses = null;
   let arFrames = null; // AR camera poses, also used to put an SfM solve into the AR frame
   if (manifest && manifest.frames && manifest.frames.length) {
     const intrs = manifest.frames.map((f) => f.intrinsics).filter(Boolean);
@@ -258,6 +266,8 @@ async function prepareSource(source, outDir, ctx, { log, usePoses = true, progre
       camera = { model: 'SIMPLE_RADIAL', params: [i.fx, i.cx, i.cy, 0].map((v) => v.toFixed(4)).join(','), single: true };
     } else {
       camera = { model: 'SIMPLE_RADIAL', params: null, single: false };
+      // Club photos say which lens each has: one camera per lens (see lensGroups).
+      if (manifest.frames.some((f) => f.lens)) lenses = lensGroups(manifest.frames);
     }
     const sparseIn = join(outDir, 'poses', 'colmap', 'sparse', '0');
     if (tracking === '6dof' && existsSync(join(sparseIn, 'images.txt'))) {
@@ -266,10 +276,38 @@ async function prepareSource(source, outDir, ctx, { log, usePoses = true, progre
       );
       const frames = manifest.frames.filter((f) => f.pose && names.has(basename(f.file))).map((f) => ({ name: basename(f.file), pose: f.pose }));
       if (frames.length >= 10) arFrames = frames;
-      if (usePoses && frames.length >= 20) posed = { modelDir: sparseIn, frames };
+      // Club photos: one outing's AR poses, with other photos placed around them (see posedReconstruction's `hold`).
+      if (usePoses && frames.length >= 20) posed = { modelDir: sparseIn, frames, hold: (manifest.capture && manifest.capture.engine) === 'club-photos' };
     }
   }
-  return { photos, nImages, manifest, camera, rig, pano, posed, arFrames };
+  return { photos, nImages, manifest, camera, rig, pano, posed, arFrames, lenses };
+}
+
+/**
+ * A capture's photos grouped by lens, for COLMAP: an exact lens (an AR camera's, from club photos taken with
+ * Track position) is a PINHOLE camera kept as it is; a guess (ordinary photos from one phone) is a SIMPLE_RADIAL
+ * camera COLMAP refines; photos with neither each get their own. Sharing the exact lens matters: a photo from
+ * another AR session then only needs a position, where on its own camera COLMAP starts its lens from a default
+ * 1.2 × the image size (2,304 px for the Pixel's 1,374) and can settle somewhere wrong.
+ * @returns {Array<{names: string[], camera: {model: string, params: string|null, single: boolean}}>}
+ */
+export function lensGroups(frames) {
+  const groups = new Map();
+  for (const f of frames) {
+    const i = f.intrinsics, kind = i && (f.lens === 'exact' || f.lens === 'guess') ? f.lens : 'own';
+    const key = kind === 'own' ? 'own' : `${kind}|${[i.w, i.h, i.fx, i.fy, i.cx, i.cy].map((v) => (+v).toFixed(1)).join('|')}`;
+    if (!groups.has(key)) {
+      const p = (vals) => vals.map((v) => (+v).toFixed(4)).join(',');
+      groups.set(key, {
+        names: [],
+        camera: kind === 'exact' ? { model: 'PINHOLE', params: p([i.fx, i.fy, i.cx, i.cy]), single: true }
+          : kind === 'guess' ? { model: 'SIMPLE_RADIAL', params: p([(i.fx + i.fy) / 2, i.cx, i.cy, 0]), single: true }
+          : { model: 'SIMPLE_RADIAL', params: null, single: false },
+      });
+    }
+    groups.get(key).names.push(basename(f.file));
+  }
+  return [...groups.values()];
 }
 
 /**

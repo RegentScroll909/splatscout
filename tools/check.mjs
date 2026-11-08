@@ -674,7 +674,7 @@ await zipTest();
 
 // ---- SplatStation
 const { listZip, extractZip, readZipText } = await import('../station/lib/zipread.mjs');
-const { posePairs } = await import('../station/lib/colmap.mjs');
+const { posePairs, posedPairs, renumberModel, strayedFromAR, imagesFromText } = await import('../station/lib/colmap.mjs');
 const stationZip = async () => {
   const z = new ZipWriter();
   await z.add('Hall_Room_20261019/images/0001.jpg', new Uint8Array([9, 8, 7]));
@@ -703,6 +703,45 @@ test('station picks matching pairs from AR poses (neighbours + loop closures)', 
   assert.ok(pairs.includes('0001.jpg 0002.jpg'), 'temporal neighbour');
   assert.ok(pairs.includes('0005.jpg 0065.jpg'), 'loop closure between laps');
   assert.ok(pairs.length < (80 * 79) / 2 / 3, 'far fewer pairs than exhaustive');
+});
+
+test('station: AR poses for only some photos (club photos) are matched and numbered the way COLMAP needs', () => {
+  const lens = { w: 860, h: 1920, fx: 1374.1, fy: 1374.76, cx: 430, cy: 960 };
+  const frames = Array.from({ length: 40 }, (_, i) => {
+    const a = (i / 40) * Math.PI * 2;
+    return { name: `${String(i + 1).padStart(4, '0')}.jpg`, pose: Array.from(poseLookDir([Math.cos(a) * 2, 1.5, Math.sin(a) * 2], [-Math.cos(a), 0, -Math.sin(a)])), intr: lens };
+  });
+  const names = [...frames.map((f) => f.name), ...Array.from({ length: 30 }, (_, i) => `${String(41 + i).padStart(4, '0')}.jpg`)];
+  assert.deepEqual(posedPairs(frames.slice(0, 38), frames.map((f) => f.name)), posePairs(frames.slice(0, 38)), 'nearly all posed: the pose pairs alone');
+  const mixed = posedPairs(frames, names), posed = new Set(frames.map((f) => f.name));
+  assert.ok(mixed.includes('0041.jpg 0042.jpg'), 'photos without a pose are matched along their own order');
+  assert.ok(mixed.some((p) => posed.has(p.split(' ')[0]) !== posed.has(p.split(' ')[1])), 'and against the posed ones');
+  // The phone's model numbers the posed photos 1, 2, 3 (here 0003.jpg has no pose); COLMAP's database gave
+  // each photo its own camera, frame and rig. point_triangulator needs the database's numbers.
+  const model = colmapText([frames[0], frames[1], frames[3]], null);
+  const rows = [1, 2, 3, 4].map((k) => ({ image_id: k, name: `${String(k).padStart(4, '0')}.jpg`, camera_id: 10 + k, frame_id: 20 + k, rig_id: 30 + k }));
+  const r = renumberModel(model, rows);
+  const data = (txt) => txt.split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(' '));
+  assert.deepEqual([r.kept, r.dropped], [3, 0]);
+  assert.deepEqual(data(r.images).map((p) => [p[0], p[8], p[9]]), [['1', '11', '0001.jpg'], ['2', '12', '0002.jpg'], ['4', '14', '0004.jpg']]);
+  assert.deepEqual(data(r.images).map((p) => p.slice(1, 8)), data(model.images).map((p) => p.slice(1, 8)), 'the poses themselves are untouched');
+  assert.deepEqual(data(r.frames).map((p) => [p[0], p[1], p.slice(9).join(' ')]), [['21', '31', '1 CAMERA 11 1'], ['22', '32', '1 CAMERA 12 2'], ['24', '34', '1 CAMERA 14 4']]);
+  assert.deepEqual(data(r.cameras).map((p) => p.join(' ')), [11, 12, 14].map((id) => `${id} PINHOLE 860 1920 1374.1 1374.76 430 960`), 'each photo’s own camera, with the AR lens');
+  assert.deepEqual(data(r.rigs).map((p) => p.join(' ')), ['31 1 CAMERA 11', '32 1 CAMERA 12', '34 1 CAMERA 14']);
+  assert.deepEqual([renumberModel(model, rows.filter((x) => x.name !== '0002.jpg')).dropped], [1], 'a photo the database doesn’t have is left out');
+  // Each camera must be the database's kind: with different lenses each photo has its own SIMPLE_RADIAL one.
+  const kind = (model_, w = 860, h = 1920) => rows.map((x) => ({ ...x, camera_model: model_, width: w, height: h }));
+  assert.deepEqual(data(renumberModel(model, kind(2)).cameras).map((p) => p.join(' ')), [11, 12, 14].map((id) => `${id} SIMPLE_RADIAL 860 1920 1374.43 430 960 0`), 'the AR lens, with no distortion');
+  assert.equal(data(renumberModel(model, kind(1)).cameras)[0].join(' '), '11 PINHOLE 860 1920 1374.1 1374.76 430 960');
+  assert.equal(renumberModel(model, kind(2, 430, 960)).kept, 0, 'a photo the database has at another size is left out');
+  // After the adjustment: an AR photo moved far on few points is left out; moved far with plenty of points (the
+  // tracking's drift corrected), or moved a little, it stays.
+  const moved = (f, dx) => ({ ...f, pose: [...f.pose.slice(0, 12), f.pose[12] + dx, f.pose[13], f.pose[14], 1] });
+  const counts = [12, 12, 80];
+  let at = 0;
+  const adjusted = colmapText([moved(frames[0], 0.3), moved(frames[1], 3), moved(frames[2], 3)], null).images
+    .replace(/\n\n/g, () => `\n${Array.from({ length: counts[at++] }, (_, k) => `${k}.5 ${k}.5 ${k}`).join(' ')}\n`);
+  assert.deepEqual(strayedFromAR(imagesFromText(adjusted), frames), ['0002.jpg']);
 });
 
 const { cropPly } = await import('../station/lib/crop.mjs');
@@ -829,6 +868,18 @@ test('walk map: floor found, plain wall, table and doorway sorted out, floor hol
   assert.ok(!w.canStand(4.5, 1.0) && w.canStand(1.5, 2.0));
 });
 
+// The floor of the space the photos were taken in (what the Campus page counts when a splat in metres has no
+// scan outline): here both rooms, through the doorway; inside an outline around the first room, just that one.
+const room1Map = await buildWalkMap(join(walkDir, 'scene.ply'), { cams: walkCams().slice(0, 3), up: [0, 1, 0], metric: true, polys: [[[0.1, 0.1], [2.9, 0.1], [2.9, 3.9], [0.1, 3.9]]] });
+// A solve can put the odd barely-matched photo kilometres away: it mustn't stretch the map over nothing.
+const strayMap = await buildWalkMap(join(walkDir, 'scene.ply'), { cams: [...walkCams(), { name: 'stray.jpg', C: [4800, 3, -1200], fwd: [1, 0, 0] }], up: [0, 1, 0], metric: true });
+test('walk map: measures the floor of the space where the photos were taken', () => {
+  const both = walkMap.stats.floorArea, one = room1Map.stats.floorArea;
+  assert.ok(both > 20 && both < 24, `two rooms of 12 m², less their walls (the table in the second counts): ${both} m²`);
+  assert.ok(one > 10 && one < 12.5, `the first room alone, inside its outline: ${one} m²`);
+  assert.deepEqual([strayMap.cell, strayMap.W, strayMap.H, strayMap.stats.floorArea], [walkMap.cell, walkMap.W, walkMap.H, both], 'a camera put 5 km away changes nothing');
+});
+
 test('walker: through the doorway, but not through walls, furniture or off the floor', () => {
   const w = new Walker(walkMap);
   const R = w.radius;
@@ -898,7 +949,7 @@ test('station reads camera centres from COLMAP text and binary models alike', ()
   }
 });
 
-const { partAreas } = await import('../station/lib/pipeline.mjs');
+const { partAreas, lensGroups } = await import('../station/lib/pipeline.mjs');
 const { mergePairs } = await import('../station/lib/colmap.mjs');
 test('merging phones: pairs within and across captures; each scan area lands in the main phone\'s coordinates', () => {
   // Phone B's AR frame is phone A's turned 70° and moved; the solve put B's photos where A has them.
@@ -1056,6 +1107,44 @@ test('club rules: light slots, handles, duplicate hashes, photo checks and point
   assert.equal(R.scoreScan({ photos: 412, grade: 'A' }), 30 + 41 + 30);
   assert.equal(R.scoreScan({ photos: 5000, grade: 'C' }), 30 + 70 + 5);
   assert.equal(R.scoreScan({ photos: 3 }), 30);
+});
+
+const SP = await import('../app/js/core/snappose.js');
+test('Snap in AR: the pose sent with a photo, poses the PC can use, and the floor from the height change', () => {
+  const lens = { fx: 1374.0978646, fy: 1374.7604370, cx: 430, cy: 960, w: 860, h: 1920 };
+  const m = Array.from(poseLookDir([1.234567, 1.45, -2.1], [0.6, -0.1, -0.8]));
+  const session = crypto.randomUUID();
+  const p = SP.poseRecord(Float32Array.from(m), lens, session, 12.3456);
+  assert.deepEqual([p.v, p.session, p.m.length, p.m[12], p.t], [1, session, 16, 1.2346, 12.35], 'rotation to 6 decimals, position to 0.1 mm');
+  assert.deepEqual(p.intr, { fx: 1374.1, fy: 1374.76, cx: 430, cy: 960, w: 860, h: 1920 });
+  assert.ok(SP.poseShapeOk(p) && JSON.stringify(p).length < 600, 'small, and the shape the database takes');
+  assert.deepEqual(SP.poseRecord(m, lens, session, 0, 0.5).intr, { fx: 687.05, fy: 687.38, cx: 215, cy: 480, w: 430, h: 960 }, 'a photo kept at half size: its lens too');
+  for (const bad of [null, [], { ...p, session: 'x' }, { ...p, m: p.m.slice(1) }, { ...p, m: [...p.m.slice(1), 'x'] }, { ...p, m: [...p.m.slice(1), NaN] }, { ...p, intr: { ...p.intr, fx: 0 } }, { ...p, intr: { ...p.intr, w: '860' } }, { ...p, pad: 'x'.repeat(1500) }]) {
+    assert.ok(!SP.poseShapeOk(bad), `refused: ${JSON.stringify(bad)?.slice(0, 60)}`);
+  }
+  const u = SP.usablePose(p, { w: 860, h: 1920 });
+  assert.ok(u && u.session === session && u.intr.fx === 1374.1);
+  assert.deepEqual(SP.usablePose(p, { w: 430, h: 960 }).intr, { fx: 687.05, fy: 687.38, cx: 215, cy: 480, w: 430, h: 960 }, 'the photo on the PC is half the size: so is its lens');
+  assert.equal(SP.usablePose(p, { w: 1920, h: 860 }), null, 'turned on its side: the lens doesn’t fit');
+  assert.equal(SP.usablePose({ ...p, m: p.m.map((x, i) => (i < 3 ? x * 1.2 : x)) }), null, 'not a rotation');
+  assert.equal(SP.usablePose({ ...p, m: [...p.m.slice(0, 15), 0] }), null, 'not a rigid pose');
+  assert.equal(SP.usablePose({ ...p, m: [...p.m.slice(0, 12), 2e4, 0, 0, 1] }), null, '20 km away');
+  assert.equal(SP.usablePose({ ...p, intr: { ...p.intr, fx: 100 } }), null, 'a lens no phone has');
+  // Floors: 1, 2, 3 …, and B, B2 below the ground floor.
+  assert.deepEqual(['2', ' 12 ', 'B', 'b2', 'Basement', 'LL', 'Mezzanine', '', null].map(SP.floorLevel), [2, 12, 0, -1, 0, 0, null, null, null]);
+  assert.deepEqual([3, 1, 0, -1].map(SP.floorLabel), ['3', '1', 'B', 'B2']);
+  const at = (floor, dy) => SP.floorSuggestion({ y: 1.4, floor }, 1.4 + dy);
+  assert.equal(at('2', 0.6), null, 'holding the phone up');
+  assert.equal(at('2', 2.2), null, 'a stair landing between floors');
+  assert.deepEqual(at('2', 4.3), { floor: '3', storeys: 1, dy: 4.3 });
+  assert.deepEqual(at('2', 9.1), { floor: '4', storeys: 2, dy: 9.1 }, 'two floors of a tall building');
+  assert.deepEqual(at('3', 3.5 * -3), { floor: 'B', storeys: -3, dy: -10.5 }, 'three short floors down from the third: the basement');
+  assert.deepEqual(at('1', -2.6), { floor: 'B', storeys: -1, dy: -2.6 });
+  assert.deepEqual(at('', 4.1), { floor: null, storeys: 1, dy: 4.1 }, 'with no floor to count from, only that it changed');
+  assert.equal(SP.floorSuggestion({ y: null, floor: '1' }, 5), null);
+  const hf = new SP.HeightFilter(5);
+  for (const y of [1.4, 1.41, 3.9, 1.39, 1.42]) hf.add(y);
+  assert.equal(hf.value(), 1.41, 'a moment’s jolt is ignored');
 });
 
 const campus = await import('../app/js/data/campus.js');
@@ -1234,6 +1323,29 @@ await (async () => {
   await settle();
   assert.equal(got(held).state, 'done');
 
+  // 5b. Track position (AR): the pose goes with the photo's row. A club database that doesn't take positions yet
+  //     (supabase-snap-pose.sql not run), or a pose it won't take, still gets the photo, just without one.
+  const pose = SP.poseRecord(Array.from(poseLookDir([0.4, 1.45, -1.2], [0, 0, -1])), { fx: 1374.1, fy: 1374.76, cx: 430, cy: 960, w: 860, h: 1920 }, crypto.randomUUID(), 3.2);
+  const arSnap = snap({ w: 860, h: 1920, pose, camera: 'AR camera (ARCore)' });
+  await snapsApp.saveSnap(arSnap);
+  await settle();
+  fake.db.noPose = true;
+  const early = snap({ w: 860, h: 1920, pose });
+  await snapsApp.saveSnap(early);
+  await settle();
+  fake.db.noPose = false;
+  const broken = snap({ pose: { ...pose, m: pose.m.slice(0, 15) } });
+  const plainSnap = snap();
+  for (const s of [broken, plainSnap]) await snapsApp.saveSnap(s);
+  await settle();
+  assert.ok([arSnap, early, broken, plainSnap].every((s) => got(s).state === 'done'), 'all four sent');
+  assert.deepEqual(fake.db.photos.get(arSnap.id).pose, pose, 'the pose is in the club database');
+  assert.deepEqual([fake.db.photos.get(arSnap.id).width, fake.db.photos.get(arSnap.id).camera], [860, 'AR camera (ARCore)']);
+  assert.ok(!('pose' in fake.db.photos.get(early.id)) && /'pose' column/.test(got(early).poseDropped), 'no positions in the database yet: sent without');
+  assert.ok(!('pose' in fake.db.photos.get(broken.id)) && /photo_pose/.test(got(broken).poseDropped), 'a broken pose: sent without');
+  assert.ok(!('pose' in fake.db.photos.get(plainSnap.id)), 'an ordinary photo sends no pose at all (older databases take it)');
+  for (const s of [arSnap, early, broken, plainSnap]) mem.delete(s.id); // (the counts below are about the photos above)
+
   // 6. The club's verdicts come back onto the phone.
   const first = rows()[0];
   Object.assign(first, { status: 'accepted', points: 6, reviewed_at: new Date().toISOString(), review_note: 'First photo of this room +5' });
@@ -1372,6 +1484,8 @@ await (async () => {
   assert.ok(man.club.contributors.includes('Mesa_Quail'));
   assert.ok(man.club.lightSlots.includes('evening') && man.club.lightSlots.includes('afternoon'));
   assert.ok(man.frames.every((f) => f.intrinsics && f.intrinsics.w === 1920 && Math.abs(f.intrinsics.fx - 1920 / 2 / Math.tan((68 / 2) * (Math.PI / 180))) < 0.1), 'one camera: its field of view is offered as a starting guess');
+  assert.ok(man.frames.every((f) => f.lens === 'guess'), 'a guess, for COLMAP to refine');
+  assert.deepEqual(lensGroups(man.frames).map((g) => [g.names.length, g.camera.model, g.camera.single]), [[built.photos, 'SIMPLE_RADIAL', true]]);
   // Photos from another phone: each photo's lens is left for COLMAP to work out.
   const other = add({ device: 'iPhone 15' }, {});
   await clubSt.review(c, cfg, { ids: [other], action: 'accept' });
@@ -1379,6 +1493,49 @@ await (async () => {
   assert.ok(!built.sharedCamera);
   assert.ok(JSON.parse(await readZipText(built.file, 'splatscout.json')).frames.every((f) => !f.intrinsics));
   await assert.rejects(clubSt.buildCapture(c, cfg, { building_code: 'hayden-library', floor: '9', room: 'Nowhere' }, inbox), /at least 10 are needed/);
+
+  // -- photos taken with Track position (AR): the AR session with the most photos sets the coordinates, as a
+  //    scan's poses do; its photos go first and its poses go in as a COLMAP model
+  const SX = 'a5e55000-0000-4000-8000-00000000000a', SY = 'a5e55000-0000-4000-8000-00000000000b';
+  const lens = { fx: 1374.1, fy: 1374.76, cx: 430, cy: 960, w: 860, h: 1920 };
+  const at = (k, s) => SP.poseRecord(Array.from(poseLookDir([k * 0.4, 1.4, 0], [0, 0, -1])), lens, s, k);
+  const atrium = (o) => ({ room: 'Atrium', session: session(3), ...o });
+  const arX = Array.from({ length: 12 }, (_, k) => add(atrium({ pose: at(k, SX) }), { w: 860, h: 1920 }));
+  const arY = Array.from({ length: 4 }, (_, k) => add(atrium({ pose: at(k, SY), session: session(4) }), { w: 860, h: 1920 }));
+  const turned = add(atrium({ pose: at(13, SX) }), { w: 1920, h: 860 }); // the photo here isn't the shape its pose describes
+  const ordinary = Array.from({ length: 3 }, () => add(atrium({ session: session(5) })));
+  await clubSt.review(c, cfg, { ids: [...ordinary, turned, ...arY, ...arX], action: 'accept' });
+  built = await clubSt.buildCapture(c, cfg, { building_code: 'hayden-library', floor: '1', room: 'Atrium' }, inbox);
+  assert.deepEqual(built.ar, { session: SX, photos: 12, posed: 16, sessions: 2 });
+  assert.ok(!built.sharedCamera, 'AR and ordinary photos: their lenses differ');
+  const amf = JSON.parse(await readZipText(built.file, 'splatscout.json'));
+  assert.equal(amf.capture.tracking, '6dof', 'the pipeline takes its poses like a scan’s');
+  assert.deepEqual(amf.club.photos.slice(0, 12), arX, 'that session’s photos come first, in the order they were taken');
+  assert.ok(amf.frames.slice(0, 12).every((f) => f.tracked && f.pose.length === 16 && f.arSession === SX && f.intrinsics.fx === 1374.1));
+  assert.ok(amf.frames.slice(12).every((f) => !f.pose && !f.tracked), 'nobody else is in its coordinates');
+  assert.equal(amf.frames.filter((f) => f.arPose && f.arSession === SY).length, 4, 'another session’s poses are kept, apart');
+  assert.equal(amf.frames.filter((f) => !f.intrinsics).length, 4, 'COLMAP works out the lens of the turned photo and the ordinary ones');
+  assert.ok(amf.frames.filter((f) => f.intrinsics).every((f) => f.lens === 'exact'), 'AR lenses are marked exact');
+  assert.deepEqual(lensGroups(amf.frames).map((g) => [g.names.length, g.camera.model, g.camera.params, g.camera.single]),
+    [[16, 'PINHOLE', '1374.1000,1374.7600,430.0000,960.0000', true], [4, 'SIMPLE_RADIAL', null, false]], 'both AR sessions share their exact lens; the rest get one each');
+  assert.deepEqual(lensGroups(amf.frames)[1].names, amf.frames.filter((f) => !f.intrinsics).map((f) => f.file.slice('images/'.length)));
+  const amodel = (name) => readZipText(built.file, `poses/colmap/sparse/0/${name}.txt`);
+  const aimg = (await amodel('images')).split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(' '));
+  assert.deepEqual(aimg.map((p) => `${p[0]} ${p[8]} ${p[9]}`), Array.from({ length: 12 }, (_, i) => `${i + 1} 1 ${String(i + 1).padStart(4, '0')}.jpg`), 'numbered as COLMAP numbers the files');
+  assert.match(await amodel('cameras'), /^1 PINHOLE 860 1920 1374\.1 1374\.76 430 960$/m, 'the AR camera’s own lens');
+  for (const k of ['points3D', 'rigs', 'frames']) assert.ok(await amodel(k), `${k}.txt (COLMAP 4 wants it)`);
+  // Too few photos from any one AR session to set the coordinates: no model, the photos alone.
+  const stairs = Array.from({ length: 10 }, (_, k) => add({ room: 'Stairs', session: session(3), pose: at(k, k < 6 ? SX : SY) }, { w: 860, h: 1920 }));
+  await clubSt.review(c, cfg, { ids: stairs, action: 'accept' });
+  built = await clubSt.buildCapture(c, cfg, { building_code: 'hayden-library', floor: '1', room: 'Stairs' }, inbox);
+  assert.deepEqual(built.ar, { session: null, photos: 0, posed: 10, sessions: 2 });
+  assert.equal(JSON.parse(await readZipText(built.file, 'splatscout.json')).capture.tracking, 'none');
+  assert.ok(!(await listZip(built.file)).some((e) => e.name.includes('/poses/')));
+  // A club database without positions yet: the photos alone, as before.
+  fake.db.noPose = true;
+  built = await clubSt.buildCapture(c, cfg, { building_code: 'hayden-library', floor: '1', room: 'Atrium' }, inbox);
+  fake.db.noPose = false;
+  assert.deepEqual([built.photos, built.ar], [20, null]);
 
   // -- freeing the cloud's storage keeps the local copies and the points
   const kept = clubSt.photoFile(ldir, ids[2]);
@@ -1654,6 +1811,11 @@ await (async () => {
   const rect = { areas: [{ poly: [[0, 0], [6, 0], [6, 4], [0, 4]] }] };
   assert.equal(campusLib.measuredArea({ colmap: { mode: 'sfm-ar' }, crop: rect }), 24, 'lined up with the AR tracking: metres');
   assert.equal(campusLib.measuredArea({ colmap: { mode: 'sfm' }, crop: rect }), null, 'a COLMAP-only solve has no scale');
+  // Club photos taken with Track position have no outline: the floor measured on the splat (its walk map) counts.
+  assert.equal(campusLib.measuredArea({ colmap: { mode: 'ar-poses' }, floor: { area: 47.4, from: 'walk map' } }), 47, 'no outline: the floor measured on the splat');
+  assert.equal(campusLib.measuredArea({ colmap: { mode: 'ar-poses' }, crop: rect, floor: { area: 47 } }), 24, 'an outline comes first');
+  assert.equal(campusLib.measuredArea({ colmap: { mode: 'sfm' }, floor: { area: 47 } }), null, 'never without metres');
+  assert.equal(campusLib.measuredArea({ colmap: { mode: 'ar-poses' }, floor: { area: 0.5 } }), null, 'nor from a speck of floor');
   const scanned = await campusLib.campusData({ club: null, jobs: [], buildings, workDir, library: [{ path: 'Hayden Library/Study room 3/2026-11-05_1200', building: 'Hayden Library', room: 'Study room 3', stamp: '2026-11-05_1200',
     info: { created: '2026-11-05T19:00:00.000Z', photos: 200, placed: 200, colmap: { mode: 'sfm-ar', reprojError: 0.5 }, training: { preset: 'standard' }, crop: rect } }] });
   assert.deepEqual([scanned.spaces[0].area, scanned.spaces[0].areaSource, scanned.spaces[0].size], [24, 'measured', 'small'], 'its scan’s floor, not the 20 m² a study room usually is');

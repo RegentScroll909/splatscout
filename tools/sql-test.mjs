@@ -1,4 +1,4 @@
-// Runs crowd/supabase-setup.sql, supabase-beta.sql, supabase-campus.sql and -campus-2.sql on a local Postgres (PGlite, Postgres
+// Runs crowd/supabase-setup.sql, supabase-beta.sql, supabase-campus.sql, -campus-2.sql and -snap-pose.sql on a local Postgres (PGlite, Postgres
 // compiled to WebAssembly) with just enough of Supabase stubbed (roles, auth.uid(), storage tables), then checks
 // that the rules do what they say: who can add what, that points can only come from SplatStation, and so on.
 // Not part of `npm run check` (the project has no dependencies). To run it:
@@ -44,7 +44,10 @@ assert.deepEqual(campusResult, { result: 'SplatScout campus summary is installed
 await run('supabase-campus-2.sql');
 const campus2 = (await run('supabase-campus-2.sql')).at(-1).rows[0]; // safe to run again too
 assert.deepEqual(campus2, { result: 'SplatScout campus update 2 is installed', new_columns: 2 });
-console.log('the scripts ran, and second runs of beta.sql, campus.sql and campus-2.sql were fine');
+await run('supabase-snap-pose.sql');
+const snapPose = (await run('supabase-snap-pose.sql')).at(-1).rows[0]; // safe to run again; ends with a result row
+assert.deepEqual(snapPose, { result: 'SplatScout photo positions are installed', pose_column: 1, pose_check: 1, photos_with_positions: 0 });
+console.log('the scripts ran, and second runs of beta.sql, campus.sql, campus-2.sql and snap-pose.sql were fine');
 
 const A = '11111111-1111-4111-8111-111111111111', B = '22222222-2222-4222-8222-222222222222', C = '33333333-3333-4333-8333-333333333333';
 await db.exec(`insert into auth.users (id) values ('${A}'), ('${B}'), ('${C}');
@@ -143,6 +146,42 @@ assert.equal((await as(B, 'select * from public.photos')).rows.length, 0, "B can
 r = await as(B, `delete from public.photos where id = '${uuid(1)}'`);
 assert.equal(r.n, 0, "B can't delete A's photo");
 pass('phones can only finish their own upload; points, status and notes are SplatStation-only');
+
+// ---- photo positions (supabase-snap-pose.sql): written with your own photo, never changed afterwards
+const poseOf = (o = {}) => ({ v: 1, session: uuid(500), m: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.5, 1.4, -2.25, 1], intr: { fx: 1374.2, fy: 1374.2, cx: 430, cy: 960, w: 860, h: 1920 }, t: 12.5, ...o });
+const posedSql = (id, pose, { code = 'hayden-library', user = null } = {}) => [`insert into public.photos (id, ${user ? 'user_id, ' : ''}taken_at, building_code, building_name, floor, room, storage_path, session, width, height, bytes, phash, light, pose)
+   values ($1, ${user ? `'${user}', ` : ''}now(), $2, 'Somewhere', '1', 'lobby', $3, $4, 860, 1920, 400000, '0123456789abcdef', 'evening', $5::jsonb)`,
+  [id, code, `${code}/floor-1-lobby/${id}.jpg`, uuid(999), pose == null ? null : JSON.stringify(pose)]];
+ok(await as(B, ...posedSql(uuid(40), poseOf())), 'a member adds an AR photo with its position');
+ok(await as(B, ...posedSql(uuid(41), null)), 'and an ordinary one without');
+r = await as(B, `select pose from public.photos where id = '${uuid(40)}'`);
+assert.deepEqual(r.rows[0].pose, poseOf(), 'the position is kept as sent');
+assert.equal((await as(A, `select * from public.photos where id = '${uuid(40)}'`)).rows.length, 0, "nobody else sees it");
+const badPoses = {
+  'a pose that is a list': [1, 2, 3],
+  'a pose that is text': 'here',
+  'no session': poseOf({ session: undefined }),
+  'a session that is not an id': poseOf({ session: 'my-session' }),
+  'a session that is a number': poseOf({ session: 12 }),
+  '15 numbers': poseOf({ m: Array(15).fill(0) }),
+  'a word among the numbers': poseOf({ m: [...poseOf().m.slice(0, 15), 'x'] }),
+  'm as one number': poseOf({ m: 3 }),
+  'no lens': poseOf({ intr: undefined }),
+  'a lens with no focal length': poseOf({ intr: { cx: 430, cy: 960, w: 860, h: 1920 } }),
+  'a focal length of 0': poseOf({ intr: { ...poseOf().intr, fx: 0 } }),
+  'a width as text': poseOf({ intr: { ...poseOf().intr, w: '860' } }),
+  'an oversized pose': poseOf({ note: 'x'.repeat(1500) }),
+};
+let n = 50;
+for (const [what, pose] of Object.entries(badPoses)) fails(await as(B, ...posedSql(uuid(n++), pose)), what, /photo_pose/);
+fails(await as(B, `update public.photos set pose = null where id = '${uuid(40)}'`), 'clearing a position afterwards', /permission denied/);
+fails(await as(B, `update public.photos set pose = $1::jsonb where id = '${uuid(41)}'`, [JSON.stringify(poseOf())]), 'adding one afterwards', /permission denied/);
+fails(await as(B, ...posedSql(uuid(70), poseOf(), { code: 'cereus-hall' })), 'an AR photo of a restricted building', /row-level security/);
+fails(await as(B, ...posedSql(uuid(71), poseOf(), { user: A })), "an AR photo in someone else's name", /row-level security/);
+fails(await as(C, ...posedSql(uuid(72), poseOf())), 'an AR photo from someone who never joined', /row-level security/);
+assert.equal((await db.query(`select count(*)::int as n from public.photos where pose is not null`)).rows[0].n, 1, 'only the one good position was stored');
+await db.exec(`delete from public.photos where id in ('${uuid(40)}', '${uuid(41)}')`); // (the later checks count photos)
+pass('photo positions: only with your own new photo, in the right shape, never changed afterwards; restricted places still refused');
 
 // ---- the leaderboard (SplatStation awards points with the secret key: superuser here)
 await db.exec(`update public.photos set status = 'accepted', points = 7, reviewed_at = now() where id = '${uuid(1)}'`);

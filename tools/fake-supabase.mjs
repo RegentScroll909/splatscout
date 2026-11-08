@@ -1,11 +1,18 @@
 // An in-memory stand-in for the club's Supabase project: the calls the phone app and SplatStation make,
 // with the rules that matter to them (membership, restricted buildings, files only into your own
-// unfinished photo, points only from SplatStation, the campus summary readable by members and written only by
+// unfinished photo, photo positions only in the right shape, points only from SplatStation, the campus summary readable by members and written only by
 // SplatStation). It lets the self-checks run without a network and
 // lets the screens be tried in a browser (tools/serve.mjs serves it at /__tools/fake-supabase.mjs).
 // The real rules live in crowd/supabase-*.sql and are tested against Postgres (tools/sql-test.mjs).
 
 export const FAKE_HOST = 'fake.supabase.co';
+
+// photos.pose as crowd/supabase-snap-pose.sql checks it (this file has no imports, so a browser can load it alone).
+const num = (x) => typeof x === 'number' && Number.isFinite(x);
+const poseShapeOk = (p) => !!p && typeof p === 'object' && !Array.isArray(p) && JSON.stringify(p).length <= 1500
+  && typeof p.session === 'string' && /^[0-9a-f-]{36}$/.test(p.session)
+  && Array.isArray(p.m) && p.m.length === 16 && p.m.every(num)
+  && !!p.intr && typeof p.intr === 'object' && ['fx', 'fy', 'cx', 'cy', 'w', 'h'].every((k) => num(p.intr[k])) && ['fx', 'fy', 'w', 'h'].every((k) => p.intr[k] > 0);
 export const FAKE_URL = 'https://' + FAKE_HOST;
 
 const json = (v, status = 200) => new Response(v == null ? null : JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
@@ -24,6 +31,7 @@ export function createFake() {
     profiles: new Map(), invites: new Map(), restricted_buildings: new Map(), missions: new Map(), photos: new Map(), captures: new Map(),
     campus_spaces: new Map(), campus_plans: new Map(), // the summary SplatStation publishes (crowd/supabase-campus.sql)
     campusV1: false, // true: the campus tables as supabase-campus.sql made them, before supabase-campus-2.sql
+    noPose: false, // true: photos without the pose column, before supabase-snap-pose.sql
     files: new Map(), // 'bucket/path' -> Buffer
     posts: new Map(), // 'bucket/path' -> times a file was sent
     failOnce: new Set(), // path endings whose next upload is refused (a 400)
@@ -156,10 +164,16 @@ export function createFake() {
         if (m !== 'GET') return json({ code: '42501', message: `permission denied for table ${name}` }, 403);
         return json(member(uid) ? select([...map.values()], url.searchParams) : []);
       }
+      if (name === 'photos' && db.noPose && (url.searchParams.get('select') || '').split(',').includes('pose')) return json({ code: '42703', message: 'column photos.pose does not exist' }, 400);
       if (m === 'GET') return json(select([...map.values()].filter(own), url.searchParams));
       if (m === 'POST') {
         const rows = [].concat(await body());
         const keep = (req.headers.get('prefer') || '').includes('return=representation');
+        // Photo positions (crowd/supabase-snap-pose.sql): not there yet, or a pose of the wrong shape.
+        if (name === 'photos' && rows.some((r) => 'pose' in r)) {
+          if (db.noPose) return json({ code: 'PGRST204', message: "Could not find the 'pose' column of 'photos' in the schema cache" }, 400);
+          if (rows.some((r) => r.pose != null && !poseShapeOk(r.pose))) return json({ code: '23514', message: 'new row for relation "photos" violates check constraint "photo_pose"' }, 400);
+        }
         // A club that hasn't run supabase-campus-2.sql yet: no space sizes, no floor counts.
         if (CAMPUS.has(name) && db.campusV1) {
           const col = rows.flatMap((r) => Object.keys(r)).find((k) => k === 'area' || k === 'floors');
