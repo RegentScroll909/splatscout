@@ -1397,6 +1397,33 @@ await (async () => {
   console.log('  ok club scans: members only, graded B or better, resume after a dropped connection, no single photos, SplatStation imports a normal ZIP (no points yet)');
 })();
 
+{
+  // A big scan: its depth points outgrow the bucket's 20 MB a file as COLMAP text. SplatStation doesn't read
+  // them there, so the club copy keeps only the header; points.ply goes when it fits; anything else too big stops it.
+  const big = 'x'.repeat(crowdApp.FILE_LIMIT + 1);
+  const head = '# 3D point list with one line of data per point:\n#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n';
+  const pts = head + Array.from({ length: 500000 }, (_, i) => `${i + 1} 1.234567 -0.234567 2.345678 120 130 140 0`).join('\n') + '\n';
+  assert.ok(pts.length > crowdApp.FILE_LIMIT, 'the test list is over the limit');
+  const files = [
+    { name: 'images/0001.jpg', data: new Blob([new Uint8Array(10)]), type: 'image/jpeg' },
+    { name: 'poses/colmap/sparse/0/images.txt', data: '# images\n1 1 0 0 0 0 0 0 1 0001.jpg\n\n', type: 'text/plain' },
+    { name: 'poses/colmap/sparse/0/points3D.txt', data: pts, type: 'text/plain' },
+    { name: 'poses/parts/2/colmap/sparse/0/points3D.txt', data: head, type: 'text/plain' },
+    { name: 'poses/points.ply', data: new Uint8Array(1000), type: 'application/octet-stream' },
+  ];
+  const out = crowdApp.forClub(files);
+  assert.deepEqual(out.map((f) => f.name), files.map((f) => f.name), 'every file still goes');
+  const p3 = out[2].data;
+  assert.ok(p3.startsWith(head) && p3.split('\n').every((l) => !l || l.startsWith('#')), 'points3D.txt keeps its header, no points');
+  assert.equal(out[1].data, files[1].data, 'the poses go as they are');
+  assert.equal(out[4].data.length, 1000, 'points.ply goes when it fits');
+  const tooBigPly = crowdApp.forClub([files[0], { name: 'poses/points.ply', data: { size: crowdApp.FILE_LIMIT + 1 } }]);
+  assert.deepEqual(tooBigPly.map((f) => f.name), ['images/0001.jpg'], 'points.ply over the limit is left out');
+  assert.throws(() => crowdApp.forClub([{ name: 'images/0002.jpg', data: big }]), /images\/0002\.jpg is 20\.0 MB; the club takes files up to 20\.0 MB/);
+  passed++;
+  console.log('  ok club uploads of a big scan: no depth points in points3D.txt (they are in points.ply), files over the limit named before sending');
+}
+
 const clubSt = await import('../station/lib/club.mjs');
 const clubApi = await import('../station/lib/clubapi.mjs');
 const campusLib = await import('../station/lib/campus.mjs');

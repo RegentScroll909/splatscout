@@ -146,6 +146,8 @@ five-minute demo script.
   *Capture more* first. It uploads as your handle, one photo at a time, so a dropped connection resumes with
   **Resume upload**; *Remove from club database* deletes your upload again. Photos carry no GPS or camera metadata
   (they come from the canvas); the GPS reading is stored with the scan's details instead.
+  Each file must be under the club's 20 MB limit: the club copy of `points3D.txt` keeps only its header (on a big
+  scan the depth points outgrow it, and SplatStation triangulates its own; they are in `poses/points.ply`).
 - **Which building:** *Find my building* uses GPS to pick from ASU's buildings (outlines from OpenStreetMap, all
   four campuses). It only picks by itself when the fix is good to 40 m and inside one building; indoors GPS is
   often off by 10–50 m, so it offers the nearby buildings to tap instead. Typed names are matched to the same
@@ -456,7 +458,7 @@ log says how much of each part was joined.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (65 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (66 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain

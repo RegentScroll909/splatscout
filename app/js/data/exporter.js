@@ -16,7 +16,7 @@ import { drawTopDown, drawPanorama } from '../capture/minimap.js';
 import { spaceOf, boundsFor, partsOf } from '../core/spaces.js';
 import { Bounds } from '../core/bounds.js';
 
-export const APP_VERSION = '2.7.0';
+export const APP_VERSION = '2.7.1';
 
 export function slugify(s) {
   return (s || '').trim().replace(/[^\w\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'capture';

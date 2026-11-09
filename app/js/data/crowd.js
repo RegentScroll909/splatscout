@@ -70,6 +70,33 @@ export async function api(path, { method = 'GET', body, type = 'application/json
 export const why = (r) => (r.body && (r.body.message || r.body.error || r.body.msg)) || r.text || `error ${r.status}`;
 
 // ------------------------------------------------------------------------------- uploads
+/** The bucket's limit on each file (file_size_limit in crowd/supabase-setup.sql). */
+export const FILE_LIMIT = 20 * 1048576;
+const sizeOf = (f) => (typeof f.data === 'string' ? f.data.length : f.data.size ?? f.data.length);
+const mb = (n) => `${(n / 1048576).toFixed(1)} MB`;
+
+/**
+ * The export as the club gets it. SplatStation reads only the cameras and photos of the COLMAP
+ * models (it triangulates its own points), so their points3D.txt goes without its points: on a big
+ * scan it outgrows the bucket's limit. The same points are in poses/points.ply, which is left out
+ * only when it is too big itself. Anything else over the limit stops the upload before it starts.
+ */
+export function forClub(files) {
+  const out = [];
+  for (const f of files) {
+    if (/(^|\/)colmap\/sparse\/0\/points3D\.txt$/.test(f.name) && typeof f.data === 'string') {
+      const head = f.data.split('\n').filter((l) => l.startsWith('#')).join('\n');
+      out.push({ ...f, data: `${head}\n# (points left out of the club upload: they are in poses/points.ply)\n` });
+      continue;
+    }
+    if (sizeOf(f) <= FILE_LIMIT) out.push(f);
+    else if (f.name !== 'poses/points.ply') {
+      throw Object.assign(new Error(`${f.name} is ${mb(sizeOf(f))}; the club takes files up to ${mb(FILE_LIMIT)} each.`), { code: 'too-big' });
+    }
+  }
+  return out;
+}
+
 /**
  * Upload a capture.
  * @param capture capture record (its .upload keeps the progress, so save it after each call)
@@ -81,6 +108,7 @@ export const why = (r) => (r.body && (r.body.message || r.body.error || r.body.m
  * @param o.signal AbortSignal to stop (resume later)
  */
 export async function uploadCapture(capture, files, tags, { save, frameIds = null, onProgress = () => {}, signal } = {}) {
+  files = forClub(files);
   const prefix = `${tags.buildingCode}/${placeSlug(tags.floor, tags.room)}`;
   let up = capture.upload;
   // An unfinished upload filed somewhere else (the tags changed): remove it and start again.
@@ -123,7 +151,7 @@ export async function uploadCapture(capture, files, tags, { save, frameIds = nul
   // Files, a few at a time; the list of everything sent goes last so SplatStation knows it's whole.
   const sent = new Set(up.sent);
   const todo = files.filter((f) => !sent.has(f.name));
-  const size = (f) => (typeof f.data === 'string' ? f.data.length : f.data.size ?? f.data.length);
+  const size = sizeOf;
   const total = files.reduce((s, f) => s + size(f), 0);
   let done = files.filter((f) => sent.has(f.name)).reduce((s, f) => s + size(f), 0);
   const report = () => onProgress(done / total, `Sent ${sent.size} of ${files.length} files · ${Math.round(done / 1048576)} of ${Math.round(total / 1048576)} MB`);
