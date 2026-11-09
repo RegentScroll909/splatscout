@@ -2070,6 +2070,68 @@ await (async () => {
   console.log('  ok building view: a building’s captures with their cameras, cached beside each splat (they outlive the job), guessed at GPS, placed by the club in campus.json, the splat’s points when the model is gone');
 })();
 
+await (async () => {
+  // A cropped scan in the building view shows only its scan area: its points, floor plan and lighter splats (big ones
+  // too). Snapping still gets every point. With the crop off, or a scan not in AR coordinates, everything shows.
+  const { readSplat } = await import('../station/lib/splatlod.mjs');
+  const { readdirSync } = await import('node:fs');
+  const ws = mkdtempSync(join(tmpdir(), 'ssk-')), lib = join(ws, 'library'), jobsDir = join(ws, 'jobs');
+  const buildings = new Map(asuList.map((b) => [b.code, b]));
+  const dot = (x, y, z, sc = 0.05) => ({ x, y, z, a: 0.8, sc: [sc, sc / 5, sc], q: [1, 0, 0, 0] });
+  const room = [], beyond = [];
+  for (let x = -2; x <= 2; x += 0.25) for (let z = -1.5; z <= 1.5; z += 0.25) room.push(dot(x, -1.5, z)); // its floor
+  for (let x = 4; x <= 6; x += 0.25) for (let z = -1; z <= 1; z += 0.25) beyond.push(dot(x, -1.5, z)); // the next room, through a doorway
+  for (let x = -1; x <= 1; x += 0.5) for (let z = -1; z <= 1; z += 0.5) beyond.push(dot(x, -3, z)); // the street, through a window
+  for (let z = -1.5; z <= 1.5; z += 0.5) for (const y of [-1, -0.5, 0]) beyond.push(dot(-4, y, z, 0.4)); // big faint blobs behind a wall
+  const folder = join(lib, 'Schwada Building', 'Room 120', '2026-11-08_1000');
+  mkdirSync(folder, { recursive: true });
+  writeWalkPly(join(folder, 'scene.ply'), [...room, ...beyond]);
+  writeFileSync(join(folder, 'scene.lod-far.splat'), Buffer.alloc(32)); // a copy made before crops were shown
+  const crop = { removed: 0, margin: 0.5, areas: [{ poly: [[-2.2, -1.7], [2.2, -1.7], [2.2, 1.7], [-2.2, 1.7]], floorY: -1.5, top: null }] };
+  const it = { building: 'Schwada Building', room: 'Room 120', stamp: '2026-11-08_1000', path: 'Schwada Building/Room 120/2026-11-08_1000' };
+  const setCrop = (c) => {
+    it.info = { building: 'Schwada Building', room: 'Room 120', jobId: 'gone', colmap: { mode: 'ar-poses' }, crop: c };
+    writeFileSync(join(folder, 'info.json'), JSON.stringify(it.info));
+  };
+  const look = async () => (await PLACEMENT.buildingView({ code: 'schwada-classroom-office-building', buildings, library: [it], libraryDir: lib, jobsDir, workDir: ws })).captures[0];
+  const inRoom = ([x, y, z]) => x >= -2.7 && x <= 2.7 && z >= -2.2 && z <= 2.2 && y >= -1.9; // the outline, 0.5 m around, from 0.4 m below the floor
+  const sent = () => {
+    const buf = PLACEMENT.viewPoints(lib, it.path), n = buf.readUInt32LE(0);
+    const at = (i) => [0, 1, 2].map((k) => buf.readFloatLE(4 + (i * 3 + k) * 4));
+    return { n, at, mask: buf.length === 4 + n * 16 ? [...buf.subarray(4 + n * 15)] : buf.length === 4 + n * 15 ? null : 'bad length' };
+  };
+  const plan = (c) => Array.from({ length: c.plan.length / 2 }, (_, i) => [c.plan[2 * i], c.plan[2 * i + 1]]);
+  const lods = () => readdirSync(folder).filter((f) => f.startsWith('scene.lod-'));
+  const lodRows = async () => readSplat(readFileSync(await PLACEMENT.splatPreview({ libraryDir: lib, jobsDir, key: it.path, detail: 'far' })));
+
+  setCrop(crop);
+  let c = await look();
+  assert.ok(c.cropped && c.points === room.length + beyond.length, `cropped, and every point read (${c.points})`);
+  let s = sent();
+  assert.ok(Array.isArray(s.mask) && s.n === c.points, 'the points come with a byte each');
+  assert.ok(s.mask.every((m, i) => m === (inRoom(s.at(i)) ? 1 : 0)), 'saying which are in its scan area');
+  assert.equal(s.mask.filter((m) => m).length, room.length, 'the next room, the street and the blobs behind the wall are not');
+  assert.ok(plan(c).length === room.length && plan(c).every(([x, z]) => inRoom([x, 0, z])), 'the floor plan only of what’s inside');
+  let rows = await lodRows();
+  assert.ok(rows.length === room.length && rows.every((r) => inRoom([r.x, r.y, r.z])), `its lighter splats only inside, big ones too (${rows.length})`);
+  assert.ok(lods().length === 1 && /^scene\.lod-far-[0-9a-f]{8}\.splat$/.test(lods()[0]), `the copy made before is gone (${lods()})`);
+
+  setCrop({ ...crop, off: true });
+  c = await look();
+  s = sent();
+  assert.ok(!c.cropped && s.mask === null, 'crop turned off: no bytes, every point shows');
+  assert.ok(plan(c).some(([x]) => x > 3), 'and the floor plan has the next room again');
+  rows = await lodRows();
+  assert.ok(rows.length === room.length + beyond.length && lods().length === 1, `a new lighter copy with everything (${rows.length}), the cropped one gone`);
+
+  assert.equal(PLACEMENT.cropOf({ colmap: { mode: 'sfm' }, crop }), null, 'not in AR coordinates: an outline means nothing');
+  assert.equal(typeof PLACEMENT.cropOf({ colmap: { mode: 'sfm-ar' }, crop }), 'function', 'aligned to AR: it does');
+  assert.equal(PLACEMENT.cropOf({ colmap: { mode: 'ar-poses' }, crop: { areas: [{ poly: [[0, 0], [1, 0]], floorY: 0 }] } }), null, 'two corners aren’t an outline');
+  assert.equal(PLACEMENT.cropOf({ colmap: { mode: 'ar-poses' } }), null, 'no crop');
+  passed++;
+  console.log('  ok building view: a cropped scan shows only its scan area (points, floor plan, lighter splats with the big ones), snapping still gets every point, and turning the crop off shows everything');
+})();
+
 // ---- review: snapping a new capture onto the ones already placed, like a jigsaw piece
 /** Points on a corridor's surfaces (floor, both walls, and a short partition) between e0 and e1, in building metres. */
 function corridorScan(e0, e1, perM2, stub = 5) {

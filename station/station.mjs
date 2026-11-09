@@ -21,7 +21,7 @@ import { cropPly, topDown, CROP_MARGIN } from './lib/crop.mjs';
 import * as crowd from './lib/crowd.mjs';
 import { handleClub, isLocal, buildings as asuBuildings } from './lib/clubapi.mjs';
 import { campusData, saveFloors, saveSize, setSince, publishSummary, savePublished, loadPublished } from './lib/campus.mjs';
-import { buildingView, savePlacement, pointsFileOf, libraryFolderOf, keepCameras, splatPreview } from './lib/placement.mjs';
+import { buildingView, savePlacement, viewPoints, libraryFolderOf, keepCameras, splatPreview } from './lib/placement.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 let PKG_VERSION = '0';
@@ -536,9 +536,12 @@ const server = createServer(async (req, res) => {
         return sendJson(res, await buildingView({ code, buildings: asuBuildings(), library: library(), libraryDir: cfg.dirs.library, jobsDir: cfg.dirs.jobs, workDir: cfg.workDir }));
       }
       if (path === '/api/campus/building/points') {
-        // A capture's points, thinned for the browser (binary: count, x y z floats, r g b bytes). ?key=<library path>
-        const f = pointsFileOf(cfg.dirs.library, url.searchParams.get('key') || '');
-        return f ? sendFile(res, f, req) : sendJson(res, { error: 'No points for that capture yet: open its building first.' }, 404);
+        // A capture's points, thinned for the browser (binary: count, x y z floats, r g b bytes; for a cropped splat,
+        // then a byte a point saying whether it's in the scan area). ?key=<library path>
+        const buf = viewPoints(cfg.dirs.library, url.searchParams.get('key') || '');
+        if (!buf) return sendJson(res, { error: 'No points for that capture yet: open its building first.' }, 404);
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': buf.length, 'Cache-Control': 'no-store' });
+        return res.end(buf);
       }
       if (path === '/api/campus/building/splat') {
         // A lighter copy of a capture's splat for the building view (.splat format, made once and kept beside it).

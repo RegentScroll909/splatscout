@@ -329,17 +329,22 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   SplatStation reads each splat's model from its job folder and keeps what it needs beside the splat
   (`scene.cameras.json` and `scene.points.bin`, up to about 1 MB); it also does that when a job finishes and before
   a job is deleted, so camera positions outlive the job folder. A splat whose job was deleted before this existed
-  shows its own points but no cameras (process its ZIP again to get them back).
+  shows its own points but no cameras (process its ZIP again to get them back). A cropped splat is shown cropped:
+  its points, floor plan and lighter splats outside its scan outline (plus the crop's margin), below its floor or
+  above its top are left out, big splats too (the crop itself keeps those so plain walls look solid from inside), so
+  it doesn't spill into its neighbours. Snapping still uses every point, since what's seen through a doorway is where
+  two captures overlap, and turning the crop off in the viewer shows everything again.
 
   **Reviewing a new splat in place (beta):** `/building.html?code=<building>&review=<library path>` opens the
   building with that splat, and the placed splats nearest it, shown as real splats (lighter copies made once and kept
-  beside each splat: `scene.lod-near.splat`, up to 800,000 splats, for the one under review, and `scene.lod-far.splat`,
-  250,000, for its neighbours). Move it like a jigsaw piece (Shift + drag in 3D, drag on the plan, arrow keys, the turn
+  beside each splat: `scene.lod-near-<tag>.splat`, up to 800,000 splats, for the one under review, and
+  `scene.lod-far-<tag>.splat`, 250,000, for its neighbours; the tag follows the crop, so a new crop makes new ones).
+  Move it like a jigsaw piece (Shift + drag in 3D, drag on the plan, arrow keys, the turn
   buttons), then **Snap to neighbours**: it turns, shifts and rises it (never tilts or scales) until its points sit on
   its placed neighbours' where they overlap, a shared doorway or wall (point-to-plane ICP). A box says how well it fits
   (how far apart, over what share of its points), before and after; **Undo** (Ctrl + Z) steps back. **Approve** saves
   where it sits and approves the member's scan, as on the Club page (its points, and the splat on the campus map);
-Reject asks for a reason, which the member reads in the app (`station/web/review.js`).
+  Reject asks for a reason, which the member reads in the app (`station/web/review.js`).
 
 **Quality presets** (choose on the dashboard; you can re-train any finished job with a different preset):
 
@@ -451,7 +456,7 @@ log says how much of each part was joined.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (64 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (65 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain

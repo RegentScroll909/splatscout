@@ -84,6 +84,22 @@ function replace(tmp, dst) {
 }
 
 /**
+ * Whether a point (splat coordinates) is in the scan area, as the crop judges it: inside an outline plus the
+ * margin, and from just below its floor to just above its top.
+ * @param {object|object[]} boundsData SplatScout "bounds" ({poly, floorY, top, ...}), or several: inside any of them
+ * @param {number} [margin] metres kept outside the outline
+ * @returns {(x: number, y: number, z: number) => boolean}
+ */
+export function insideAreas(boundsData, margin = CROP_MARGIN) {
+  const areas = (Array.isArray(boundsData) ? boundsData : [boundsData]).map((d) => {
+    const b = new Bounds({ ...d, margin, skips: [] });
+    return { b, floor: b.floorY - 0.4, top: b.top == null ? Infinity : b.top + 0.4 };
+  });
+  if (!areas.length || areas.some((a) => !a.b.poly)) throw new Error('No scan-area outline');
+  return (x, y, z) => areas.some(({ b, floor, top }) => y >= floor && y <= top && b.inArea(x, b.floorY, z));
+}
+
+/**
  * @param {string|string[]} src input .ply (several: e.g. a cropped splat plus what an earlier crop removed)
  * @param {string} dst output .ply (may be one of the inputs)
  * @param {object|object[]|null} boundsData SplatScout manifest "bounds" ({poly, floorY, top, ...}), or
@@ -95,15 +111,7 @@ function replace(tmp, dst) {
  * @returns {{kept:number, removed:number}}
  */
 export function cropPly(src, dst, boundsData, margin = CROP_MARGIN, { outside = null, keepBig = KEEP_BIG } = {}) {
-  let inside = () => true;
-  if (boundsData) {
-    const areas = (Array.isArray(boundsData) ? boundsData : [boundsData]).map((d) => {
-      const b = new Bounds({ ...d, margin, skips: [] });
-      return { b, floor: b.floorY - 0.4, top: b.top == null ? Infinity : b.top + 0.4 };
-    });
-    if (!areas.length || areas.some((a) => !a.b.poly)) throw new Error('No scan-area outline');
-    inside = (x, y, z) => areas.some(({ b, floor, top }) => y >= floor && y <= top && b.inArea(x, b.floorY, z));
-  }
+  const inside = boundsData ? insideAreas(boundsData, margin) : () => true;
   const files = openAll(Array.isArray(src) ? src : [src]);
   const { header, stride, off } = files[0];
   // Scales are stored as logs; without them (plain point clouds) size can't be judged.

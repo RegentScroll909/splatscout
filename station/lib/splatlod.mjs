@@ -2,6 +2,7 @@
 // most (opaque and big), at most `max` of them, inside the capture's own box, in the .splat format the viewer's
 // renderer reads (32 bytes a splat: centre and size as floats, colour with opacity, then the turn as bytes). Turned
 // like the capture's levelled model (y up), so the building view moves them exactly as it moves the capture's points.
+// A cropped splat's copies keep only its scan area (placement.mjs cropOf).
 
 import { openSync, readSync, closeSync, writeFileSync, renameSync } from 'node:fs';
 import { readHeader } from './crop.mjs';
@@ -59,9 +60,11 @@ function cutFor(imp, max) {
  * @param {number} o.max at most this many splats
  * @param {number[]|null} [o.box] [x0, y0, z0, x1, y1, z1]: leave out what's outside (levelled coordinates)
  * @param {number[]|null} [o.rot] row-major 3×3 that levels the model (the capture's), or null
+ * @param {((x: number, y: number, z: number) => boolean)|null} [o.inside] leave out what this says no to (levelled
+ *   coordinates): a cropped splat's scan area, big splats included
  * @returns {Promise<{count: number, kept: number}>} splats in the .ply, and written
  */
-export async function splatLod({ ply, out, max, box = null, rot = null, minOpacity = 0.03 }) {
+export async function splatLod({ ply, out, max, box = null, rot = null, inside = null, minOpacity = 0.03 }) {
   const fd = openSync(ply, 'r');
   try {
     const { dataStart, count, stride, off } = readHeader(fd);
@@ -81,6 +84,7 @@ export async function splatLod({ ply, out, max, box = null, rot = null, minOpaci
         if (a < minOpacity) continue;
         const [x, y, z] = centre(o);
         if (box && (x < box[0] || y < box[1] || z < box[2] || x > box[3] || y > box[4] || z > box[5])) continue;
+        if (inside && !inside(x, y, z)) continue;
         const s = [f(o, 'scale_0'), f(o, 'scale_1'), f(o, 'scale_2')].map(Math.exp).sort((p, q) => q - p);
         imp[i + j] = Math.max(1e-30, a * s[0] * s[1]);
         kept++;

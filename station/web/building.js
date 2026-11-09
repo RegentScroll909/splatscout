@@ -208,6 +208,7 @@ function capRow(c) {
     floorName(pl.floor ?? 1) + (c.floorGiven == null && !c.placement ? ' (not given)' : ''),
     c.cams.length ? `${fmt(c.cams.length)} photos placed` : c.source === 'splat' ? 'camera positions unknown: its job folder was deleted' : c.error || 'no model',
     c.points ? `${fmt(c.points)} points` : null,
+    c.cropped ? 'shown cropped to its scan area' : null,
     c.metric ? 'in metres' : `scale ${pl.s.toFixed(2)}${c.placement ? '' : ' (guessed)'}`,
   ].filter(Boolean).join(' · ');
   return h('div', { class: 'cap' + (S.focus === c.key ? ' on' : ''), tabindex: 0, onclick: () => focusOn(c.key), onkeydown: (e) => e.key === 'Enter' && focusOn(c.key) },
@@ -377,26 +378,44 @@ function build3d() {
   place3d();
 }
 
-/** A capture's thinned points (model coordinates), fetched once: {n, xyz: Float32Array, rgb: Uint8Array}. */
+/**
+ * A capture's thinned points (model coordinates), fetched once: {n, xyz: Float32Array, rgb: Uint8Array}, every point
+ * (what snapping fits: what's seen through a doorway is where two captures overlap), and `shown`, the ones drawn:
+ * for a cropped splat only those inside its scan area, as the crop shows it.
+ */
 async function pointsOf(c) {
-  if (!c.points) return { n: 0, xyz: new Float32Array(0), rgb: new Uint8Array(0) };
+  const none = { n: 0, xyz: new Float32Array(0), rgb: new Uint8Array(0) };
+  if (!c.points) return { ...none, shown: none };
   if (!T.points.has(c.key)) {
     T.points.set(c.key, fetch('/api/campus/building/points?key=' + encodeURIComponent(c.key))
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`error ${r.status}`))))
       .then((buf) => {
         const n = new DataView(buf).getUint32(0, true);
-        return { n, xyz: new Float32Array(buf, 4, n * 3), rgb: new Uint8Array(buf, 4 + n * 12, n * 3) };
+        const all = { n, xyz: new Float32Array(buf, 4, n * 3), rgb: new Uint8Array(buf, 4 + n * 12, n * 3) };
+        // A cropped splat's points come with a byte each after them: 1 inside its scan area, 0 outside.
+        if (buf.byteLength < 4 + n * 16) return { ...all, shown: all };
+        const mask = new Uint8Array(buf, 4 + n * 15, n);
+        let m = 0;
+        for (let i = 0; i < n; i++) if (mask[i]) m++;
+        const xyz = new Float32Array(m * 3), rgb = new Uint8Array(m * 3);
+        for (let i = 0, j = 0; i < n; i++) {
+          if (!mask[i]) continue;
+          xyz.set(all.xyz.subarray(i * 3, i * 3 + 3), j * 3);
+          rgb.set(all.rgb.subarray(i * 3, i * 3 + 3), j * 3);
+          j++;
+        }
+        return { ...all, shown: { n: m, xyz, rgb } };
       })
       .catch(() => {
         T.points.delete(c.key);
-        return { n: 0, xyz: new Float32Array(0), rgb: new Uint8Array(0) };
+        return { ...none, shown: none };
       }));
   }
   return T.points.get(c.key);
 }
 
 async function showPoints(c, x) {
-  const p = await pointsOf(c);
+  const p = (await pointsOf(c)).shown;
   if (!p.n || T.groups.get(c.key) !== x) return;
   const geo = x.pts.geometry;
   geo.setAttribute('position', new THREE.BufferAttribute(p.xyz, 3));

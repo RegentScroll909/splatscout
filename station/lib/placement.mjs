@@ -7,12 +7,13 @@
 // What a capture's model gives is cached beside its splat (scene.cameras.json and scene.points.bin), so camera
 // positions survive the job folder being deleted from the dashboard.
 
-import { existsSync, readFileSync, writeFileSync, statSync, openSync, readSync, closeSync } from 'node:fs';
-import { join, resolve, sep } from 'node:path';
+import { existsSync, readFileSync, writeFileSync, statSync, openSync, readSync, closeSync, readdirSync, rmSync } from 'node:fs';
+import { join, resolve, sep, dirname } from 'node:path';
+import { createHash } from 'node:crypto';
 import { readModel, isModel, lensOf, thinPoints, planSample, packPoints, unpackPoints } from './colmapmodel.mjs';
 import { splatLod } from './splatlod.mjs';
 import { upRotation } from './walkmap.mjs';
-import { readHeader } from './crop.mjs';
+import { readHeader, insideAreas, CROP_MARGIN } from './crop.mjs';
 import { matchNameIn } from '../../app/js/data/campus.js';
 import { floorArea } from '../../app/js/core/campusmodel.js';
 import * as P from '../web/place.js';
@@ -219,6 +220,74 @@ async function buildCaptureModel({ folder, info, modelDir, ply, source, key, cac
   return out;
 }
 
+// ------------------------------------------------------------------------------------ a cropped splat's scan area
+const readInfo = (folder) => {
+  try {
+    return JSON.parse(readFileSync(join(folder, 'info.json'), 'utf8')) || {};
+  } catch {
+    return {};
+  }
+};
+
+/**
+ * What the building view shows of a cropped splat: inside(x, y, z) in its model's coordinates, the crop's own test
+ * (its outline plus the margin, from just below the floor to just above the top), or null when it shows everything:
+ * no outline, the crop turned off, or not in AR coordinates (where an outline means nothing). AR models aren't turned
+ * (captureModel), so the crop's splat coordinates are the model's.
+ */
+export function cropOf(info) {
+  const c = info && info.crop;
+  if (!c || c.off || !AR.test((info.colmap && info.colmap.mode) || '')) return null;
+  const areas = (c.areas || []).filter((a) => a && Array.isArray(a.poly) && a.poly.length >= 3 && Number.isFinite(a.floorY));
+  if (!areas.length) return null;
+  try {
+    return insideAreas(areas, Number.isFinite(c.margin) ? c.margin : CROP_MARGIN);
+  } catch {
+    return null;
+  }
+}
+const cropKey = (info) => (cropOf(info) ? JSON.stringify([info.crop.areas, info.crop.margin ?? null]) : '');
+
+/** Which of a capture's points are in its scan area (their indices). */
+function insideIdx(pts, inside) {
+  const keep = [];
+  for (let i = 0; i < pts.n; i++) if (inside(pts.xyz[i * 3], pts.xyz[i * 3 + 1], pts.xyz[i * 3 + 2])) keep.push(i);
+  return keep;
+}
+
+/**
+ * A capture's points for the building view: scene.points.bin as it is (count, x y z floats, r g b bytes), plus a byte
+ * a point when its splat is cropped: 1 inside the scan area, 0 outside. The page draws only what's inside, as the
+ * crop does, while snapping onto neighbours still gets every point (what's seen through a doorway is where two
+ * captures overlap).
+ * @returns {Buffer|null} null when its model hasn't been read yet
+ */
+export function viewPoints(libraryDir, key) {
+  const f = pointsFileOf(libraryDir, key);
+  if (!f) return null;
+  const buf = readFileSync(f), inside = cropOf(readInfo(dirname(f)));
+  if (!inside) return buf;
+  const pts = unpackPoints(buf), mask = Buffer.alloc(pts.n);
+  for (const i of insideIdx(pts, inside)) mask[i] = 1;
+  return Buffer.concat([buf.subarray(0, 4 + pts.n * 15), mask]);
+}
+
+const plans = new Map(); // folder -> {k, plan}
+/** The floor-plan sample a capture is drawn with: of the points inside its scan area when it's cropped. */
+function shownPlan(folder, info, model, inside) {
+  if (!inside) return model.plan || [];
+  const file = join(folder, POINTS_FILE), k = cropKey(info) + '|' + fileKey(file), hit = plans.get(folder);
+  if (hit && hit.k === k) return hit.plan;
+  let plan = model.plan || [];
+  try {
+    const pts = unpackPoints(readFileSync(file)), keep = insideIdx(pts, inside), xyz = new Float32Array(keep.length * 3);
+    keep.forEach((i, j) => xyz.set(pts.xyz.subarray(i * 3, i * 3 + 3), j * 3));
+    plan = planSample({ n: keep.length, xyz }, PLAN_POINTS).map(r2);
+  } catch {}
+  plans.set(folder, { k, plan });
+  return plan;
+}
+
 // ------------------------------------------------------------------------------------ one building
 function manifestIn(jobDir) {
   for (const f of jobDir ? [join(jobDir, 'dataset', 'splatscout.json'), join(jobDir, 'dataset', 'parts', 'p1', 'splatscout.json')] : []) {
@@ -276,6 +345,7 @@ export async function buildingView({ code, buildings, library, libraryDir, jobsD
     const geo = c.geo && Number.isFinite(c.geo.lat) && Number.isFinite(c.geo.lon) ? { lat: c.geo.lat, lon: c.geo.lon, acc: c.geo.acc ?? null } : null;
     const floorText = c.floor != null ? String(c.floor) : '';
     const outlines = model.metric ? ((info.crop && info.crop.areas) || []).filter((a) => a && Array.isArray(a.poly) && a.poly.length >= 3).map((a) => a.poly.map(([x, z]) => [r3(x), r3(z)])) : [];
+    const inside = model.source ? cropOf(info) : null; // a cropped splat: only its scan area is shown
     const pl = saved[it.path] ? P.cleanPlacement(saved[it.path]) : null;
     caps.push({
       key: it.path, slot, room: info.room || it.room, building: info.building || it.building, stamp: it.stamp, created: info.created || null,
@@ -283,7 +353,7 @@ export async function buildingView({ code, buildings, library, libraryDir, jobsD
       grade: (info.capture && info.capture.grade) || null, score: info.capture && info.capture.score != null ? info.capture.score : null,
       author: (info.capture && info.capture.author) || null, eval: (info.training && info.training.eval) || null, splats: (info.training && info.training.splats) || null,
       photos: info.photos || 0, mode: model.mode ?? ((info.colmap && info.colmap.mode) || null), metric: !!model.metric, source: model.source, error: model.error || null,
-      images: model.images || 0, cams: model.cams || [], lenses: model.lenses || [], plan: model.plan || [], points: model.points || 0, allPoints: model.allPoints || 0,
+      images: model.images || 0, cams: model.cams || [], lenses: model.lenses || [], plan: shownPlan(folder, info, model, inside), cropped: !!inside, points: model.points || 0, allPoints: model.allPoints || 0,
       floorY: model.floorY ?? 0, floorFrom: model.floorFrom || null, anchor: model.anchor || [0, 0], sGuess: model.sGuess || 1, wall: model.wall || 0,
       start: model.start || null, outlines, floorText, floorGiven: P.floorNumber(floorText), geo, gps: geo ? frame.toXY([geo.lat, geo.lon]).map(r2) : null,
       placement: pl ? { ...pl, at: saved[it.path].at || null } : null,
@@ -337,27 +407,29 @@ export function libraryFolderOf(libraryDir, key) {
 // ------------------------------------------------------------------------------------ splats for the building view
 /** How many splats the building view's lighter copies keep: the capture being reviewed, and its neighbours. */
 export const LOD_SIZES = { near: 800000, far: 250000 };
+const LOD_VERSION = 2; // 2: a cropped splat's copies keep only its scan area
 const lodBusy = new Map();
 
 /**
- * A lighter copy of a library splat for the building view (scene.lod-near.splat or scene.lod-far.splat beside it),
- * made when it's missing or older than the splat or its model: its most important splats inside its capture's box
- * (its points, 0.75 m around), levelled like its model.
+ * A lighter copy of a library splat for the building view (scene.lod-near-<tag>.splat or scene.lod-far-<tag>.splat
+ * beside it), made when it's missing or older than the splat or its model: its most important splats inside its
+ * capture's box (its points, 0.75 m around) and, when it's cropped, inside its scan area (big splats too: the crop
+ * keeps those so plain walls look solid from inside, but in the building view they reach into the neighbours),
+ * levelled like its model. The tag says what it was made with, so a changed crop makes a new one.
  * @param {{libraryDir: string, jobsDir: string, key: string, detail?: 'near'|'far'}} o
  * @returns {Promise<string>} the .splat file
  */
 export async function splatPreview({ libraryDir, jobsDir, key, detail = 'far' }) {
   const folder = libraryFolderOf(libraryDir, key);
   if (!folder) throw new Error('No such splat in the library');
-  const kind = LOD_SIZES[detail] ? detail : 'far', out = join(folder, `scene.lod-${kind}.splat`), ply = join(folder, 'scene.ply');
+  const info = readInfo(folder), inside = cropOf(info);
+  const kind = LOD_SIZES[detail] ? detail : 'far', ply = join(folder, 'scene.ply');
+  const tag = createHash('sha1').update(JSON.stringify([LOD_VERSION, cropKey(info)])).digest('hex').slice(0, 8);
+  const name = `scene.lod-${kind}-${tag}.splat`, out = join(folder, name);
   const newer = (f, than) => !existsSync(than) || statSync(f).mtimeMs >= statSync(than).mtimeMs;
   if (existsSync(out) && newer(out, ply) && newer(out, join(folder, POINTS_FILE))) return out;
   if (lodBusy.has(out)) return lodBusy.get(out);
   const p = (async () => {
-    let info = {};
-    try {
-      info = JSON.parse(readFileSync(join(folder, 'info.json'), 'utf8'));
-    } catch {}
     const jobDir = info.jobId && jobsDir && existsSync(join(jobsDir, info.jobId)) ? join(jobsDir, info.jobId) : null;
     const model = await captureModel({ folder, info, jobDir }); // how it's levelled, and its points for the box
     let box = null;
@@ -373,7 +445,15 @@ export async function splatPreview({ libraryDir, jobsDir, key, detail = 'far' })
         for (let k = 0; k < 3; k++) [box[k], box[k + 3]] = [box[k] - pad, box[k + 3] + pad];
       }
     }
-    await splatLod({ ply, out, max: LOD_SIZES[kind], box, rot: model.rot || null });
+    await splatLod({ ply, out, max: LOD_SIZES[kind], box, rot: model.rot || null, inside });
+    // Copies made before (with another crop, or by an older version) go; one still being read stays till next time.
+    const old = new RegExp(`^scene\\.lod-${kind}(-[0-9a-f]+)?\\.splat$`);
+    for (const f of readdirSync(folder)) {
+      if (f === name || !old.test(f)) continue;
+      try {
+        rmSync(join(folder, f), { force: true });
+      } catch {}
+    }
     return out;
   })().finally(() => lodBusy.delete(out));
   lodBusy.set(out, p);

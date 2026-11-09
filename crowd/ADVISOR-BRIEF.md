@@ -56,7 +56,7 @@ campus map, points for the member) or **not approved** (off the map, with a reas
 | Spam and storage | Closed beta; storage on the free plan is about 1 GB (a few scans at a time), and scans move off the cloud to the PC once imported. |
 
 The database rules are tested on a real PostgreSQL (who can add what, scans only and graded B or better, points
-only from the club PC, members-only views, bans, leaving) and the apps by 64 automated checks.
+only from the club PC, members-only views, bans, leaving) and the apps by 65 automated checks.
 
 ## What we need from you (decisions, not code)
 
