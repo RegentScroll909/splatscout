@@ -1,14 +1,15 @@
 // The club's admin API for the SplatStation page (/club.html): the scans members send and the review of the
-// splats built from them (approve: points and the campus map; or not, with a note), missions, invites,
-// members and restricted buildings. Everything here uses the project's secret key, so it only answers
-// requests from this PC (not from the Wi-Fi).
+// splats built from them (approve: points and the campus map; or not, with a note), how full the club's cloud
+// storage is and freeing a reviewed scan's copy there, missions, invites, members and restricted buildings.
+// Everything here uses the project's secret key, so it only answers requests from this PC (not from the Wi-Fi).
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { networkInterfaces } from 'node:os';
 import * as crowd from './crowd.mjs';
 import * as club from './club.mjs';
+import { readZipText } from './zipread.mjs';
 import { approvalFacts, normRoom } from './campus.mjs';
 import { scoreScan } from '../../app/js/core/clubrules.js';
 
@@ -38,6 +39,58 @@ function localOf(row, library, jobs) {
   const item = library.find((it) => it.info && it.info.club && it.info.club.id === row.id) || null;
   return { job, item };
 }
+
+const zipScan = new Map(); // '<file>|<size>|<changed>' -> the club scan a ZIP holds (the id in its manifest), or null
+/** Which member's scan a ZIP on this PC is: importUpload wrote the scan's id into its splatscout.json. */
+async function scanIn(file) {
+  let st;
+  try {
+    st = statSync(file);
+  } catch {
+    return null;
+  }
+  const key = `${file}|${st.size}|${st.mtimeMs}`;
+  if (!zipScan.has(key)) {
+    let id = null;
+    try {
+      const m = JSON.parse(await readZipText(file, 'splatscout.json'));
+      id = (m.club && m.club.id) || null;
+    } catch {}
+    zipScan.set(key, id);
+  }
+  return zipScan.get(key);
+}
+
+/**
+ * This PC's own copy of a member's scan: the ZIP it was imported as, kept in its job's folder for as long as
+ * the job is in History (or still in the inbox, a moment after importing). {name, in: 'job'|'inbox'}, or null
+ * when there is none (never imported here, or its jobs were deleted): then the photos are only in the cloud.
+ * The page says which before it frees a cloud copy, so a ZIP only counts when its manifest names this scan
+ * (the eight characters of the id in its file name could be another scan's).
+ */
+async function zipOf(row, jobs, inbox) {
+  const tag = `club-${row.id.slice(0, 8)}`;
+  for (const j of jobs) {
+    const mine = !!j.source && !j.source.parts && !!j.club && j.club.id === row.id; // processed here as this scan (a ZIP that was renamed)
+    for (const s of j.source ? j.source.parts || [j.source] : []) {
+      if (!s.file || !/\.zip$/i.test(s.file) || !(mine || basename(s.file).includes(tag))) continue;
+      if ((await scanIn(s.file)) === row.id) return { name: basename(s.file), in: 'job' };
+    }
+  }
+  let waiting = [];
+  try {
+    waiting = readdirSync(inbox).filter((n) => !n.startsWith('.') && n.includes(tag) && /\.zip$/i.test(n));
+  } catch {}
+  for (const name of waiting) if ((await scanIn(join(inbox, name))) === row.id) return { name, in: 'inbox' };
+  return null;
+}
+
+const mb = (bytes) => {
+  const n = bytes / 1048576;
+  return `${n >= 100 ? Math.round(n) : n.toFixed(1)} MB`;
+};
+/** What the page is told when a request can't be done as asked (anything else is a 500). */
+const REFUSED = { 'not-reviewed': 409, 'no-cloud-copy': 410 };
 
 /**
  * What approving a scan would earn: its grade, the floor it adds to the campus map (none for a space already
@@ -76,18 +129,23 @@ export async function handleClub(ctx) {
         const [rows, missions] = await Promise.all([club.listScans(c), club.listMissions(c)]);
         const library = ctx.library(), jobs = ctx.jobs();
         const data = rows.some((r) => localOf(r, library, []).item) ? await ctx.campus(c) : null;
-        return sendJson(res, {
-          scans: rows.map((row) => {
-            const { job, item } = localOf(row, library, jobs);
-            return {
-              ...row, busy: busy.has(row.id),
-              job: job ? { id: job.id, status: job.status, stage: job.stage || null, error: job.error || null } : null,
-              splat: item ? { path: item.path, title: `${item.info.building || item.building} · ${item.info.room || item.room}`, created: item.info.created || null, view: item.info.view || null, review: item.info.review || null } : null,
-              award: item && row.status !== 'approved' && row.status !== 'rejected' ? pointsFor(row, item, data, missions) : null,
-            };
-          }),
-        });
+        const scans = [];
+        for (const row of rows) {
+          const { job, item } = localOf(row, library, jobs);
+          scans.push({
+            ...row, busy: busy.has(row.id),
+            job: job ? { id: job.id, status: job.status, stage: job.stage || null, error: job.error || null } : null,
+            splat: item ? { path: item.path, title: `${item.info.building || item.building} · ${item.info.room || item.room}`, created: item.info.created || null, view: item.info.view || null, review: item.info.review || null } : null,
+            award: item && row.status !== 'approved' && row.status !== 'rejected' ? pointsFor(row, item, data, missions) : null,
+            zip: await zipOf(row, jobs, cfg.dirs.inbox), // this PC's own copy of the scan, if it still has one
+          });
+        }
+        return sendJson(res, { scans });
       }
+
+      case '/api/club/storage':
+        // How full the club's cloud storage is, and what each scan takes there (?fresh=1 measures them all again).
+        return sendJson(res, await crowd.cloudUsage(c, { fresh: !!ctx.url && ctx.url.searchParams.get('fresh') === '1' }));
 
       case '/api/club/scan': {
         const id = String(post.id || '');
@@ -112,6 +170,13 @@ export async function handleClub(ctx) {
             say(`Club: deleted the scan of ${place} from the club database.`);
             if (ctx.onCampusChanged) ctx.onCampusChanged();
             return sendJson(res, { ok: true });
+          }
+          if (post.op === 'free') {
+            // A reviewed scan's files leave the cloud; its row stays, and with it the member's points and their
+            // entry in My scans. Only ever on the reviewer's say-so (the page asks first).
+            const freed = await crowd.freeUpload(c, id);
+            say(`Club: freed the cloud copy of the scan of ${place} (${freed.files} files, ${mb(freed.bytes)}). Its entry in the club database stays${row.status === 'approved' ? `, and so do its ${row.points} points` : ''}.`);
+            return sendJson(res, { ok: true, ...freed });
           }
           const { item } = localOf(row, ctx.library(), []);
           if (post.op === 'approve') {
@@ -184,6 +249,6 @@ export async function handleClub(ctx) {
     }
     return sendJson(res, { error: 'Not found' }, 404);
   } catch (e) {
-    return sendJson(res, { error: e.message }, 500);
+    return sendJson(res, { error: e.message }, REFUSED[e.code] || 500);
   }
 }

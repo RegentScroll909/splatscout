@@ -1,6 +1,6 @@
 // Self-checks for the platform-independent core (run: node tools/check.mjs).
 import assert from 'node:assert/strict';
-import { writeFileSync, mkdtempSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, readFileSync, mkdirSync, existsSync, readdirSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir, networkInterfaces } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -1256,6 +1256,203 @@ say('Done training! Took FormattedDuration(1s).');
   console.log('  ok measured quality: trainBrush holds back every 12th photo, asks Brush to log, and returns its score');
 })();
 
+// ---------------------------------------------------------------- jobs that finish (station)
+// What a night of processing one big scan turned up: a bar that said 99% while nothing moved, the cameras solved
+// from scratch on every retry, COLMAP's matcher stopping by chance, and the PC going to sleep part way.
+const { TrainProgress } = await import('../station/lib/trainer.mjs');
+test('training progress: follows Brush\'s own lines, and waits when they stop', () => {
+  // Brush's lines from that scan's last run (1,026 photos, RTX 5080): one every 400 steps, some 7 s apart.
+  const day = (t) => Date.parse(`2026-11-09T${t}Z`);
+  const lines = [
+    ['07:37:40', 'Loaded dataset with 940 training, 86 eval views'],
+    ['07:37:47', 'Refine iter 401, 707943 splats.'],
+    ['07:37:53', 'Refine iter 801, 736310 splats.'],
+    ['07:38:00', 'Refine iter 1201, 765451 splats.'],
+    ['07:38:07', 'Refine iter 1601, 801756 splats.'],
+    ['07:38:14', 'Refine iter 2001, 838379 splats.'],
+  ];
+  const t0 = day('07:37:36'), last = day('07:38:14');
+  const p = new TrainProgress({ steps: 50000, rate: 30, every: 400, now: t0 });
+  near([p.estimate(t0 + 2000).step], [60], 1e-6, 'before Brush says anything: the speed remembered from the last job');
+  assert.equal(p.usualGap(), null, 'too early to say what is usual');
+  for (const [t, s] of lines) p.line(`[2026-11-09T${t}Z INFO  brush_cli] ${s}`, day(t));
+  assert.deepEqual([Math.round(p.estimate(last).step), p.estimate(last).splats], [2001, 838379]);
+  near([p.rate], [2001 / 38], 1e-6, 'the speed measured from the lines');
+  near([p.estimate(last + 4000).step], [2001 + 4 * (2001 / 38)], 1e-6, 'between lines it carries on at that speed');
+  near([p.estimate(last).eta], [(50000 - 2001) / (2001 / 38)], 1e-6, 'time left');
+  // Brush goes quiet (the GPU stopped): the step waits a line and a half on. The clock alone used to carry it to 99%.
+  assert.equal(p.estimate(last + 10 * 60000).step, 2001 + 600);
+  assert.deepEqual([p.usualGap(), p.quiet(last + 200000)], [7, 200], 'lines usually 7 s apart; 200 s without one');
+  // The PC slept for an hour: that isn't Brush standing still.
+  p.paused(3600000, last + 3605000);
+  assert.equal(p.quiet(last + 3605000), 5);
+  // A Brush that says nothing still moves on by its snapshots, at the speed between them.
+  const q = new TrainProgress({ steps: 30000, rate: 30, now: 0 });
+  q.mark(6000, 300000);
+  near([q.rate, q.estimate(360000).step], [20, 7200], 1e-6, 'snapshots only');
+  q.mark(6000, 400000);
+  near([q.estimate(400000).step], [8000], 1e-6, 'the same snapshot seen again changes nothing');
+  assert.equal(q.usualGap(), null, 'and a run without lines is never called stalled');
+});
+await (async () => {
+  // A stand-in for brush_app.exe that reports every --refine-every steps, as Brush does, and then either finishes
+  // with its last snapshot or (a file named "hang" in its folder) goes silent while still running.
+  const dir = mkdtempSync(join(tmpdir(), 'train-'));
+  const fake = join(dir, 'fake-brush.mjs');
+  writeFileSync(fake, `import { writeFileSync, existsSync } from 'node:fs';
+const a = process.argv.slice(2), opt = (k) => a[a.indexOf(k) + 1];
+const steps = +opt('--total-steps'), every = +opt('--refine-every'), out = opt('--export-path');
+const say = (s) => console.log('[2026-11-09T07:37:47Z INFO  brush_cli] ' + s);
+say('Loaded dataset with 233 training, 0 eval views');
+let i = 0;
+const tick = setInterval(() => {
+  i += every;
+  say('Refine iter ' + (i + 1) + ', ' + (1000 + i) + ' splats.');
+  if (existsSync(out + '/hang') && i >= 2 * every) return clearInterval(tick), setInterval(() => {}, 1000);
+  if (i < steps) return;
+  clearInterval(tick);
+  writeFileSync(out + '/splat_' + steps + '.ply', 'ply\\nformat binary_little_endian 1.0\\nelement vertex 4321\\nend_header\\n');
+  say('Done training! Took FormattedDuration(1s).');
+}, 40);
+`);
+  // 1. Processed again: the folder still has the last run's snapshots, one of them from a longer run.
+  const out = join(dir, 'again');
+  mkdirSync(out);
+  const hourAgo = new Date(Date.now() - 3600e3);
+  for (const name of ['splat_1000.ply', 'splat_9000.ply', 'splat_9000.walk.json']) {
+    writeFileSync(join(out, name), 'ply\nformat binary_little_endian 1.0\nelement vertex 9999\nend_header\n');
+    utimesSync(join(out, name), hourAgo, hourAgo);
+  }
+  const shown = [], exported = [];
+  const r = await trainBrush({
+    brush: process.execPath, dataset: fake, outDir: out, preset: { steps: 3000, maxResolution: 1920, maxSplats: 1e6 }, nImages: 233,
+    progress: (f, note) => shown.push([f, note]), onExport: (file, iter) => exported.push(iter), stall: { poll: 50 }, cacheDir: dir,
+  });
+  assert.deepEqual([r.iter, r.splats, r.ply.endsWith('splat_3000.ply')], [3000, 4321, true], 'this run\'s own splat, not the old run\'s bigger one');
+  assert.deepEqual(exported, [3000], 'the old snapshots aren\'t shown as this run\'s');
+  assert.ok(shown.length && shown[0][0] < 0.5, `the bar starts where the run is (it used to jump to 99%): ${shown[0]}`);
+  assert.ok(shown.every(([f], k) => k === 0 || f >= shown[k - 1][0] - 1e-9), 'and only moves forward');
+  assert.match(shown[shown.length - 1][1], /^step ~[\d,.\s]+ \/ 3.?000 · 0\.00 M splats · ~\d+ s left$/);
+  assert.deepEqual(readdirSync(out).filter((n) => /^splat_/.test(n)), ['splat_3000.ply'], 'afterwards only the finished splat is kept');
+  // 2. A run whose GPU stops: Brush is still there but says nothing more. Said, and in the end stopped.
+  const hung = join(dir, 'hung');
+  mkdirSync(hung);
+  writeFileSync(join(hung, 'hang'), '');
+  const told = [], notes = [];
+  await assert.rejects(trainBrush({
+    brush: process.execPath, dataset: fake, outDir: hung, preset: { steps: 3000, maxResolution: 1920, maxSplats: 1e6 }, nImages: 233,
+    progress: (f, note) => notes.push(note), say: (s) => told.push(s), stall: { poll: 50, after: 0.2, giveUp: 0.6 }, cacheDir: dir,
+  }), /Training stopped at step 467 of 3.?000: nothing came from Brush for \d+ s, so it was ended/);
+  assert.equal(told.length, 1);
+  assert.match(told[0], /hasn't moved for \d+ s \(Brush last reported step 467\)/);
+  // The bar waits near Brush's last line (467), at most a line and a half on, and says so.
+  const waiting = notes.filter((n) => /^step ~[\d,.\s]+ \/ 3.?000 · 0\.00 M splats · no progress for \d+ s$/.test(n));
+  const stepOf = (n) => +/^step ~([\d,.\s]+) \//.exec(n)[1].replace(/\D/g, '');
+  assert.ok(waiting.length && waiting.every((n) => stepOf(n) >= 467 && stepOf(n) <= 467 + 350), 'the bar waits by the last line: ' + notes[notes.length - 1]);
+  passed++;
+  console.log('  ok training: a job processed again shows and returns its own run (not the last run\'s snapshots); a run gone silent is said and ended');
+})();
+
+const { withRetries, whyStopped } = await import('../station/lib/colmap.mjs');
+await (async () => {
+  // COLMAP 4.2's matcher stopped on this, a third of the way through a 1,026-photo scan; the next try passed.
+  const stopped = Object.assign(new Error('colmap.exe exited with code 3221226505:\n…'), {
+    tail: ['I20261109 00:04:26.872356 33516 pairing.cc:934] Processing block [16/39]', 'E20261109 00:04:29.144390 37332 essential_matrix.cc:252] Check failed: cam_rays1_with_jac.size() >= kMinNumSamples (4 vs. 5) '],
+  });
+  assert.equal(whyStopped(stopped), 'Check failed: cam_rays1_with_jac.size() >= kMinNumSamples (4 vs. 5)');
+  assert.equal(whyStopped(new Error('spawn colmap.exe ENOENT\nmore')), 'spawn colmap.exe ENOENT');
+  const said = [];
+  let calls = 0;
+  const got = await withRetries(async (k) => {
+    calls++;
+    if (k < 3) throw stopped;
+    return 'matched';
+  }, { onRetry: (e, k) => said.push(`${k}: ${whyStopped(e)}`) });
+  assert.deepEqual([got, calls, said.length, said[1].slice(0, 15)], ['matched', 3, 2, '2: Check failed']);
+  calls = 0;
+  await assert.rejects(withRetries(async () => { calls++; throw stopped; }), /3221226505/, 'three tries, then it fails as before');
+  assert.equal(calls, 3);
+  calls = 0;
+  await assert.rejects(withRetries(async () => { calls++; throw Object.assign(new Error('Cancelled'), { cancelled: true }); }), /Cancelled/);
+  assert.equal(calls, 1, 'a cancelled job isn\'t tried again');
+  passed++;
+  console.log('  ok COLMAP\'s matcher: stopped by chance, it is sent on from where it stopped (three tries; not when cancelled)');
+})();
+
+const { solveKey, saveSolve, savedSolve } = await import('../station/lib/pipeline.mjs');
+await (async () => {
+  // Processing a capture again uses the camera solve its last run left, when nothing it was made from changed.
+  const dir = mkdtempSync(join(tmpdir(), 'solve-'));
+  const zip = join(dir, 'source', 'Hayden_C42_20261108.zip'), colmap = join(dir, 'colmap.exe');
+  for (const d of ['source', 'colmap/posed_clean', 'dataset/images']) mkdirSync(join(dir, d), { recursive: true });
+  writeFileSync(zip, 'zip bytes');
+  writeFileSync(colmap, 'exe');
+  for (const n of ['cameras.bin', 'images.bin', 'points3D.bin']) writeFileSync(join(dir, 'colmap/posed_clean', n), n);
+  for (const n of ['0001.jpg', '0002.jpg', '0003.jpg']) writeFileSync(join(dir, 'dataset/images', n), n);
+  const job = { source: { kind: 'zip', file: zip } }, cfg = { usePoses: true, matcher: 'auto', tools: { colmap } };
+  const key = solveKey(job, cfg);
+  assert.equal(typeof key, 'string');
+  assert.equal(solveKey(job, { ...cfg }), key, 'the same capture and settings: the same key');
+  assert.notEqual(solveKey({ ...job, usePoses: false }, cfg), key, 'AR positions off: another solve');
+  assert.notEqual(solveKey(job, { ...cfg, matcher: 'exhaustive' }), key, 'another matcher: another solve');
+  assert.equal(solveKey({ source: { kind: 'video', file: zip } }, cfg), null, 'a video is solved every time');
+  assert.equal(solveKey({ source: { kind: 'merge', parts: [{ kind: 'zip', file: zip }, { kind: 'video', file: zip }] } }, cfg), null, 'so is a merge with one in it');
+  assert.equal(typeof solveKey({ source: { kind: 'merge', parts: [{ kind: 'zip', file: zip }, { kind: 'zip', file: zip }] } }, cfg), 'string');
+  assert.equal(solveKey({ source: { kind: 'zip', file: join(dir, 'gone.zip') } }, cfg), null, 'a capture that is gone has none');
+  const rec = { modelDir: join(dir, 'colmap', 'posed_clean'), imagesDir: join(dir, 'dataset', 'images'), stats: { images: 3, points: 120, observations: 400, reprojError: 0.57 }, mode: 'ar-poses', undistorted: false };
+  assert.equal(await savedSolve(dir, key, 3), null, 'nothing saved yet');
+  saveSolve(dir, key, rec, 3);
+  const same = async () => ({ images: 3, points: 120 });
+  assert.deepEqual(await savedSolve(dir, key, 3, same), { ...rec, reused: true }, 'the solve comes back as it was saved');
+  assert.equal(await savedSolve(dir, solveKey({ ...job, usePoses: false }, cfg), 3, same), null, 'not for other settings');
+  assert.equal(await savedSolve(dir, key, 4, same), null, 'not for another number of photos');
+  assert.equal(await savedSolve(dir, key, 3, async () => ({ images: 3, points: 119 })), null, 'not when the model on disk is no longer the one saved');
+  assert.equal(await savedSolve(dir, key, 3, async () => { throw new Error('unreadable'); }), null, 'or can\'t be read');
+  writeFileSync(zip, 'zip bytes, changed');
+  assert.notEqual(solveKey(job, cfg), key, 'another capture file: another solve');
+  writeFileSync(zip, 'zip bytes');
+  rmSync(join(dir, 'dataset/images/0003.jpg'));
+  assert.equal(await savedSolve(dir, key, 3, same), null, 'not when photos are missing');
+  writeFileSync(join(dir, 'dataset/images/0003.jpg'), 'x');
+  rmSync(join(dir, 'colmap/posed_clean/points3D.bin'));
+  assert.equal(await savedSolve(dir, key, 3, same), null, 'not when the model is incomplete');
+  writeFileSync(join(dir, 'colmap/posed_clean/points3D.bin'), 'x');
+  writeFileSync(join(dir, 'colmap', 'solve.json'), '\0'.repeat(300)); // what a PC that stopped mid-write can leave
+  assert.equal(await savedSolve(dir, key, 3, same), null, 'a spoiled note means solving again');
+  passed++;
+  console.log('  ok camera solve: kept for the next run of the same capture and settings, and only then');
+})();
+
+const { writeFileAtomic, readList } = await import('../station/lib/files.mjs');
+const { keepAwake, heldAwake } = await import('../station/lib/awake.mjs');
+await (async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'state-'));
+  const f = join(dir, 'jobs.json');
+  assert.deepEqual(readList(f), [], 'no job list yet');
+  writeFileAtomic(f, JSON.stringify([{ id: 'a' }]));
+  writeFileAtomic(f, JSON.stringify([{ id: 'a' }, { id: 'b' }]));
+  assert.deepEqual(readList(f).map((j) => j.id), ['a', 'b']);
+  assert.deepEqual(readdirSync(dir), ['jobs.json'], 'nothing left beside it');
+  // A list a stopped PC spoiled: SplatStation still starts, and the file is kept to look at.
+  writeFileSync(f, '[{"id": "a"}, {"id"');
+  const bad = [];
+  assert.deepEqual(readList(f, (e, kept) => bad.push(kept)), []);
+  assert.equal(bad.length, 1);
+  assert.match(bad[0], /jobs\.json\.unreadable-\d+$/);
+  assert.deepEqual([existsSync(f), existsSync(bad[0])], [false, true]);
+  writeFileSync(f, '{"not": "a list"}');
+  assert.deepEqual(readList(f), []);
+  // Awake while there's work (Windows; elsewhere it does nothing). Asking twice starts one helper.
+  const on = await keepAwake(true);
+  assert.equal(on, process.platform === 'win32', 'held awake on Windows');
+  assert.equal(await keepAwake(true), on);
+  assert.equal(heldAwake(), on);
+  assert.equal(await keepAwake(false), false);
+  assert.equal(heldAwake(), false, 'and let go');
+  passed++;
+  console.log(`  ok station: the job list survives a PC that stops mid-write; the PC is held awake while there's work${on ? '' : ' (Windows only: not tried here)'}`);
+})();
+
 // ---------------------------------------------------------------- club (beta)
 // An in-memory stand-in for the club's Supabase project (tools/fake-supabase.mjs) answers for both the
 // phone code and the station code; the ASU building list is read from disk instead of over HTTP.
@@ -1549,6 +1746,160 @@ await (async () => {
   assert.equal(answer[0], 403, 'a phone on the Wi-Fi is refused');
   passed++;
   console.log('  ok club (PC): scans with what this PC made of them, approve (points, mission bonus, campus map) or not (the member reads why), missions, invites, members, restricted places');
+})();
+
+// ---------------------------------------------------------------- club: room in the cloud
+// A scan's files stay in the club's cloud storage after SplatStation imports it (the free plan has about 1 GB).
+// The Club page says how full it is, and frees a reviewed scan's copy there when the reviewer asks: the files
+// go, the row stays, and with it the member's points and their entry in My scans.
+await (async () => {
+  const c = { url: FAKE_URL, key: 'sb_secret_test' };
+  const dir = mkdtempSync(join(tmpdir(), 'clubcloud-'));
+  const cfg = { workDir: dir, dirs: { library: join(dir, 'library'), inbox: join(dir, 'inbox'), jobs: join(dir, 'jobs') } };
+  for (const d of Object.values(cfg.dirs)) mkdirSync(d, { recursive: true });
+  writeFileSync(join(dir, 'crowd.json'), JSON.stringify({ url: FAKE_URL, secretKey: 'sb_secret_test' }));
+  let jobs = [];
+  const said = [];
+  const api = async (path, post) => {
+    let out = null;
+    const url = new URL('http://localhost' + path);
+    await clubApi.handleClub({ req: { socket: { remoteAddress: '127.0.0.1' }, method: post ? 'POST' : 'GET' }, res: {}, path: url.pathname, url, cfg, readBody: async () => post || {},
+      sendJson: (res, body, code = 200) => (out = { code, body }), say: (t) => said.push(t), scanInbox() {}, library: () => [], jobs: () => jobs, campus: async () => null, onCampusChanged() {} });
+    return out;
+  };
+  const leaf = (p) => p.split(/[\\/]/).pop();
+  const inCloud = (prefix) => [...fake.db.files].filter(([k]) => k.startsWith(`captures/${prefix}/`));
+  const bytesOf = (prefix) => inCloud(prefix).reduce((s, [, d]) => s + d.length, 0);
+
+  // This phone (Test_Fox) sends a scan: five photos, its manifest, and pose files two and five folders down.
+  const files = [
+    ...[1, 2, 3, 4, 5].map((n) => ({ name: `images/000${n}.jpg`, data: new Blob([new Uint8Array(1000 * n).fill(n)], { type: 'image/jpeg' }), type: 'image/jpeg' })),
+    { name: 'splatscout.json', data: JSON.stringify({ capture: { building: 'Hayden Library', room: 'Room 105' }, frames: [] }), type: 'application/json' },
+    { name: 'poses/colmap/sparse/0/cameras.txt', data: '# cameras\n', type: 'text/plain' },
+    { name: 'poses/parts/2/colmap/sparse/0/images.txt', data: '# images\n', type: 'text/plain' },
+  ];
+  const capture = { id: 'cloud-1', engine: 'xr', score: { grade: 'A' } };
+  const up = await crowdApp.uploadCapture(capture, files, { buildingCode: 'hayden-library', buildingName: 'Hayden Library', floor: '1', room: 'Room 105', contributor: 'Test_Fox' }, { save: async () => {} });
+  const own = 15000 + files.slice(5).reduce((s, f) => s + f.data.length, 0) + fake.db.files.get(`captures/${up.prefix}/upload.json`).length;
+  const N = files.length + 1; // and the file list, upload.json
+  assert.equal(bytesOf(up.prefix), own);
+  const other = fake.db.captures.get(phoneScan).storage_prefix; // the scan this phone sent earlier (not approved)
+  const hawk = [...fake.db.captures.values()].find((x) => x.contributor === 'Scan_Hawk'); // a row with no files
+
+  // -- how full the cloud storage is: every scan's folder listed (sub-folders too) and added up
+  const before = await crowdStation.cloudUsage(c);
+  assert.deepEqual(before.scans[up.id], { bytes: own, files: N });
+  assert.deepEqual(before.scans[phoneScan], { bytes: bytesOf(other), files: 9 });
+  assert.deepEqual(before.scans[hawk.id], { bytes: 0, files: 0 }, 'a scan with nothing in the cloud');
+  assert.deepEqual([before.bytes, before.files, before.limit], [own + bytesOf(other), N + 9, 1024 * 1048576], 'against about 1 GB');
+  // The server gives a folder's entries a page at a time (a 1,026-photo scan needs two): a small page finds the same files.
+  const whole = await crowdStation.listFiles(c, up.prefix);
+  assert.deepEqual(whole.map((f) => f.name.slice(up.prefix.length + 1)).sort(), [...files.map((f) => f.name), 'upload.json'].sort());
+  assert.deepEqual(await crowdStation.listFiles(c, up.prefix, 2), whole, 'two entries at a time');
+  assert.deepEqual(await crowdStation.listFiles(c, `${up.prefix}-gone`), [], 'a folder that isn’t there');
+  // Each finished scan's folder is listed once and remembered; asked afresh, they are listed again.
+  let listed = fake.db.lists;
+  assert.deepEqual(await crowdStation.cloudUsage(c), before);
+  assert.equal(fake.db.lists, listed, 'nothing listed twice');
+  assert.deepEqual((await api('/api/club/storage')).body, before);
+  assert.equal(fake.db.lists, listed);
+  assert.deepEqual((await api('/api/club/storage?fresh=1')).body, before);
+  assert.ok(fake.db.lists > listed, 'measured again when asked');
+  // A scan still being sent counts too, and is measured each time (it grows).
+  const G = 'c10d0000-0000-4000-8000-000000000001', gp = `hayden-library/floor-1-room-106/${G}`;
+  fake.db.captures.set(G, { ...fake.db.captures.get(up.id), id: G, room: 'Room 106', storage_prefix: gp, status: 'uploading' });
+  fake.db.files.set(`captures/${gp}/images/0001.jpg`, new Uint8Array(700));
+  assert.deepEqual((await crowdStation.cloudUsage(c)).scans[G], { bytes: 700, files: 1 });
+  fake.db.files.set(`captures/${gp}/images/0002.jpg`, new Uint8Array(300));
+  let use = await crowdStation.cloudUsage(c);
+  assert.deepEqual([use.scans[G], use.bytes], [{ bytes: 1000, files: 2 }, before.bytes + 1000]);
+  // Deleting a scan (its files and its row) takes it out of the figure.
+  await crowdStation.deleteUpload(c, G);
+  assert.deepEqual([inCloud(gp).length, fake.db.captures.has(G)], [0, false]);
+  assert.deepEqual(await crowdStation.cloudUsage(c), before);
+  passed++;
+  console.log('  ok club storage: how much the scans take in the cloud against about 1 GB (sub-folders, a page at a time, a scan still being sent), each scan measured once');
+
+  // -- freeing a scan's cloud copy: only once it is reviewed
+  await assert.rejects(crowdStation.freeUpload(c, up.id), /Review this scan first/);
+  let r = await api('/api/club/scan', { op: 'free', id: up.id });
+  assert.deepEqual([r.code, bytesOf(up.prefix)], [409, own], 'a scan not imported yet keeps its files');
+  // SplatStation imports it: this PC's own copy is the ZIP, in the inbox and then in its job's folder.
+  const zip = await crowdStation.importUpload(c, up.id, cfg.dirs.inbox);
+  const scanRow = async (id) => (await api('/api/club/scans')).body.scans.find((x) => x.id === id);
+  assert.deepEqual((await scanRow(up.id)).zip, { name: leaf(zip), in: 'inbox' });
+  mkdirSync(join(cfg.dirs.jobs, 'j1', 'source'), { recursive: true });
+  const kept = join(cfg.dirs.jobs, 'j1', 'source', leaf(zip));
+  fsx.renameSync(zip, kept);
+  jobs = [{ id: 'j1', status: 'done', source: { kind: 'zip', file: kept, name: leaf(kept) } }];
+  assert.deepEqual((await scanRow(up.id)).zip, { name: leaf(kept), in: 'job' });
+  assert.equal((await scanRow(phoneScan)).zip, null, 'a scan this PC never imported');
+  assert.equal((await api('/api/club/scan', { op: 'free', id: up.id })).code, 409, 'imported, but not reviewed yet');
+  // The club approves it: 36 points for Test_Fox.
+  await clubSt.approveScan(c, up.id, 36);
+  const boards = async () => [await clubApp.leaderboard('all'), await clubApp.leaderboard('week')];
+  const boardBefore = await boards(), mineBefore = await clubApp.myScans();
+  assert.deepEqual(boardBefore[0].find((x) => x.handle === 'Test_Fox'), { handle: 'Test_Fox', points: 36, photos: 0, scans: 1 });
+  assert.deepEqual(mineBefore.map((s) => [s.id, s.status, s.points, s.review_note]), [[up.id, 'approved', 36, null], [phoneScan, 'rejected', 0, 'Too blurry or patchy']]);
+
+  // Free cloud copy: the files go; the row, the points, the leaderboard and My scans stay as they were.
+  listed = fake.db.lists;
+  r = await api('/api/club/scan', { op: 'free', id: up.id });
+  assert.deepEqual([r.code, r.body], [200, { ok: true, bytes: own, files: N }]);
+  assert.equal(inCloud(up.prefix).length, 0, 'its files are gone from the cloud');
+  assert.deepEqual([fake.db.captures.get(up.id).status, fake.db.captures.get(up.id).points], ['approved', 36], 'its row and points are kept');
+  assert.deepEqual(await boards(), boardBefore, 'the leaderboard is unchanged');
+  assert.deepEqual(await clubApp.myScans(), mineBefore, 'and so is My scans on the phone');
+  assert.equal(inCloud(other).length, 9, 'another scan’s files are left alone');
+  assert.ok(said.some((t) => /freed the cloud copy/.test(t) && /Hayden Library · Room 105/.test(t) && /its 36 points/.test(t)), said.join(' / '));
+  listed = fake.db.lists;
+  use = await crowdStation.cloudUsage(c);
+  assert.deepEqual([use.scans[up.id], use.bytes, fake.db.lists], [{ bytes: 0, files: 0 }, before.bytes - own, listed], 'the figure follows, without listing anything again');
+  assert.ok(existsSync(kept) && (await scanRow(up.id)).zip.in === 'job', 'this PC’s ZIP is still in its job’s folder');
+  // The ZIP also counts when it is one part of a merge; once its jobs are deleted, the page is told there is none.
+  jobs = [{ id: 'j2', status: 'done', source: { kind: 'merge', parts: [{ kind: 'zip', file: join(dir, 'other.zip') }, { kind: 'zip', file: kept }] } }];
+  assert.deepEqual((await scanRow(up.id)).zip, { name: leaf(kept), in: 'job' });
+  jobs = [];
+  assert.equal((await scanRow(up.id)).zip, null);
+  // A ZIP only counts when its manifest names this scan: another scan's can carry the same eight characters in its name.
+  const alike = new ZipWriter();
+  await alike.add('x/splatscout.json', JSON.stringify({ capture: {}, club: { id: `${up.id.slice(0, 8)}-0000-4000-8000-00000000abcd` } }));
+  const twin = join(cfg.dirs.jobs, 'j1', 'source', `Another_scan_club-${up.id.slice(0, 8)}.zip`);
+  writeFileSync(twin, Buffer.from(await alike.finish().arrayBuffer()));
+  jobs = [{ id: 'j3', status: 'done', source: { kind: 'zip', file: twin, name: leaf(twin) } }];
+  assert.equal((await scanRow(up.id)).zip, null, 'a look-alike name is not this scan’s ZIP');
+  jobs = [];
+
+  // Import again is refused, saying why (the storage itself only says "Object not found"), and writes nothing.
+  await assert.rejects(crowdStation.importUpload(c, up.id, cfg.dirs.inbox), /cloud copy was freed.*can’t be imported again/);
+  r = await api('/api/club/scan', { op: 'import', id: up.id });
+  assert.equal(r.code, 410);
+  assert.match(r.body.error, /no files in the club’s cloud storage any more \(its cloud copy was freed\)/);
+  assert.deepEqual([readdirSync(cfg.dirs.inbox), fake.db.captures.get(up.id).status], [[], 'approved']);
+  // Freeing it again finds nothing to free.
+  assert.deepEqual((await api('/api/club/scan', { op: 'free', id: up.id })).body, { ok: true, bytes: 0, files: 0 });
+  // A copy freed only in part (it stopped part way) says so when imported, and freeing it again removes the rest.
+  fake.db.files.set(`captures/${up.prefix}/images/0003.jpg`, new Uint8Array(10));
+  await assert.rejects(crowdStation.importUpload(c, up.id, cfg.dirs.inbox), /isn’t whole \(its file list is gone and 1 file is left/);
+  assert.deepEqual(await crowdStation.freeUpload(c, up.id), { bytes: 10, files: 1 });
+  assert.equal(inCloud(up.prefix).length, 0);
+  // A scan that wasn't approved can be freed too: its owner still reads why it was turned down.
+  r = await api('/api/club/scan', { op: 'free', id: phoneScan });
+  assert.deepEqual([r.code, r.body.files, inCloud(other).length], [200, 9, 0]);
+  assert.deepEqual([fake.db.captures.get(phoneScan).status, fake.db.captures.get(phoneScan).review_note], ['rejected', 'Too blurry or patchy']);
+  assert.deepEqual(await clubApp.myScans(), mineBefore);
+  assert.equal((await crowdStation.cloudUsage(c, { fresh: true })).bytes, 0, 'nothing left in the cloud');
+  assert.equal((await api('/api/club/scan', { op: 'free', id: 'ce000000-0000-4000-8000-00000000ffff' })).code, 404, 'a scan that isn’t in the database');
+  passed++;
+  console.log('  ok club storage: freeing a reviewed scan’s cloud copy (the files go; the row, points, leaderboard and My scans stay), not before its review, Import again says why');
+
+  // -- the phone: "Remove from club database" still works on a scan whose cloud copy the club freed
+  await crowdApp.deleteUpload(capture);
+  assert.ok(!fake.db.captures.has(up.id), 'its row is gone');
+  assert.deepEqual((await clubApp.myScans()).map((s) => s.id), [phoneScan], 'and it left My scans; the other scan is still there');
+  assert.deepEqual((await clubApp.leaderboard('all')).find((x) => x.handle === 'Test_Fox'), { handle: 'Test_Fox', points: 0, photos: 0, scans: 0 }, 'removing your own scan gives up its points');
+  passed++;
+  console.log('  ok club (phone): Remove from club database still works once the scan’s cloud copy was freed');
 })();
 
 // ---------------------------------------------------------------- campus view

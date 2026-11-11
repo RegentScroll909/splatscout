@@ -19,10 +19,32 @@ if (process.argv.includes('--demo')) demo();
 
 /**
  * --demo: made-up members ("Demo_…") and the scans they sent around a few Tempe buildings, so the Campus and
- * Club pages have something to show: some approved, some waiting for the club, one turned down. Rows only (no
- * files), spread over the last four weeks and all four kinds of light.
+ * Club pages have something to show: some approved, some waiting for the club, one turned down, spread over
+ * the last four weeks and all four kinds of light. Each scan has its files in the bucket, so the Club page's
+ * cloud storage figure and Free cloud copy can be tried: the photos are stand-ins of a few bytes that a
+ * listing gives a photo's size (about 660 MB in all, without holding it). They import, but can't be built.
  */
 function demo() {
+  let seed2 = 11; // the files' sizes have their own dice, so the rows stay as they always were
+  const rnd2 = () => ((seed2 = (seed2 * 48271) % 2147483647) / 2147483647);
+  const MB = 1048576, jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+  /** A scan's files as a phone sends them (see uploadCapture in app/js/data/crowd.js). */
+  const putFiles = (row) => {
+    const list = [];
+    const put = (name, data, size = data.length) => {
+      const k = `captures/${row.storage_prefix}/${name}`;
+      fake.db.files.set(k, typeof data === 'string' ? new TextEncoder().encode(data) : data);
+      if (size !== data.length) fake.db.sizes.set(k, size);
+      list.push({ name, size });
+    };
+    for (let i = 1; i <= row.photo_count; i++) put(`images/${String(i).padStart(4, '0')}.jpg`, jpeg, Math.round((0.16 + rnd2() * 0.12) * MB));
+    put('splatscout.json', JSON.stringify({ capture: { building: row.building_name, floor: row.floor, room: row.room, engine: 'xr' }, frames: [] }));
+    put('poses/transforms.json', '{"frames": []}');
+    for (const f of ['cameras.txt', 'images.txt', 'points3D.txt']) put(`poses/colmap/sparse/0/${f}`, `# ${f}\n`);
+    put('poses/points.ply', new Uint8Array(8), Math.round((4 + rnd2() * 4) * MB));
+    put('coverage.png', new Uint8Array(8), Math.round((40 + rnd2() * 40) * 1024));
+    fake.db.files.set(`captures/${row.storage_prefix}/upload.json`, new TextEncoder().encode(JSON.stringify({ capture: row.id, files: list })));
+  };
   const list = JSON.parse(readFileSync(new URL('../app/data/asu-buildings.json', import.meta.url), 'utf8')).buildings;
   const at = (name) => list.find((b) => b.name === name);
   let seed = 7;
@@ -52,15 +74,18 @@ function demo() {
     const [user, handle] = users[Math.floor(rnd() * users.length)];
     const base = new Date(now - daysAgo * day);
     const t = Math.min(now - 6e4, Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), HOURS[light] + 7, Math.floor(rnd() * 50)));
-    const id = `5ca00000-0000-4000-8000-${String(++k).padStart(12, '0')}`;
+    // Each id starts differently: SplatStation names an imported ZIP after the first eight characters.
+    const id = `5ca0000${++k}-0000-4000-8000-${String(k).padStart(12, '0')}`;
     const done = status === 'approved' || status === 'rejected';
     fake.db.captures.set(id, {
       id, user_id: user, created_at: new Date(t).toISOString(), building_code: b.code, building_name: b.name, floor, room, photo_count: photos, grade, status,
       points: status === 'approved' ? points : 0, reviewed_at: done ? new Date(Math.min(now, t + day)).toISOString() : null, review_note: status === 'rejected' ? 'A person is in the scan' : null,
       contributor: handle, lat: b.c[0] + (rnd() - 0.5) * 0.0003, lon: b.c[1] + (rnd() - 0.5) * 0.0003, gps_accuracy_m: Math.round(8 + rnd() * 20), storage_prefix: `${b.code}/x/${id}`,
     });
+    putFiles(fake.db.captures.get(id));
   }
-  console.log(`Demo data: ${fake.db.captures.size} scans, ${users.length} demo members`);
+  const held = [...fake.db.files.keys()].reduce((s, k) => s + (fake.db.sizes.get(k) ?? fake.db.files.get(k).length), 0);
+  console.log(`Demo data: ${fake.db.captures.size} scans, ${users.length} demo members, ${fake.db.files.size} stand-in files listed as ${Math.round(held / MB)} MB`);
 }
 
 createServer(async (req, res) => {

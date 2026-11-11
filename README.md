@@ -169,8 +169,11 @@ five-minute demo script.
   graded A or B would make it better") and **Scan here**. The list of buildings under the map has the same
   information without the map. The numbers come from SplatStation's Campus page, which publishes them for members
   (counts and sizes only, no names or GPS points); the phone keeps the last copy for places with no signal.
-- **Where it goes:** a Supabase project (free plan: about 1 GB, roughly 3–6 scans at a time; import scans onto
-  SplatStation and delete their cloud copies to make room). Scans land in the private `captures` bucket under
+- **Where it goes:** a Supabase project (free plan: about 1 GB of files; a 267-photo scan took 82 MB there and
+  a 1,026-photo one 504 MB). A scan's files stay in the cloud after SplatStation imports it: nothing is removed
+  by itself. SplatStation's Club page shows how full the storage is, and once a scan is reviewed, **Free cloud
+  copy** there deletes its files and keeps its row, so the member keeps their points and the scan stays in
+  *My scans*. Scans land in the private `captures` bucket under
   `<building>/<floor-room>/<scan id>/`, with one row per scan. Each phone signs in anonymously and the database
   rules let it add, finish and delete only its own uploads, never see anyone else's, and never set its own points
   or review note.
@@ -262,7 +265,8 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   answer requests from this PC, not from the Wi-Fi). *Club scans* on the dashboard then lists the scans members
   sent, by building. **Import** downloads one into *Ready to process* as a normal SplatScout ZIP filed under the
   shared building name (no points yet: they come with your approval); **Delete** removes it from the club database
-  for good.
+  for good, its row too. An approved scan's row is the member's points, so to make room use *Free cloud copy* on
+  the Club page instead (next).
 - **Review scans & members** (that section's button, or `/club.html`): the **Scans** queue, in tabs: *Splats to
   review*, *Not on this PC yet* (**Import and build**), *Being built*, *Approved* and *Not approved*. Once a scan's
   splat is built, **View the splat** opens it in the viewer and **Place it in the building** opens it among the
@@ -272,6 +276,17 @@ itself instead, tick *Process new captures by themselves* under Defaults.
   place). The splat stays on this PC either way. The page also makes **missions** (scan a space; a bonus when a scan
   of it is approved), **invite codes** (who can join and how many times), pauses, renames or removes members
   (removing deletes everything they sent), and edits the list of off-limits buildings.
+
+  **Cloud storage** (in the page's Overview): how much the members' scans take in the club's cloud storage against
+  the free plan's 1 GB or so, counted from the files themselves (each scan's folder is listed once while
+  SplatStation runs; *Measure again* lists them afresh). Importing a scan doesn't remove it from the cloud, so the
+  storage fills up with scans you've already dealt with. On a scan under *Approved* or *Not approved*, **Free cloud
+  copy** deletes its files there and keeps its row: the member keeps their points, their place on the leaderboard
+  and the scan in *My scans* (with the reason, if it wasn't approved), and can still remove it themselves. It asks
+  first and says what stays: the row, the splat, and this PC's ZIP of the scan while its job is in History (it
+  says so when this PC has no ZIP, because then the photos are gone for good). What stops working is *Import
+  again*, which then says the cloud copy was freed. Nothing is ever freed by itself, and a scan that isn't
+  reviewed yet can't be freed. *Delete from the club database* is the other thing entirely: the files and the row.
 - **Campus map** (dashboard header, or `/campus.html`, this PC only): every ASU building on a map, coloured by
   how much of its floor area is covered, with the GPS points where scans were made. Click a building for its floors
   and spaces (each room or area a scan was tagged with), and a space for its quality, how that number was reached,
@@ -358,6 +373,34 @@ itself instead, tick *Process new captures by themselves* under Defaults.
 
 On the RTX 5080, the practice room (309 photos) took **2 min 19 s end to end on Quick**: about 80 s for the camera
 solve and 58 s of training. Training time grows roughly with the step count; the dashboard shows a live estimate.
+
+**Processing again, and jobs that stop part way.** What a night of processing one 1,026-photo scan five times
+taught SplatStation:
+
+- **The camera solve is kept.** *Process again* (another preset, a crop, *Measure quality*, or a retry after the
+  PC stopped) starts at training when the capture file, *AR positions*, COLMAP and the solve's own code are what
+  they were: the solve took 15 of that scan's 31 minutes each time. Tick **Solve cameras again** to redo it.
+  Videos are always solved again (their frames are picked afresh). The note is `colmap/solve.json` in the job folder,
+  and the model is read back and compared before it's trusted.
+- **The PC stays awake while there's work.** Windows goes to sleep on its idle timer whatever the PC is doing (it
+  did, 12 minutes into a job, and the job stood still until someone came back). SplatStation now asks Windows to
+  stay awake while a job runs or waits in the queue, and lets go when the queue is empty or SplatStation is
+  closed (`station/lib/awake.mjs`). The screen may still turn off.
+- **Training progress is Brush's own.** The bar follows the step Brush reports every few hundred steps, with the
+  splat count beside it. Only the current run's snapshots count: a job processed again used to show 99% at once,
+  from the last run's files, and a run with fewer steps could hand back the old run's bigger splat. When Brush
+  goes quiet for three minutes the bar says so; after fifteen the run is ended with an error that says the GPU
+  probably stopped responding, rather than sitting at "0 s left" all night. Once a run finishes, only its final
+  snapshot is kept in the job folder (the others were up to 3 GB a job).
+- **COLMAP's matcher is sent on when it stops by chance.** COLMAP 4.2 now and then ends on one of its own checks
+  while verifying a pair (`Check failed: cam_rays1_with_jac.size() >= kMinNumSamples`); the same photos pass the
+  next time. The pairs already matched are in its database and aren't matched again, so SplatStation tries up to
+  three times and the job carries on.
+- **If the PC itself stops** (it has, during training, right after Windows logged an NVIDIA driver error): the job
+  shows as *interrupted* when SplatStation next starts, and a retry starts at training. Its `job.log` has a line
+  every 15 s with the GPU's load, memory in use, temperature and power draw, so the log shows what the GPU was
+  doing just before; the activity log gives the peak when a job finishes. The job list itself (`jobs.json`) is
+  written so that a stop mid-write leaves the old list or the new one, never half of one.
 
 **Output:** `%USERPROFILE%\SplatStation\library\<Building>\<Room>\<date>\` contains `scene.ply` (standard 3DGS
 format, works in SuperSplat, Postshot, Unity/Unreal plugins and the web viewers), `info.json` (photos, camera-solve
@@ -458,7 +501,7 @@ log says how much of each part was joined.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (66 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (74 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
@@ -478,7 +521,11 @@ Tested on this PC:
   invite code; leaving deleting everything; a scan graded C or a single photo refused; scan uploads resuming
   without sending anything twice; SplatStation importing a scan without awarding points; the review list with what
   approving each splat would earn (grade, new floor area, a mission's bonus), approving once only, turning one
-  down with a reason the member reads, members, invites, missions, and refusing requests from the Wi-Fi), and the
+  down with a reason the member reads, members, invites, missions, and refusing requests from the Wi-Fi), and room
+  in the club's cloud storage (how much the scans take there, counted from the files, sub-folders and more than
+  one page of them, a scan still being sent included; freeing a reviewed scan's cloud copy with its row, points,
+  leaderboard place and My scans left as they were, and never before its review; *Import again* then saying why;
+  this PC's ZIP of a scan told from a look-alike; the member still able to remove the scan), and the
   campus view (quality from scans and finished builds; approved and your own splats on the map, members' scans and
   splats waiting for review shown but not counted; floor area covered, floor by floor, with sizes guessed, set or
   measured from a scan; a fresh start and back; scans, splats and queued captures of one room joined into one
@@ -487,13 +534,34 @@ Tested on this PC:
   building completion on the phone equal to the Campus page's, with or without supabase-campus-2.sql; stale rows
   removed on the next publish; the last copy kept offline), and COLMAP starting from AR poses for some photos
   only (a capture's photos numbered as COLMAP numbers the files, the AR model renumbered to COLMAP's database; the
-  floor area measured on a walk map, a stray camera kilometres off changing nothing). They run against an in-memory stand-in for Supabase
+  floor area measured on a walk map, a stray camera kilometres off changing nothing), and jobs that finish
+  (training progress read from Brush's own lines, a job processed again showing and returning its own run and not
+  the last run's snapshots, a silent run said and ended, COLMAP's matcher sent on after it stops by chance, the
+  camera solve kept for the next run of the same capture and settings only, a job list that survives a stop
+  mid-write, and the PC held awake while there's work). The club checks run against an in-memory stand-in for Supabase
   (`tools/fake-supabase.mjs`; `tools/fake-supabase-server.mjs` serves it so the phone app and SplatStation can be
   tried together; `--demo` fills it with made-up members and scans to try the Campus and Club pages). The database rules themselves are tested on a real Postgres with `tools/sql-test.mjs`
   (needs `npm install --no-save @electric-sql/pglite`): who can add what, that points only come from
   SplatStation, members-only views, bans, leaving, the campus summary (members read it, strangers and the bare
   public key see nothing, only the secret key writes it), and scans only (no new single photos, scans graded A or
   B, points and missions from approved scans, the review note).
+- **Jobs that finish** (after 2.7.1), found in the job log, the job list and Windows' event log of the night a
+  1,026-photo scan was processed five times: one run ended on COLMAP's matcher check, the last one's bar read
+  "step ~49,750 / 50,000 · ~0 s left" while Brush was at step 9,601 (an earlier run's snapshots were still in
+  the folder), the PC slept for four minutes in the middle of one (*Sleep Reason: System Idle*), and two ended
+  with the whole PC stopping during training, once right after an `nvlddmkm` error. Each run solved the cameras
+  again, about 15 minutes.
+  Tried on a scratch SplatStation with a real capture (the 34-photo practice room, Quick): processed, it took
+  1 min 10 s; processed again, it said it was using the last run's solve and started at training; with *Solve
+  cameras again* ticked it solved from scratch; stopped mid-training and started again, it showed the job as
+  interrupted with a note that its solve was kept, and the retry started at training with the bar at 0% although
+  the earlier run's finished snapshot was still in the folder (the old code read 99% there). Afterwards the folder
+  held only the finished snapshot. Brush's real log of the big scan, replayed through the progress code, gave
+  1 min 17 s left with 1 min 22 s really to go, and flagged the run whose GPU stopped three minutes after its
+  last line. COLMAP's matcher run again over an already matched database (267 photos) took 0.3 s instead of
+  72 s, which is why a retry carries on rather than starting over. The stay-awake request shows in Windows' own
+  power state while a job runs and is gone when SplatStation stops. Not tried: a GPU that really stops under
+  the new code (the stall is simulated in the checks), and a retry of the 1,026-photo scan itself.
 - **The guide loop (2.3)**, with a simulated person following every pass of the Practice hallway and room
   (walking, turning, taking the photos the app asks for, pressing Skip when it offers). Before: the last pass
   never ended (in the hallway, still going after 15 minutes with 83 turn reversals and 96 trips back), and since
@@ -635,7 +703,8 @@ tools/            serve.mjs (dev server), check.mjs (self-checks), make-icons.mj
                   fake-supabase.mjs / fake-supabase-server.mjs (stand-in database), sql-test.mjs (database rules on Postgres)
 station/          SplatStation: station.mjs (server, queue, inbox, merges), lib/ (zip, COLMAP, Brush, crop, walk maps, video, adb,
                   crowd + club + clubapi: the club, campus: the campus view's data, colmapmodel: COLMAP models read
-                  as text or binary, placement: the building view's data and placements),
+                  as text or binary, placement: the building view's data and placements, awake: keeping the PC
+                  awake while there's work, files: the job list written so a stop can't spoil it),
                   web/ (dashboard, viewer, walk.js: walk-mode collision shared with the self-checks, club, campus,
                   building: the building view, place.js: placing captures on a footprint (shared with the
                   self-checks), plan.js: floor plans of where photos were taken)

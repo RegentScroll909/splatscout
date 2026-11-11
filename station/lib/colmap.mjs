@@ -74,6 +74,33 @@ export async function modelStats(colmap, modelDir) {
 
 const isModel = (d) => existsSync(join(d, 'cameras.bin')) || existsSync(join(d, 'cameras.txt'));
 
+/**
+ * Run a step that can be carried on after it stops by chance, up to `tries` times in all. COLMAP 4.2's matcher
+ * now and then ends on a check of its own while verifying a pair ("Check failed: cam_rays1_with_jac.size() >=
+ * kMinNumSamples (4 vs. 5)"): its sampling is random, and the same photos pass the next time. The pairs matched
+ * so far are in the database and aren't matched again (a second run over a finished database takes under a
+ * second), so another go carries on from where it stopped.
+ * @param {(attempt: number) => Promise<any>} step
+ * @param {{tries?: number, onRetry?: (error: Error, attempt: number) => void}} [o]
+ */
+export async function withRetries(step, { tries = 3, onRetry = () => {} } = {}) {
+  for (let k = 1; ; k++) {
+    try {
+      return await step(k);
+    } catch (e) {
+      if (e.cancelled || k >= tries) throw e;
+      onRetry(e, k);
+    }
+  }
+}
+
+/** Why a COLMAP step stopped, in a few words: its "Check failed" line (without the log prefix), or its exit code. */
+export function whyStopped(e) {
+  const line = (e.tail || []).slice().reverse().find((l) => /Check failed|^E\d{8} /.test(l));
+  if (line) return line.replace(/^[A-Z]\d{8} [\d:.]+\s+\d+ \S+\]\s*/, '').trim().slice(0, 140);
+  return String(e.message || e).split('\n')[0].slice(0, 140);
+}
+
 /** Photos in a folder, including one level of subfolders (the views cut from 360 video). */
 export function countImages(dir) {
   let n = 0;
@@ -550,19 +577,23 @@ export async function reconstruct(p) {
     const m = /\[(\d+)\/(\d+)\]/.exec(l);
     if (m) progress('matching', +m[1] / +m[2]);
   };
+  // The matcher can stop by chance; what it had matched is kept, so it's sent on from there (withRetries).
+  const match = (args) => withRetries(() => run(colmap, args, { log, token, onLine: onMatch }), {
+    onRetry: (e, k) => say(`COLMAP's matcher stopped by itself (${whyStopped(e)}). The pairs it had matched are kept: carrying on from there (try ${k + 1} of 3)…`),
+  });
   if (mode === 'exhaustive') {
-    await run(colmap, ['exhaustive_matcher', '--database_path', db, '--FeatureMatching.use_gpu', '1'], { log, token, onLine: onMatch });
+    await match(['exhaustive_matcher', '--database_path', db, '--FeatureMatching.use_gpu', '1']);
   } else if (mode === 'poses' || mode === 'merge') {
     const pairsFile = join(work, 'pairs.txt');
     const all = () => readdirSync(imagesDir).filter((f) => /\.(jpe?g|png)$/i.test(f));
     writeFileSync(pairsFile, (mode === 'merge' ? mergePairs(p.parts) : segs ? segmentPairs(segs) : posedPairs(posed.frames, all())).join('\n') + '\n');
-    await run(colmap, ['matches_importer', '--database_path', db, '--match_list_path', pairsFile, '--match_type', 'pairs',
-      '--FeatureMatching.use_gpu', '1'], { log, token, onLine: onMatch });
+    await match(['matches_importer', '--database_path', db, '--match_list_path', pairsFile, '--match_type', 'pairs',
+      '--FeatureMatching.use_gpu', '1']);
   } else {
     // With a rig, each neighbouring frame brings all of its views along (expand_rig_images), so
     // fewer neighbours cover the same ground.
-    await run(colmap, ['sequential_matcher', '--database_path', db, '--FeatureMatching.use_gpu', '1',
-      '--SequentialMatching.overlap', rig ? '8' : '25', '--SequentialMatching.quadratic_overlap', '1'], { log, token, onLine: onMatch });
+    await match(['sequential_matcher', '--database_path', db, '--FeatureMatching.use_gpu', '1',
+      '--SequentialMatching.overlap', rig ? '8' : '25', '--SequentialMatching.quadratic_overlap', '1']);
   }
 
   // ---- 3. Cameras + points

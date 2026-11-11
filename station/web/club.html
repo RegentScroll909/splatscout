@@ -13,6 +13,18 @@
     .stat b { display: block; font-size: 1.3rem; font-family: var(--mono); }
     .stat span { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.1em; }
     .stat.hot b { color: var(--accent); }
+    .cloud { margin-top: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; display: flex; flex-direction: column; gap: 7px; }
+    .cloud-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+    .cloud-head b { font-family: var(--mono); font-size: 1rem; font-variant-numeric: tabular-nums; }
+    .cloud .bar { height: 6px; margin: 0; border-radius: 3px; }
+    .cloud.warn .bar > div { background: var(--warn); }
+    .cloud.full .bar > div { background: var(--bad); }
+    .cloud p { margin: 0; }
+    .freed { color: var(--dim); font-size: 0.82rem; }
+    .keeps { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; font-size: 0.88rem; }
+    .keeps.stops li::marker { color: var(--bad); }
+    .keeps li::marker { color: var(--good); }
+    .gone { color: var(--warn); font-size: 0.88rem; margin: 0; border: 1px solid rgba(245, 185, 66, 0.35); background: rgba(245, 185, 66, 0.06); border-radius: 8px; padding: 8px 10px; }
     .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
     .tab { font: inherit; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
     .tab.on { color: var(--text); background: var(--surface-2); border-color: var(--line-2); }
@@ -68,6 +80,7 @@
         <button class="btn small ghost" id="refresh">Refresh</button>
       </div>
       <div class="stats" id="stats"></div>
+      <div class="cloud hidden" id="cloud"></div>
     </section>
 
     <section id="review">

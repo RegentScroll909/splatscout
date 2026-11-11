@@ -7,7 +7,7 @@
 // New captures wait until you press Process (unless automatic processing is switched on).
 
 import { createServer } from 'node:http';
-import { createReadStream, createWriteStream, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync, linkSync, copyFileSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync, linkSync, copyFileSync, appendFile } from 'node:fs';
 import { join, extname, normalize, basename, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { networkInterfaces } from 'node:os';
@@ -22,6 +22,8 @@ import * as crowd from './lib/crowd.mjs';
 import { handleClub, isLocal, buildings as asuBuildings } from './lib/clubapi.mjs';
 import { campusData, saveFloors, saveSize, setSince, publishSummary, savePublished, loadPublished } from './lib/campus.mjs';
 import { buildingView, savePlacement, viewPoints, libraryFolderOf, keepCameras, splatPreview } from './lib/placement.mjs';
+import { keepAwake, heldAwake } from './lib/awake.mjs';
+import { writeFileAtomic, readList } from './lib/files.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 let PKG_VERSION = '0';
@@ -35,15 +37,22 @@ if (args.port) cfg.port = +args.port;
 
 // ------------------------------------------------------------------------------------ jobs
 const JOBS_FILE = join(cfg.workDir, 'jobs.json');
-let jobs = existsSync(JOBS_FILE) ? JSON.parse(readFileSync(JOBS_FILE, 'utf8')) : [];
-for (const j of jobs) if (j.status === 'running') j.status = 'interrupted';
+const startNotes = []; // said once the dashboard is up
+let jobs = readList(JOBS_FILE, (e, kept) => startNotes.push(`The job list (jobs.json) couldn't be read (${e.message}), so it starts empty${kept ? `; the unreadable file is kept as ${basename(kept)}` : ''}. Finished splats are still in the library, and the old jobs' working files are still in ${cfg.dirs.jobs}.`));
+// A job that was running when SplatStation last stopped (it was closed, or the PC stopped) didn't finish.
+for (const j of jobs) {
+  if (j.status !== 'running') continue;
+  j.status = 'interrupted';
+  const solved = j.dir && existsSync(join(j.dir, 'colmap', 'solve.json'));
+  startNotes.push(`${j.building || 'Unknown'} / ${j.room || j.id} was being processed when SplatStation last stopped. Retry it from History${solved ? ': its camera solve is kept, so it starts again at training' : ''}.`);
+}
 const clients = new Set();
 const log = [];
 let current = null; // {job, token}
 let queuePaused = false; // finish the running job, then start nothing new
 
 function saveJobs() {
-  writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 1));
+  writeFileAtomic(JOBS_FILE, JSON.stringify(jobs, null, 1));
 }
 
 function publicJob(j) {
@@ -136,14 +145,24 @@ async function inspectSource(job) {
 }
 
 async function pump() {
-  if (current || queuePaused) return;
-  const job = jobs.filter((j) => j.status === 'queued').sort((a, b) => (a.order ?? a.created) - (b.order ?? b.created))[0];
-  if (!job) return;
+  if (current) return;
+  const job = queuePaused ? null : jobs.filter((j) => j.status === 'queued').sort((a, b) => (a.order ?? a.created) - (b.order ?? b.created))[0];
+  // Nothing to run: the PC may sleep again. With work to do it's kept awake (awake.mjs), or Windows would put
+  // it to sleep on its idle timer part way through a job.
+  if (!job) return void keepAwake(false);
+  if (!heldAwake()) {
+    keepAwake(true).then((ok) => {
+      if (ok) say('Keeping this PC awake until the queue is done (the screen may still turn off).');
+      else if (process.platform === 'win32') say('Couldn’t ask Windows to keep this PC awake: if it goes to sleep, the job waits until it wakes.');
+    });
+  }
   const token = { cancelled: false, child: null };
   current = { job, token };
   job.status = 'running';
   job.started = Date.now();
   job.error = null;
+  job.gpu = null; // the GPU at its busiest during this run (pollGpu)
+  job.preview = null; // an earlier run's snapshot isn't this run's preview
   for (const s of STAGES) job.stages[s.id] = { p: 0, note: '' };
   changed(job);
   const ctx = {
@@ -170,6 +189,7 @@ async function pump() {
     job.result = result;
     job.finished = Date.now();
     say(`Done in ${fmtDur(result.totalSec)}: ${result.info.training.splats ? result.info.training.splats.toLocaleString() + ' splats, ' : ''}${result.info.sizeMB} MB → ${result.folder}`, job);
+    if (job.gpu && job.gpu.memTotal) say(`The GPU at its busiest in this job: ${(job.gpu.mem / 1024).toFixed(1)} of ${(job.gpu.memTotal / 1024).toFixed(1)} GB of its memory in use, ${Math.round(job.gpu.temp)} °C.`, job);
     // Where its photos were taken, kept beside the splat for the building view (outlives the job folder).
     keepCameras({ library: library(), libraryDir: cfg.dirs.library, jobId: job.id, jobDir: job.dir }).catch(() => {});
   } catch (e) {
@@ -235,15 +255,31 @@ phone.start();
 
 // ------------------------------------------------------------------------------------ GPU monitor
 let gpu = { name: null };
+let gpuNoted = 0;
 async function pollGpu() {
   const smi = `${process.env.SystemRoot || 'C:\\Windows'}\\System32\\nvidia-smi.exe`;
   if (!existsSync(smi)) return;
   try {
-    const { stdout } = await capture(smi, ['--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu', '--format=csv,noheader,nounits']);
-    const [name, util, used, total, temp] = stdout.trim().split(',').map((s) => s.trim());
-    gpu = { name, util: +util, memUsed: +used, memTotal: +total, temp: +temp };
+    const { stdout } = await capture(smi, ['--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw', '--format=csv,noheader,nounits']);
+    const [name, util, used, total, temp, power] = stdout.trim().split(/\r?\n/)[0].split(',').map((s) => s.trim());
+    gpu = { name, util: +util, memUsed: +used, memTotal: +total, temp: +temp, power: Number.isFinite(+power) ? +power : null };
     broadcast('gpu', gpu);
+    noteGpu();
   } catch {}
+}
+
+/**
+ * While a job runs: the GPU's state goes into the job's log every 15 s, and its busiest moment is kept with the
+ * job. A PC that stops mid-training (a graphics driver error takes the whole PC down) leaves no other trace of
+ * whether its memory was full or it was running hot.
+ */
+function noteGpu() {
+  if (!current || !Number.isFinite(gpu.memUsed)) return;
+  const job = current.job, was = job.gpu || { mem: 0, temp: 0 };
+  job.gpu = { mem: Math.max(was.mem, gpu.memUsed), temp: Math.max(was.temp, gpu.temp || 0), memTotal: gpu.memTotal };
+  if (Date.now() - gpuNoted < 15000) return;
+  gpuNoted = Date.now();
+  appendFile(join(job.dir, 'job.log'), `\n[gpu ${new Date().toISOString()}] ${gpu.util}% busy · ${gpu.memUsed} of ${gpu.memTotal} MiB · ${gpu.temp} °C${gpu.power != null ? ` · ${Math.round(gpu.power)} W` : ''}\n`, () => {});
 }
 pollGpu();
 setInterval(pollGpu, 3000);
@@ -602,7 +638,8 @@ const server = createServer(async (req, res) => {
         setTimeout(scanInbox, 100);
         return sendJson(res, { ok: true, file: basename(file) });
       } catch (e) {
-        return sendJson(res, { error: e.message }, 500);
+        // A scan whose cloud copy was freed (Club page) can't be imported again: gone, not a fault.
+        return sendJson(res, { error: e.message }, e.code === 'no-cloud-copy' ? 410 : 500);
       } finally {
         crowdBusy.delete(id);
       }
@@ -790,6 +827,7 @@ const server = createServer(async (req, res) => {
           if (typeof b.usePoses === 'boolean') job.usePoses = b.usePoses;
           if (typeof b.crop === 'boolean') job.crop = b.crop;
           if (typeof b.measure === 'boolean') job.measure = b.measure;
+          job.resolve = b.resolve === true; // solve the cameras again, where the last run's solve would do
           job.status = 'queued';
           job.order = Date.now();
           job.error = null;
@@ -875,6 +913,7 @@ server.listen(cfg.port, () => {
   console.log(`  COLMAP:     ${cfg.tools.colmap || 'NOT FOUND'}`);
   console.log(`  Brush:      ${cfg.tools.brush || 'NOT FOUND'}`);
   console.log(`  adb:        ${cfg.tools.adb || 'not found (USB auto-import off)'}\n`);
+  for (const note of startNotes) say(note);
   scanInbox();
   pump();
 });

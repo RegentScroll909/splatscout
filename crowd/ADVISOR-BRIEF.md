@@ -53,10 +53,10 @@ campus map, points for the member) or **not approved** (off the map, with a reas
 | Withdrawing | Any member can delete all of their scans and profile from the Club screen. The club can also remove a member and everything they sent. Models already built from a scan are not undone automatically (the consent text says so). |
 | Cheating | Points are only ever set by the club PC, when a person approves a model: a phone can't give itself points or approve itself. Only scans graded B or better can be sent; re-scanning a space already on the map as Good earns little unless a mission asks for it. |
 | Admin access | The database's secret key lives only on the club PC, and the admin tools answer only that PC (not other devices on the Wi-Fi). |
-| Spam and storage | Closed beta; storage on the free plan is about 1 GB (a few scans at a time), and scans move off the cloud to the PC once imported. |
+| Spam and storage | Closed beta; storage on the free plan is about 1 GB (a few scans at a time). A scan stays in the cloud after the PC imports it; nothing is deleted there automatically. Once a scan is reviewed, a club member can free its cloud copy by hand (the PC asks first, and says whether it still has its own copy of the scan): the photos leave the cloud, while the scan's record and the member's points stay. How long cloud copies are kept is still to be decided (question 2 below). |
 
 The database rules are tested on a real PostgreSQL (who can add what, scans only and graded B or better, points
-only from the club PC, members-only views, bans, leaving) and the apps by 66 automated checks.
+only from the club PC, members-only views, bans, leaving) and the apps by 74 automated checks.
 
 ## What we need from you (decisions, not code)
 

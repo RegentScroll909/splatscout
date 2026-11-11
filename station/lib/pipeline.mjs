@@ -1,10 +1,12 @@
 // One job = one capture → one splat. Stages: import → features → matching → mapping →
 // (undistort) → train → finish. Progress and messages go through `ctx.update`.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, copyFileSync, cpSync, symlinkSync, linkSync, rmSync, statSync } from 'node:fs';
-import { join, basename, extname } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, copyFileSync, cpSync, symlinkSync, linkSync, rmSync, statSync, renameSync } from 'node:fs';
+import { join, basename, extname, relative, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { extractZip } from './zipread.mjs';
-import { reconstruct, viewHint, countImages } from './colmap.mjs';
+import { reconstruct, viewHint, countImages, modelStats } from './colmap.mjs';
 import { trainBrush, HOLD_OUT_EVERY } from './trainer.mjs';
 import { selectFrames, extractFrames, probeVideo, isEquirect, extract360, viewSize, rigConfig, VIEWS_360 } from './video.mjs';
 import { run } from './run.mjs';
@@ -24,6 +26,79 @@ export const STAGES = [
 
 const VIDEO = /\.(mp4|mov|m4v|mkv|webm|avi)$/i;
 const MAX_360_FRAMES = 160; // × 9 views each
+
+// ---- The camera solve, kept for the next run of the same capture
+// Processing a capture again (another quality setting, a run the PC didn't finish) used to solve the cameras
+// again first: a quarter of an hour for a 1,000-photo scan, for the same answer. A finished solve is noted in
+// colmap/solve.json with what it was made from, and the next run uses it when none of that has changed.
+// (That includes the code that makes a solve: an update to these two files redoes saved ones. Their text counts,
+// not how git wrote their line ends on this PC.)
+const SOLVE_CODE = (() => {
+  const here = dirname(fileURLToPath(import.meta.url)), h = createHash('sha1');
+  for (const f of ['pipeline.mjs', 'colmap.mjs']) h.update(readFileSync(join(here, f), 'utf8').replace(/\r\n/g, '\n'));
+  return h.digest('hex').slice(0, 12);
+})();
+
+const fileSig = (f) => {
+  const st = statSync(f);
+  return `${basename(f)}:${st.size}:${Math.round(st.mtimeMs)}`;
+};
+
+/**
+ * What a job's camera solve depends on: its capture file(s), the settings that change the solve, and COLMAP
+ * itself. Null for video (its frames are picked again each run), whose solve is never used again.
+ */
+export function solveKey(job, cfg) {
+  const sources = job.source.kind === 'merge' ? job.source.parts : [job.source];
+  if (sources.some((p) => p.kind !== 'zip')) return null;
+  try {
+    return JSON.stringify({
+      code: SOLVE_CODE, files: sources.map((p) => fileSig(p.file)), poses: !!(cfg.usePoses && job.usePoses !== false),
+      matcher: cfg.matcher || 'auto', colmap: cfg.tools.colmap ? fileSig(cfg.tools.colmap) : null,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Note a finished solve beside its files (paths relative to the job folder, so the work folder can move). */
+export function saveSolve(dir, key, rec, nImages) {
+  if (!key) return;
+  const out = {
+    key, at: new Date().toISOString(), nImages,
+    rec: { modelDir: relative(dir, rec.modelDir), imagesDir: relative(dir, rec.imagesDir), stats: rec.stats, mode: rec.mode, undistorted: !!rec.undistorted },
+  };
+  const f = join(dir, 'colmap', 'solve.json');
+  try {
+    writeFileSync(f + '.tmp', JSON.stringify(out, null, 1));
+    renameSync(f + '.tmp', f);
+  } catch {} // (without the note the next run solves again; the job itself goes on)
+}
+
+/**
+ * The solve a job's last run left, when it still fits: made from the same capture with the same settings, its
+ * model and photos still there, and (`check`, which reads the model) still what it was when it was noted: a PC
+ * that stopped mid-run can leave half-written files behind.
+ * @param {(modelDir: string) => Promise<{images: number, points: number}>} [check]
+ * @returns {Promise<{modelDir, imagesDir, stats, mode, undistorted, reused: true}|null>}
+ */
+export async function savedSolve(dir, key, nImages, check = null) {
+  if (!key) return null;
+  try {
+    const s = JSON.parse(readFileSync(join(dir, 'colmap', 'solve.json'), 'utf8'));
+    if (s.key !== key || s.nImages !== nImages || !s.rec || !s.rec.stats) return null;
+    const modelDir = join(dir, s.rec.modelDir), imagesDir = join(dir, s.rec.imagesDir);
+    if (!['cameras', 'images', 'points3D'].every((n) => existsSync(join(modelDir, n + '.bin')) || existsSync(join(modelDir, n + '.txt')))) return null;
+    if (!existsSync(imagesDir) || countImages(imagesDir) < s.rec.stats.images) return null;
+    if (check) {
+      const now = await check(modelDir);
+      if (!now || now.images !== s.rec.stats.images || now.points !== s.rec.stats.points) return null;
+    }
+    return { modelDir, imagesDir, stats: s.rec.stats, mode: s.rec.mode, undistorted: !!s.rec.undistorted, reused: true };
+  } catch {
+    return null;
+  }
+}
 
 export function sourceKind(file) {
   if (/\.zip$/i.test(file)) return 'zip';
@@ -70,27 +145,39 @@ export async function processJob(job, ctx) {
   }
   ctx.update({ nImages });
   ctx.stage('import', 1, `${nImages} photos`);
-  if (posed) ctx.say(`Using AR poses for ${posed.frames.length} of ${nImages} photos as a starting point.`);
 
   // ---------------------------------------------------------------- reconstruction
-  const rec = await reconstruct({
-    colmap: T.colmap,
-    imagesDir: photos,
-    work: join(dir, 'colmap'),
-    camera,
-    posed,
-    rig,
-    parts: src.parts || null,
-    lenses: src.lenses || null,
-    segments: src.segments || null,
-    align: arFrames,
-    matcher: cfg.matcher || 'auto',
-    progress: (stage, f, note) => ctx.stage(stage, f, note),
-    say: ctx.say,
-    token,
-    log,
-  });
-  ctx.stage('mapping', 1, `${rec.stats.images}/${nImages} photos placed · ${(rec.stats.reprojError || 0).toFixed(2)} px`);
+  // The same capture with the same settings as its last run: that run's camera solve is used again (solveKey).
+  const key = solveKey(job, cfg);
+  const again = !!job.resolve;
+  if (again) ctx.update({ resolve: false }); // asked for this run only
+  let rec = again ? null : await savedSolve(dir, key, nImages, (d) => modelStats(T.colmap, d));
+  if (rec) {
+    for (const id of ['features', 'matching']) ctx.stage(id, 1, 'from the last run');
+    ctx.say(`Using the camera solve from this capture's last run (same photos, same settings): ${rec.stats.images} of ${nImages} photos placed, ${(rec.stats.reprojError || 0).toFixed(2)} px. Tick "Solve cameras again" to redo it.`);
+  } else {
+    rmSync(join(dir, 'colmap', 'solve.json'), { force: true });
+    if (posed) ctx.say(`Using AR poses for ${posed.frames.length} of ${nImages} photos as a starting point.`);
+    rec = await reconstruct({
+      colmap: T.colmap,
+      imagesDir: photos,
+      work: join(dir, 'colmap'),
+      camera,
+      posed,
+      rig,
+      parts: src.parts || null,
+      lenses: src.lenses || null,
+      segments: src.segments || null,
+      align: arFrames,
+      matcher: cfg.matcher || 'auto',
+      progress: (stage, f, note) => ctx.stage(stage, f, note),
+      say: ctx.say,
+      token,
+      log,
+    });
+    saveSolve(dir, key, rec, nImages);
+  }
+  ctx.stage('mapping', 1, `${rec.stats.images}/${nImages} photos placed · ${(rec.stats.reprojError || 0).toFixed(2)} px${rec.reused ? ' · from the last run' : ''}`);
   ctx.update({ colmap: { ...rec.stats, mode: rec.mode } });
   // A scan in parts: how much of each part made it into the one model.
   let partsPlaced = null;
@@ -100,6 +187,7 @@ export async function processJob(job, ctx) {
     ctx.say(`Scan in ${partsPlaced.length} parts, solved as one: ${partsPlaced.map((s) => `part ${s.part}${s.main ? ' (main)' : ''} ${s.placed} of ${s.photos} photos`).join(', ')}.`);
   }
   if (!rec.undistorted) ctx.stage('undistort', 1, 'not needed');
+  else if (rec.reused) ctx.stage('undistort', 1, 'from the last run');
 
   // ---------------------------------------------------------------- training dataset
   const train = join(dir, 'train');
@@ -132,6 +220,7 @@ export async function processJob(job, ctx) {
     stepsPerSec: cfg.rates && cfg.rates[presetKey],
     cacheDir: join(cfg.workDir, 'brush-cache'),
     progress: (f, note) => ctx.stage('train', f, note),
+    say: ctx.say,
     onExport: (file, iter) => ctx.update({ preview: { file, iter, at: Date.now() } }),
     token,
     log,

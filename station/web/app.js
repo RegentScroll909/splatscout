@@ -274,18 +274,32 @@ function optionControls(j) {
     preset: j.preset, usePoses: j.usePoses !== false && status.usePoses, crop: j.crop != null ? j.crop : status.cropToBounds,
     measure: j.measure != null ? j.measure : !!status.measureQuality,
   };
-  const read = () => ({ preset: sel.value, usePoses: poses.checked, crop: crop.checked, measure: measure.checked });
-  const keep = () => drafts.set(j.id, read());
+  const peek = () => ({ preset: sel.value, usePoses: poses.checked, crop: crop.checked, measure: measure.checked, resolve: again.checked });
+  const keep = () => drafts.set(j.id, peek());
   const sel = h('select', { onchange: keep }, ...Object.entries(status.presets || {}).map(([k, p]) => h('option', { value: k, selected: k === d.preset }, p.label)));
   const poses = h('input', { type: 'checkbox', checked: d.usePoses, onchange: keep });
   const crop = h('input', { type: 'checkbox', checked: d.crop, onchange: keep });
   const measure = h('input', { type: 'checkbox', checked: d.measure, onchange: keep });
+  const again = h('input', { type: 'checkbox', checked: !!d.resolve, onchange: keep });
+  // A capture processed before keeps its camera solve: the next run starts at training unless this is ticked
+  // (or the capture, or "AR positions", has changed). Videos are always solved again.
+  const solved = !!j.colmap && j.source.kind !== 'video' && !(j.source.parts || []).some((p) => p.kind === 'video');
   const box = h('div', { class: 'opts' },
     h('label', { class: 'field inline' }, h('span', { class: 'lbl' }, 'Quality'), sel),
     j.source.kind === 'zip' ? h('label', { class: 'check inline' }, poses, h('span', {}, 'AR positions')) : null,
     mergeToggle(j),
     j.source.kind === 'zip' || j.source.kind === 'merge' ? h('label', { class: 'check inline' }, crop, h('span', {}, 'Crop to scan area')) : null,
-    h('label', { class: 'check inline', title: 'Hold back every 12th photo and score the splat on them (PSNR, SSIM). It trains on about 8% fewer photos.' }, measure, h('span', {}, 'Measure quality')));
+    h('label', { class: 'check inline', title: 'Hold back every 12th photo and score the splat on them (PSNR, SSIM). It trains on about 8% fewer photos.' }, measure, h('span', {}, 'Measure quality')),
+    solved ? h('label', { class: 'check inline', title: 'The camera solve from this capture’s last run is used again, so it starts at training. Tick this to solve the cameras from scratch.' }, again, h('span', {}, 'Solve cameras again')) : null);
+  // What to send when it's queued. Solving again is asked for one run at a time.
+  const read = () => {
+    const v = peek();
+    if (again.checked) {
+      again.checked = false;
+      keep();
+    }
+    return v;
+  };
   return { box, read };
 }
 
@@ -483,7 +497,10 @@ function crowdCard(u, busy) {
       h('button', {
         class: 'btn small ghost danger', disabled: busy,
         onclick: async () => {
-          if (!confirm('Delete this upload from the club database for good? (Frees its storage. Anything already imported stays here.)')) return;
+          // Deleting removes the scan's row too, and an approved scan's row is the member's points.
+          if (!confirm(u.status === 'approved'
+            ? `Delete this approved scan from the club database for good? Its row goes too, so ${u.contributor ? `@${u.contributor}` : 'the member'} loses its points and it leaves their My scans. To make room and keep the points, use Free cloud copy on the Club page instead.`
+            : 'Delete this upload from the club database for good? (Its files and its row: the member no longer sees it in My scans. Anything already imported stays here.)')) return;
           const res = await api('/api/crowd/delete', { id: u.id });
           if (res.error) alert(res.error);
           loadCrowd();

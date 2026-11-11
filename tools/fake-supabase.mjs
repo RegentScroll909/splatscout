@@ -1,7 +1,8 @@
 // An in-memory stand-in for the club's Supabase project: the calls the phone app and SplatStation make,
 // with the rules that matter to them (membership, restricted buildings, files only into your own
-// unfinished photo, photo positions only in the right shape, points only from SplatStation, the campus summary readable by members and written only by
-// SplatStation). It lets the self-checks run without a network and
+// unfinished photo, a phone listing and deleting only its own files, photo positions only in the right shape, points only from SplatStation, the campus summary readable by members and written only by
+// SplatStation). Storage answers as the real one does: a folder listed a page at a time with each file's
+// size, a missing file as a 400, deleting names that aren't there as nothing deleted. It lets the self-checks run without a network and
 // lets the screens be tried in a browser (tools/serve.mjs serves it at /__tools/fake-supabase.mjs).
 // The real rules live in crowd/supabase-*.sql and are tested against Postgres (tools/sql-test.mjs).
 
@@ -33,6 +34,8 @@ export function createFake() {
     campusV1: false, // true: the campus tables as supabase-campus.sql made them, before supabase-campus-2.sql
     noPose: false, // true: photos without the pose column, before supabase-snap-pose.sql
     files: new Map(), // 'bucket/path' -> Buffer
+    sizes: new Map(), // 'bucket/path' -> the size a listing gives, for a file that stands in for a bigger one (the demo's photos)
+    lists: 0, // storage listings asked for
     posts: new Map(), // 'bucket/path' -> times a file was sent
     failOnce: new Set(), // path endings whose next upload is refused (a 400)
     flaky: new Set(), // path endings whose next upload gets a 503 (a busy server: worth retrying)
@@ -82,6 +85,11 @@ export function createFake() {
     return p && !p.banned ? p : null;
   };
   const restricted = (code) => db.restricted_buildings.has(code);
+  // The storage rules: a phone sees and deletes only the files of its own scans (and photos), and only while
+  // their row is there. The secret key sees and deletes everything.
+  const ownFile = (bucket, path, uid) => (bucket === 'captures'
+    ? [...db.captures.values()].some((r) => r.user_id === uid && path.startsWith(r.storage_prefix + '/'))
+    : [...db.photos.values()].some((r) => r.user_id === uid && path === r.storage_path));
 
   // ---- views
   // As supabase-scans-only.sql has them: points and counts from approved scans (photos stays, always 0).
@@ -234,26 +242,40 @@ export function createFake() {
         db.files.set(k, new Uint8Array(data));
         return json({ Key: k });
       }
-      if (m === 'GET') return db.files.has(k) ? new Response(db.files.get(k)) : json({ message: 'not found' }, 404);
+      // A file that isn't there: the real storage answers 400 with the 404 in the body.
+      if (m === 'GET') return db.files.has(k) ? new Response(db.files.get(k)) : json({ statusCode: '404', error: 'not_found', message: 'Object not found' }, 400);
     }
     mm = p.match(/^\/storage\/v1\/object\/(captures|club-photos)$/);
     if (mm && m === 'DELETE') {
+      // Names that aren't there are passed over: the answer lists what was deleted (none is still a 200).
       const { prefixes } = await body();
       const gone = [];
-      for (const path of prefixes) if (db.files.delete(`${mm[1]}/${path}`)) gone.push({ name: path });
+      for (const path of prefixes) {
+        const k = `${mm[1]}/${path}`;
+        if ((admin || ownFile(mm[1], path, uid)) && db.files.delete(k)) {
+          db.sizes.delete(k);
+          gone.push({ name: path });
+        }
+      }
       return json(gone);
     }
     mm = p.match(/^\/storage\/v1\/object\/list\/(captures|club-photos)$/);
     if (mm && m === 'POST') {
-      const { prefix } = await body();
+      // One folder's entries by name, `limit` at a time (100 unless asked): a file has an id and its size in
+      // metadata, a sub-folder has neither. A folder that isn't there has no entries.
+      const { prefix = '', limit = 100, offset = 0 } = await body();
+      db.lists++;
+      const dir = prefix ? prefix.replace(/\/+$/, '') + '/' : '';
       const seen = new Map();
-      for (const k of db.files.keys()) {
+      for (const [k, data] of db.files) {
+        if (!k.startsWith(mm[1] + '/')) continue;
         const path = k.slice(mm[1].length + 1);
-        if (!path.startsWith(prefix + '/')) continue;
-        const [first, ...rest] = path.slice(prefix.length + 1).split('/');
-        seen.set(first, rest.length ? { name: first, id: null } : { name: first, id: k });
+        if (!path.startsWith(dir) || !(admin || ownFile(mm[1], path, uid))) continue;
+        const [first, ...rest] = path.slice(dir.length).split('/');
+        seen.set(first, rest.length ? { name: first, id: null, metadata: null } : { name: first, id: k, metadata: { size: db.sizes.get(k) ?? data.length } });
       }
-      return json([...seen.values()]);
+      const all = [...seen.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      return json(all.slice(offset, offset + limit));
     }
     return json({ message: `fake Supabase doesn't know ${m} ${p}` }, 500);
   }
