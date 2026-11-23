@@ -56,7 +56,7 @@ campus map, points for the member) or **not approved** (off the map, with a reas
 | Spam and storage | Closed beta; storage on the free plan is about 1 GB (a few scans at a time). A scan stays in the cloud after the PC imports it; nothing is deleted there automatically. Once a scan is reviewed, a club member can free its cloud copy by hand (the PC asks first, and says whether it still has its own copy of the scan): the photos leave the cloud, while the scan's record and the member's points stay. How long cloud copies are kept is still to be decided (question 2 below). |
 
 The database rules are tested on a real PostgreSQL (who can add what, scans only and graded B or better, points
-only from the club PC, members-only views, bans, leaving) and the apps by 74 automated checks.
+only from the club PC, members-only views, bans, leaving) and the apps by 78 automated checks.
 
 ## What we need from you (decisions, not code)
 

@@ -12,10 +12,18 @@ import { DEG, v3, clamp, angleBetween, poseForward, posePosition } from './math.
 import { VoxelMap } from './coverage.js';
 import { FloorGrid } from './floorgrid.js';
 import { voxelNormal } from './align.js';
+import { heightOff } from './plans.js';
 
 const SPACING = 0.4; // m between path stations
 const DONE_RADIUS = 0.6; // a photo this close to a station (and aimed about right) completes it
 const DONE_ANGLE = 35 * DEG;
+// An overhead or low pass is about its height and its tilt: a photo counts only at the height the pass asks
+// for (HEIGHTS.ok in plans.js) and tilted within this of its aim. Judged on the whole angle, as the other
+// passes are, an eye-level photo tilted down 11° was close enough to a station tilted down 35°, and the
+// overhead lap counted the eye-level lap's photos as its own.
+const PITCH_TOL = 18; // degrees
+const MISSED_TIME = 60; // s going back for missed spots at the end of a path before the pass is called done
+const MOSTLY_MISSED = 0.6; // the end of a path with less than this done: the pass didn't take, move on
 const AT_STATION = 0.6; // m: standing "on" a station
 const DWELL = 2.5; // s standing on a station, aimed, before it counts even without a new photo
 const STUCK = 15; // s on the same station without progress before it's skipped
@@ -28,6 +36,34 @@ const GAPS_DONE = 0.93; // surface coverage at which the gap pass counts as done
 const LONG_WALL = 2.5; // m of flat wall around a spot: seen head-on from close up, that's a plain view
 
 export const passHeight = (pass) => HEIGHT[pass && pass.height] || HEIGHT.chest;
+
+const tilted = (pass) => !!(pass && (pass.height === 'high' || pass.height === 'low'));
+const pitchOf = (d) => Math.asin(clamp(d[1], -1, 1)) / DEG;
+/** Degrees between two directions seen from above (180 when either points straight up or down). */
+function headingApart(a, b) {
+  const la = Math.hypot(a[0], a[2]), lb = Math.hypot(b[0], b[2]);
+  if (la < 0.1 || lb < 0.1) return 180;
+  return Math.acos(clamp((a[0] * b[0] + a[2] * b[2]) / (la * lb), -1, 1)) / DEG;
+}
+
+/**
+ * Whether the phone, `h` metres above the floor and pointing along `fwd`, is how a pass wants it for a spot
+ * aimed along `aim`. An overhead or low pass: at its height, tilted within PITCH_TOL of the aim and facing
+ * within DONE_ANGLE of it. Any other pass: within half a metre of its height and DONE_ANGLE of the aim.
+ */
+export function fitsPass(pass, h, fwd, aim) {
+  if (tilted(pass)) {
+    return h != null && !heightOff(pass, h) && Math.abs(pitchOf(fwd) - pitchOf(aim)) < PITCH_TOL && headingApart(fwd, aim) < DONE_ANGLE / DEG;
+  }
+  return (h == null || Math.abs(h - passHeight(pass)) < 0.5) && angleBetween(fwd, aim) < DONE_ANGLE;
+}
+
+/** Whether a photo taken from `pose` completes path station `st` of `pass` (the floor at `floorY`). */
+export function photoCounts(st, pose, pass, floorY) {
+  const p = posePosition(pose);
+  if (dist2D(st.pos, p) >= DONE_RADIUS) return false;
+  return fitsPass(pass, floorY == null ? null : p[1] - floorY, poseForward(pose), st.aim);
+}
 
 // The voxel itself first, then its neighbours.
 const NEAR_CELLS = [[0, 0, 0]];
@@ -257,6 +293,9 @@ export class Guide {
     this.k = 0;
     this.gap = null;
     this.complete = false;
+    this.partial = false;
+    this.missedT = null;
+    this.visited = new Set(); // path spots the user has been nearest to (how much of the path was walked)
     this.nextIdx = -1;
     this.dwellT = 0;
     this.aiming = false;
@@ -339,7 +378,7 @@ export class Guide {
     if (this.stations) {
       for (const st of this.stations) {
         if (st.done || st.transit) continue;
-        if (dist2D(st.pos, p) < DONE_RADIUS && Math.abs(st.pos[1] - p[1]) < 0.5 && angleBetween(f, st.aim) < DONE_ANGLE) st.done = true;
+        if (photoCounts(st, pose, this.pass, this.floorY)) st.done = true;
       }
     }
     if (this.gap && dist2D(this.gap.pos, p) < AT_GAP + 0.15 && angleBetween(f, this.gap.aim) < 30 * DEG) this.gap.hits = (this.gap.hits || 0) + 1;
@@ -406,10 +445,21 @@ export class Guide {
       missed = next >= 0;
     }
     const progress = this.progress();
-    const complete = next < 0 || (progress >= 0.94 && k >= S.length - 3);
+    // The end of the path with spots missed. Going back for a few is worth it; for most of a lap it isn't (the
+    // photos weren't counting: the phone at the wrong height, say), and going back for each in turn, every one
+    // skipped after STUCK seconds, is the loop a real scan got stuck in for eight minutes. So: back for the
+    // missed spots for up to MISSED_TIME, and with most of the path missed, not at all. The pass then ends as
+    // partly done, and says so.
+    if (missed && this.missedT == null) this.missedT = t;
+    // Walked to the end of the path (most of its spots passed on the way) with most of it not counted: same.
+    this.visited.add(k);
+    const walkedIt = k >= S.length - 3 && this.visited.size >= S.length * 0.6;
+    const giveUp = (missed && (progress < MOSTLY_MISSED || t - this.missedT > MISSED_TIME)) || (walkedIt && progress < MOSTLY_MISSED);
+    const complete = next < 0 || (progress >= 0.94 && k >= S.length - 3) || giveUp;
     if (complete) {
       this.complete = true;
-      return { mode: 'path', progress, complete: true, next: null, trail: [], instruction: null };
+      this.partial = giveUp;
+      return { mode: 'path', progress, complete: true, partial: giveUp, next: null, trail: [], instruction: null };
     }
     if (next !== this.nextIdx) {
       this.nextIdx = next;
@@ -419,11 +469,15 @@ export class Guide {
     const target = S[next];
     const distTo = dist2D(target.pos, pos);
     const offAim = angleBetween(fwd, target.aim) / DEG;
+    // An overhead or low pass: is the phone up (or down) where the pass wants it? Until it is, nothing counts.
+    const h = pos[1] - floorY;
+    const off = heightOff(this.pass, h);
 
     // Standing on the station and aimed: it's done after a moment even if no photo was accepted
     // (the session also asks for one), so nobody gets stuck shuffling on the spot.
-    const at = distTo < AT_STATION && Math.abs(target.pos[1] - pos[1]) < 0.6;
-    if (at && offAim < 30) {
+    const at = distTo < AT_STATION && (tilted(this.pass) ? !off : Math.abs(target.pos[1] - pos[1]) < 0.6);
+    const aimed = tilted(this.pass) ? fitsPass(this.pass, h, fwd, target.aim) : offAim < 30;
+    if (at && aimed) {
       if (!this.dwellT) this.dwellT = t;
       else if (t - this.dwellT > DWELL) {
         target.done = true;
@@ -432,7 +486,9 @@ export class Guide {
     } else {
       this.dwellT = 0;
     }
-    // Not getting anywhere with this spot (can't reach it, can't aim there): skip it.
+    // Not getting anywhere with this spot (can't reach it, can't aim there): skip it. Not while the phone is
+    // being raised or lowered as asked: that's the guide's own instruction taking a moment.
+    if (off) this.nextSince = t;
     let skipped = false;
     if (!target.done && t - this.nextSince > STUCK && distTo < 2.5) {
       target.transit = true;
@@ -459,20 +515,25 @@ export class Guide {
     if (!near) this.aiming = false;
     else if (this.aiming ? offAim < 15 : offAim > 25) this.aiming = !this.aiming;
     // "Hold steady" only once someone has lingered on a spot without its photo; walking past at a
-    // steady pace is the normal way to follow a path.
-    const phase = !near ? 'walk' : this.aiming ? 'aim' : at && !target.done && this.dwellT && t - this.dwellT > 1 ? 'hold' : 'go';
+    // steady pace is the normal way to follow a path. On the path, the phone's height comes before all else.
+    const phase = !near ? 'walk' : off ? 'height' : this.aiming ? 'aim' : at && !target.done && this.dwellT && t - this.dwellT > 1 ? 'hold' : 'go';
     const carrot = near ? this._carrot(next, pos, 0.8) : [target.pos[0], floorY, target.pos[2]];
     const instruction =
       phase === 'walk'
         ? { title: missed ? 'Go back to a spot you missed' : 'Walk to the path', detail: `Follow the arrows on the floor (${distTo.toFixed(1)} m).` }
-        : phase === 'aim'
-          ? { title: 'Turn to the ring', detail: 'Turn slowly until the phone points where the arrow shows, then carry on along the path.' }
-          : phase === 'hold'
-            ? { title: 'Hold steady', detail: 'Taking a photo of this spot.' }
-            : { title: 'Follow the path', detail: 'Move the way the arrow points at a slow, steady pace.' };
+        : phase === 'height'
+          ? off === 'down'
+            ? { title: 'Lower the phone to waist height', detail: `This lap only counts photos taken about 1 m up, tilted up. You're at ${h.toFixed(1)} m: photos wait until the phone is lower.` }
+            : { title: 'Raise the phone above your head', detail: `This lap only counts photos taken with your arms up, tilted down. You're at ${h.toFixed(1)} m: photos wait until the phone is higher.` }
+          : phase === 'aim'
+            ? { title: 'Turn to the ring', detail: 'Turn slowly until the phone points where the arrow shows, then carry on along the path.' }
+            : phase === 'hold'
+              ? { title: 'Hold steady', detail: 'Taking a photo of this spot.' }
+              : { title: 'Follow the path', detail: 'Move the way the arrow points at a slow, steady pace.' };
     return {
       mode: 'path', progress, complete: false, missed, next: target, aimPoint, aimDir: target.aim, offAim, distTo, trail, instruction,
-      phase, carrot, wantPhoto: at && offAim < 30 && !target.done, skipped, stuck: t - this.nextSince > 8,
+      phase, carrot, wantPhoto: at && aimed && !target.done, skipped, stuck: t - this.nextSince > 8,
+      heightOff: off, height: h,
       ghost: !near ? { pos: target.pos, aim: target.aim } : null,
       stand: !near ? [target.pos[0], floorY, target.pos[2]] : null,
     };

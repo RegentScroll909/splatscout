@@ -66,7 +66,7 @@ const SECTIONS = [
 <li><b>Move, don't pivot.</b> Every new photo should be taken from a slightly different <i>position</i>, not just a different angle. Sidestep ("crab walk") along walls.</li>
 <li><b>Three angles minimum.</b> Every surface should be photographed from 3 or more clearly different directions. In AR mode that's the colour: red → amber → green.</li>
 <li><b>Stay about 1 m from surfaces.</b> Closer and frames can't overlap; much farther and detail is lost. In big halls, walk up to the things that matter.</li>
-<li><b>Three heights.</b> Eye level, overhead tilted down, waist tilted up. That's how tabletops, ceilings and the undersides of things get covered.</li>
+<li><b>Three heights.</b> Eye level, overhead tilted down (arms up, not just above your eyes), waist tilted up (about 1 m, lower than it feels). That's how tabletops, ceilings and the undersides of things get covered, and it's what stops a splat smearing up and down when you walk around in it. On the overhead and low laps the arrow tells you to raise or lower the phone, and photos wait until it's there.</li>
 <li><b>Fixed light, no flash.</b> All lights on and unchanged. Never use the phone's flashlight: light that moves with you ruins splats.</li>
 <li><b>Nothing moves.</b> No people walking through, no doors swinging, no screens playing video.</li>
 <li><b>Close the loop.</b> End each lap a little past where it started, and walk through doorways slowly in both directions.</li>

@@ -707,8 +707,15 @@ export async function captureScreen(root, { captureId, navigate }) {
       if (settings.sounds) chime();
       buzz(40);
       const next = template.passes[session.passIndex + 1];
-      toast(e.last ? `${e.pass.name} done. Keep filling gaps or tap Done.` : `${e.pass.name} done. Next: ${next.name}`, 3500);
-      say(e.last ? `${e.pass.name} done.` : `${e.pass.name} done. Next, ${next.name}.`);
+      if (e.partial) {
+        // The path ended with much of it not counted: say so plainly instead of sending them round again.
+        const pct = Math.round((e.progress || 0) * 100);
+        toast(`${e.pass.name}: only ${pct}% of it counted${e.pass.height === 'low' ? ' (the phone has to be at waist height)' : e.pass.height === 'high' ? ' (the phone has to be above your head)' : ''}. ${e.last ? 'Tap the pass name to redo it, or tap Done.' : `Next: ${next.name}. Tap the pass name to redo it.`}`, 7000);
+        say(`${e.pass.name}: only ${pct} percent counted.`);
+      } else {
+        toast(e.last ? `${e.pass.name} done. Keep filling gaps or tap Done.` : `${e.pass.name} done. Next: ${next.name}`, 3500);
+        say(e.last ? `${e.pass.name} done.` : `${e.pass.name} done. Next, ${next.name}.`);
+      }
     } else if (e.type === 'passStart') {
       toast(`Pass ${e.index + 1}: ${e.pass.name}. ${e.pass.short}`, 5000);
     } else if (e.type === 'areaComplete') {
@@ -903,10 +910,10 @@ export async function captureScreen(root, { captureId, navigate }) {
       cueKind = kind;
       mount(cueIcon, icon(c.kind === 'turn' ? 'turn' : c.kind === 'around' ? 'around' : c.kind === 'hold' ? 'hold' : 'arrow'));
     }
-    const rot = c.kind === 'walk' || c.kind === 'tilt' ? `rotate(${c.arrow}deg)` : c.kind === 'turn' && c.arrow < 0 ? 'scaleX(-1)' : '';
+    const rot = c.kind === 'walk' || c.kind === 'tilt' || c.kind === 'height' ? `rotate(${c.arrow}deg)` : c.kind === 'turn' && c.arrow < 0 ? 'scaleX(-1)' : '';
     cueIcon.firstChild.style.transform = rot;
     cueLabel.textContent = c.label;
-    cueSub.textContent = c.dist != null ? `${c.dist.toFixed(1)} m` : '';
+    cueSub.textContent = c.sub ? c.sub : c.dist != null ? `${c.dist.toFixed(1)} m` : '';
   }
 
   // ---------------------------------------------------------------- sheets

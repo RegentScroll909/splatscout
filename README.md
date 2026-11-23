@@ -38,6 +38,13 @@ building interiors well enough to make **clean Gaussian splats**. While you scan
   (2.7). The capture guide has a page on temporary markers for long blank walls.
 - **Walks you through a capture plan** for the type of space (room, hallway, large hall, stairwell,
   object, freestyle), pass by pass (eye level, overhead, low, cross, details), with progress for each pass.
+  The overhead and low passes are about height (2.8.1): a photo counts for them only with the phone above your
+  head (1.72 m or higher) or at your waist (1.2 m or lower), tilted within 18° of the way the pass asks; the
+  arrow in the middle says *Raise the phone above your head* / *Lower the phone to waist height*, and photos
+  wait until it's there (the shutter button still takes one). A path that ends with under 60% of it counted, or
+  a minute spent going back for missed spots, ends the pass as partly done and says so, rather than sending you
+  round again. The grade's *Capture plan* part replays every photo through the same rule, so a scan without its
+  overhead or low lap says which and can't be an A.
 - **Points you at what's missing** with an AR beacon and the centre arrow, and shows a live floor-plan map
   with the scan area and the path.
 - **Grades the capture (A–F) before you leave the room**, with concrete fixes ("23% of surfaces were seen
@@ -501,7 +508,7 @@ log says how much of each part was joined.
 ## 4. What was tested, and what still needs your Pixel
 
 Tested on this PC:
-- **Core checks**: `npm run check` (74 checks): sensor/screen orientation maths, projection, angular
+- **Core checks**: `npm run check` (78 checks): sensor/screen orientation maths, projection, angular
   velocity, sharpness and texture detection, image-motion tracking, coverage counting, free-space carving of
   depth noise, the flying-pixel depth filter, scan bounds, guide paths and pass completion, never sending you
   backwards, completing and skipping spots, re-alignment (any heading, rejecting look-alike rooms and plain
@@ -545,6 +552,20 @@ Tested on this PC:
   SplatStation, members-only views, bans, leaving, the campus summary (members read it, strangers and the bare
   public key see nothing, only the secret key writes it), and scans only (no new single photos, scans graded A or
   B, points and missions from approved scans, the review note).
+- **The overhead and low laps (2.8.1)**, from a real scan that graded 100 and made a soft, smeared splat (Memorial
+  Union, "Left wing low", 629 photos). Its photos: eye-level lap 130 at 1.57 m tilted down 11°; "overhead" lap
+  24 in 18 s at 1.70 m tilted down 16° (it ended at once: the eye-level photos counted for it); "low" lap 475 in
+  8 minutes at 1.44 m tilted up 14°, round and round, the last of them aimed at the floor. The guide only counted
+  low-lap photos under 1.35 m, its height reminder sat behind the guide's own message so it never showed, and at the
+  end of the path it sent the scanner back to each missed spot in turn, skipping each after 15 s. The cross-the-room
+  pass was never reached. Every club scan with a scan area, replayed through the new rule, was photographed from
+  1.25–1.80 m only: none ever did a real overhead or low lap, though the old rule gave the overhead lap 44–91%.
+  Tried in the practice room: on the low lap with the phone raised to 1.4 m the arrow reads *Lower the phone to
+  waist height · 1.4 m now* and no photos are taken; lowered, the path cue comes back and photos resume. Also in
+  the self-checks (the real scan's heights and tilts, a whole lap at the wrong height ending as partly done, a minute
+  of going back for missed spots, the grade). Not tried: a real Pixel on the new laps. The same splat, viewed from
+  where one of its photos was taken, was sharp nearby and broken past the outline: the crop. In an open concourse
+  the crop removes most of what you see; *Crop* → off in the viewer shows it (see "Cropping").
 - **Jobs that finish** (after 2.7.1), found in the job log, the job list and Windows' event log of the night a
   1,026-photo scan was processed five times: one run ended on COLMAP's matcher check, the last one's bar read
   "step ~49,750 / 50,000 · ~0 s left" while Brush was at step 9,601 (an earlier run's snapshots were still in

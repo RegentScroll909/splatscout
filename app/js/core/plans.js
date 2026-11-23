@@ -32,16 +32,18 @@ export const TEMPLATES = [
         id: 'high', name: 'Overhead lap', height: 'high', loop: true, bands: ['low'], guide: { kind: 'loop', inset: 0.9, pitch: -35, yaw: 15 },
         short: 'Same lap with the phone above your head, tilted down about 30°.',
         steps: [
-          'Raise the phone above your head and tilt it down so you see the floor and the lower walls.',
+          'Raise the phone above your head (arms up, not just above your eyes) and tilt it down so you see the floor and the lower walls.',
           'Follow the same loop. This captures tabletops, floor and furniture from above.',
+          'Photos only count, and are only taken, while the phone is up there; the arrow says when to raise it or tilt it.',
         ],
       },
       {
         id: 'low', name: 'Low lap', height: 'low', loop: true, bands: ['high'], guide: { kind: 'loop', inset: 0.9, pitch: 28, yaw: 15 },
-        short: 'Lap at waist height, tilted up about 30°.',
+        short: 'Lap with the phone at waist height (about 1 m), tilted up about 30°.',
         steps: [
-          'Hold the phone at waist or knee height, tilted up toward the ceiling–wall line.',
+          'Hold the phone at your waist (about 1 m up, lower than you think), tilted up toward the ceiling–wall line.',
           'Walk the loop again. This fills in the ceiling, light fixtures and the undersides of tables.',
+          'Photos only count, and are only taken, while the phone is that low; the arrow says when to lower it or tilt it.',
         ],
       },
       {
@@ -134,7 +136,9 @@ export const TEMPLATES = [
         ],
       },
       {
-        id: 'up', name: 'Ceiling & upper walls', height: 'low', loop: true, bands: ['high', 'ceil'], guide: { kind: 'loop', inset: 1.5, pitch: 35, yaw: 15 },
+        // Held where it's comfortable (a big hall's ceiling is far away: tilting is what matters, not the height).
+        // As 'low' it only counted photos under 1.35 m that its steps never asked for, so it could never end.
+        id: 'up', name: 'Ceiling & upper walls', height: 'chest', loop: true, bands: ['high', 'ceil'], guide: { kind: 'loop', inset: 1.5, pitch: 35, yaw: 15 },
         short: 'Lap again, tilted up at balconies, ceiling and upper walls.',
         steps: ['Tilt up about 40° and walk another lap. Move slower: things far away blur more.'],
       },
@@ -240,26 +244,44 @@ export function getTemplate(id) {
   return TEMPLATES.find((t) => t.id === id) || TEMPLATES[0];
 }
 
+// Phone height above the floor for each kind of pass: the ideal (min–max, for the instructions) and, for the
+// overhead and low passes, what counts (`ok`): a photo outside it doesn't count for the pass, the guide says
+// to raise or lower the phone, and photos wait until it's there. One rule for the guide, the hint and the
+// grade. A real scan (Memorial Union, Nov 2026) shows why it matters: held at eye level the phone was at
+// 1.57 m; the "overhead" lap was walked at 1.70 m and the "low" lap at 1.44 m, tilted half as much as asked.
+// The overhead lap still counted (it took eye-level photos as its own) and the low lap never could, so the
+// guide sent its holder round and round for eight minutes.
 export const HEIGHTS = {
   chest: { min: 1.05, max: 1.65, label: 'chest height' },
-  high: { min: 1.75, max: 3.0, label: 'above your head' },
-  low: { min: 0.2, max: 1.0, label: 'waist height or lower' },
+  high: { min: 1.75, max: 3.0, label: 'above your head', ok: [1.72, 3.5] },
+  low: { min: 0.2, max: 1.0, label: 'waist height or lower', ok: [0, 1.2] },
 };
+
+/**
+ * Which way the phone has to go for a pass that asks for a height ('up' | 'down'), or null when it's fine (or
+ * the pass doesn't mind, or the height isn't known).
+ */
+export function heightOff(pass, heightM) {
+  const band = pass && HEIGHTS[pass.height] && HEIGHTS[pass.height].ok;
+  if (!band || heightM == null) return null;
+  return heightM < band[0] ? 'up' : heightM > band[1] ? 'down' : null;
+}
 
 /** A hint when the phone is clearly not at the pass's intended height (AR mode only). */
 export function heightHint(pass, heightM) {
   if (!pass || !pass.height || heightM == null) return null;
   const h = HEIGHTS[pass.height];
-  if (heightM < h.min - 0.1) {
+  const off = h.ok ? heightOff(pass, heightM) : heightM < h.min - 0.1 ? 'up' : heightM > h.max + 0.1 ? 'down' : null;
+  if (off === 'up') {
     return {
       title: pass.height === 'high' ? 'Raise the phone above your head' : 'Raise the phone a bit',
-      detail: `This pass is at ${h.label}. You're at about ${heightM.toFixed(1)} m.`,
+      detail: `This pass is at ${h.label}. You're at about ${heightM.toFixed(1)} m.${h.ok ? ' Photos wait until the phone is up there.' : ''}`,
     };
   }
-  if (heightM > h.max + 0.1) {
+  if (off === 'down') {
     return {
       title: pass.height === 'low' ? 'Lower the phone to waist height' : 'Lower the phone a bit',
-      detail: `This pass is at ${h.label}. You're at about ${heightM.toFixed(1)} m.`,
+      detail: `This pass is at ${h.label}. You're at about ${heightM.toFixed(1)} m.${h.ok ? ' Photos wait until the phone is down there.' : ''}`,
     };
   }
   return null;

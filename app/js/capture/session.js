@@ -631,10 +631,14 @@ export class CaptureSession {
     // Keyframe selection. Candidates are evaluated whenever a photo is (nearly) due, also while
     // moving: the keyframer keeps the sharpest one instead of waiting for the user to stop.
     // Not while AR tracking is lost or slipping ('limited'): those photos' positions are guesses.
-    const canShoot = this.recording && !this.paused && !holding && !this.orientationChanged && fi.requestCandidate &&
+    // An overhead or low pass with the phone at the wrong height: photos wait until it's raised or lowered (the
+    // arrow says which). Otherwise they are eye-level photos again, which that pass doesn't count. The shutter
+    // button still takes one.
+    const gs = this.live.guide;
+    const heightWait = !!(gs && gs.heightOff) && !this.manualPending;
+    const canShoot = this.recording && !this.paused && !holding && !this.orientationChanged && fi.requestCandidate && !heightWait &&
       !(this.sixdof && (fi.trackState === 'lost' || fi.trackState === 'limited'));
     // Standing on a gap marker, aimed at the ring: that's the photo the guide asked for.
-    const gs = this.live.guide;
     if (canShoot && gs && gs.mode === 'gaps' && gs.wantPhoto && this.guide.gap === gs.next && !this.keyframer.forced) {
       const last = this.frames.length ? this.frames[this.frames.length - 1] : null;
       const recent = last && last.segment === this.segment && this.t0 + last.t > t - 1;
@@ -776,7 +780,11 @@ export class CaptureSession {
     const hd = Math.atan2(f[0], f[2]);
     const wrapDeg = (a) => ((a / DEG + 540) % 360) - 180;
     let cue;
-    if (gs.phase === 'walk' || gs.phase === 'go') {
+    if (gs.phase === 'height') {
+      // Up or down, straight to the point (the coach card underneath says why).
+      const up = gs.heightOff === 'up';
+      cue = { kind: 'height', key: 'height' + (up ? 'u' : 'd'), arrow: up ? 0 : 180, label: up ? 'Raise the phone above your head' : 'Lower the phone to waist height', sub: gs.height != null ? `${gs.height.toFixed(1)} m now` : '' };
+    } else if (gs.phase === 'walk' || gs.phase === 'go') {
       const c = gs.carrot;
       const vx = c[0] - pos[0], vz = c[2] - pos[2];
       const dist = Math.hypot(vx, vz);
@@ -1159,7 +1167,7 @@ export class CaptureSession {
       if (gs && gs.complete && g.hasPath) {
         if (!this.passCompleteAt) {
           this.passCompleteAt = t;
-          this._emit('passComplete', { pass: this.pass, last: this.passIndex >= this.template.passes.length - 1 });
+          this._emit('passComplete', { pass: this.pass, last: this.passIndex >= this.template.passes.length - 1, partial: !!gs.partial, progress: gs.progress });
         } else if (t - this.passCompleteAt > 2.5 && this.passIndex < this.template.passes.length - 1 && this.settings.autoAdvance !== false) {
           this.nextPass();
           this._emit('passStart', { pass: this.pass, index: this.passIndex });

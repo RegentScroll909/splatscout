@@ -340,6 +340,8 @@ input[type=checkbox]:checked::after { content: ''; width: 9px; height: 5px; bord
 .cue-sub:empty { display: none; }
 .cue.hold { border-color: rgba(52, 211, 153, 0.45); }
 .cue.hold .cue-icon { color: var(--good); }
+.cue.height { border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+.cue.height .cue-icon { color: var(--warn); }
 .cue.turn .cue-icon .ic, .cue.around .cue-icon .ic { animation: nudge 1s ease-in-out infinite; }
 @keyframes nudge { 50% { opacity: 0.55; } }
 .pill-btn { position: absolute; left: 50%; top: calc(50% + 104px); transform: translateX(-50%); display: inline-flex; align-items: center; gap: 7px; border-radius: var(--r); padding: 7px 14px; color: var(--text); font-size: 0.86rem; font-weight: 550; cursor: pointer; }

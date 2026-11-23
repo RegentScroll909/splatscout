@@ -6,6 +6,37 @@ import { posePosition, clamp } from './math.js';
 import { getTemplate } from './plans.js';
 import { Bounds } from './bounds.js';
 import { mainSpace, spaceCount, framesIn, boundsIn } from './spaces.js';
+import { planPass, photoCounts } from './guide.js';
+
+/**
+ * How much of each walked pass of the plan (laps, lanes, orbits) was photographed the way that pass asks: its
+ * path planned from the scan area as the guide plans it, and each spot counted when one of the photos would
+ * have completed it live (guide.js photoCounts: about there, at the pass's height and tilt). The coverage map
+ * can't see this: a Memorial Union scan photographed from 1.3–1.7 m only, its overhead and low laps not done
+ * as asked, had 85% of its surfaces from 3+ angles, scored 100 and made a soft, smeared splat.
+ * @returns {Array<{pass, done: number, spots: number}>|null} null without a scan area
+ */
+export function planCompletion(frames, template, bounds) {
+  if (!bounds || !bounds.poly) return null;
+  const posed = frames.filter((f) => f.pose && f.tracked);
+  const out = [];
+  for (const pass of template.passes) {
+    const first = posed.find((f) => f.pass === pass.id);
+    const stations = planPass(pass.guide, bounds, pass, first ? posePosition(first.pose) : null);
+    if (!stations) continue;
+    const spots = stations.filter((s) => !s.transit);
+    let done = 0;
+    for (const st of spots) if (posed.some((f) => photoCounts(st, f.pose, pass, bounds.floorY))) done++;
+    out.push({ pass, done: spots.length ? done / spots.length : 1, spots: spots.length });
+  }
+  return out.length ? out : null;
+}
+
+// What a pass's views add, for the fix that says it's missing.
+const PLAN_HINT = {
+  high: 'Do it with the phone above your head (arms up), tilted down about 30°: the floor and tabletops from above.',
+  low: 'Do it with the phone at waist height (about 1 m), tilted up about 30°: the ceiling and upper walls from below.',
+};
 
 /**
  * Rebuild coverage structures from saved frames (poses, depth points and depth images), the same
@@ -187,7 +218,27 @@ export function analyzeCapture(frames, capture) {
     detail: `${n} of about ${target} recommended${area ? ` for ~${Math.round(area)} m²` : ''}` });
   if (n < target * 0.7) fixes.push({ level: 'warn', text: `About ${target - n} more photos are recommended for this space. Finish the remaining passes.` });
 
-  const score = Math.round(parts.reduce((s, p) => s + p.weight * p.value, 0) / parts.reduce((s, p) => s + p.weight, 0) * 100);
+  // --- The plan: each walked pass done the way it asks (the guide's own rule, replayed) ---
+  const plan = sixdof ? planCompletion(shown, template, bounds) : null;
+  let heightsMissing = false;
+  if (plan) {
+    const mean = plan.reduce((s, p) => s + p.done, 0) / plan.length;
+    // Replayed without the live guide's moves round furniture, a fully walked pass comes out around 90%.
+    parts.push({ id: 'plan', label: 'Capture plan', weight: 0.2, value: clamp(mean / 0.85, 0, 1),
+      detail: plan.map((p) => `${p.pass.name} ${Math.round(p.done * 100)}%`).join(' · ') });
+    for (const p of plan) {
+      if (p.done >= 0.6) continue;
+      const hint = PLAN_HINT[p.pass.height] || p.pass.short;
+      fixes.push({ level: (p.pass.height === 'high' || p.pass.height === 'low') ? 'bad' : 'warn',
+        text: `${p.pass.name}: ${Math.round(p.done * 100)}% of its path was photographed as it asks. ${hint}` });
+    }
+    // Photos from one height only (the overhead or low pass missing) make a splat that smears up and down from
+    // anywhere but where the phone was: whatever else went well, that isn't an A.
+    heightsMissing = plan.some((p) => (p.pass.height === 'high' || p.pass.height === 'low') && p.done < 0.5);
+  }
+
+  let score = Math.round(parts.reduce((s, p) => s + p.weight * p.value, 0) / parts.reduce((s, p) => s + p.weight, 0) * 100);
+  if (heightsMissing) score = Math.min(score, GRADES[0][0] - 1);
   const [, grade, verdict] = GRADES.find(([min]) => score >= min);
   const order = { bad: 0, warn: 1, info: 2 };
   fixes.sort((a, b) => order[a.level] - order[b.level]);

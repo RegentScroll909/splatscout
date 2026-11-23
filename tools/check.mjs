@@ -300,6 +300,125 @@ test('guide: standing on a spot completes it; a spot that can\'t be reached is s
   assert.ok(skipped && target.transit, 'skipped after ~15 s');
 });
 
+// The overhead and low laps, from a real scan (Memorial Union, Nov 2026): held at eye level the phone was at
+// 1.57 m; the "overhead" lap was walked at 1.70 m tilted down 16°, and the "low" lap at 1.44 m tilted up 14°.
+// The overhead lap counted the eye-level lap's photos as its own; the low lap never counted anything, and the
+// guide sent its holder back for each missed spot in turn, eight minutes and 475 photos.
+const tiltedPose = (pos, headingAim, pitchDeg) => {
+  const l = Math.hypot(headingAim[0], headingAim[2]) || 1, c = Math.cos(pitchDeg * DEG);
+  return poseLookDir(pos, [(headingAim[0] / l) * c, Math.sin(pitchDeg * DEG), (headingAim[2] / l) * c]);
+};
+test('guide: the overhead lap counts photos from above your head, not the eye-level lap\'s', () => {
+  const room = getTemplate('room');
+  const [mid, high] = room.passes;
+  const b = new Bounds({ poly: [[0, 0], [6, 0], [6, 5], [0, 5]], floorY: 0 });
+  const g = new Guide({ template: room, bounds: b, voxels: new VoxelMap(0.2, 7) });
+  g.setPass(high, [3, 1.6, 4]);
+  // The eye-level lap's photos, as the session hands them over when a pass starts.
+  for (const st of planPass(mid.guide, b, mid, [3, 1.6, 4])) g.onPhoto(tiltedPose([st.pos[0], 1.57, st.pos[2]], st.aim, -11));
+  assert.equal(g.progress(), 0, 'eye-level photos don\'t count for the overhead lap (they did: 55% of a real lap)');
+  // The real scan's "overhead" photos: barely raised, barely tilted.
+  for (const st of g.stations) g.onPhoto(tiltedPose([st.pos[0], 1.7, st.pos[2]], st.aim, -16));
+  assert.equal(g.progress(), 0, '1.7 m, tilted down 16°: not overhead');
+  // Arms up, tilted down about 30°: it counts.
+  for (const st of g.stations) g.onPhoto(tiltedPose([st.pos[0], 1.85, st.pos[2]], st.aim, -30));
+  assert.equal(g.progress(), 1);
+  // The eye-level lap itself still takes its photos as before.
+  const g2 = new Guide({ template: room, bounds: b, voxels: new VoxelMap(0.2, 7) });
+  g2.setPass(mid, [3, 1.6, 4]);
+  for (const st of g2.stations) g2.onPhoto(tiltedPose([st.pos[0], 1.57, st.pos[2]], st.aim, -11));
+  assert.equal(g2.progress(), 1);
+});
+
+test('guide: the low lap at chest height says to lower the phone, and ends instead of looping', () => {
+  const room = getTemplate('room');
+  const low = room.passes[2];
+  const b = new Bounds({ poly: [[0, 0], [6, 0], [6, 5], [0, 5]], floorY: 0 });
+  const g = new Guide({ template: room, bounds: b, voxels: new VoxelMap(0.2, 7) });
+  g.setPass(low, [3, 1.45, 4]);
+  const S = g.stations;
+  const at = (st, y) => [st.pos[0], y, st.pos[2]];
+  let st = g.update({ pos: at(S[0], 1.45), fwd: tiltedPose(at(S[0], 1.45), S[0].aim, 14).slice(8, 11).map((v) => -v), t: 0 });
+  assert.deepEqual([st.phase, st.heightOff, st.wantPhoto], ['height', 'down', false]);
+  assert.match(st.instruction.title, /Lower the phone to waist height/);
+  assert.match(st.instruction.detail, /1\.4 m/);
+  // Standing there at chest height, aimed, for a while: the spot neither counts nor gets skipped.
+  for (let t = 0.5; t < 30; t += 0.5) st = g.update({ pos: at(S[0], 1.45), fwd: S[0].aim, t });
+  assert.ok(!S[0].done && !S[0].transit, 'still waiting for the phone to come down');
+  // Walk the whole lap at 1.45 m, photos all the way (the real scan's): none count, and at the end of the path the
+  // pass ends, partly done, instead of sending you back to each missed spot.
+  let t = 30;
+  for (const s of S) {
+    t += 0.6;
+    g.onPhoto(tiltedPose(at(s, 1.45), s.aim, 14));
+    st = g.update({ pos: at(s, 1.45), fwd: s.aim, t });
+    if (st.complete) break;
+  }
+  for (let k = 0; k < 6 && !st.complete; k++) st = g.update({ pos: at(S[S.length - 1], 1.45), fwd: S[S.length - 1].aim, t: (t += 0.5) });
+  assert.ok(st.complete && st.partial, `ends at the end of the path, partly done (progress ${g.progress()})`);
+  assert.equal(g.progress(), 0);
+  // Lowered to the waist and tilted up: the lap counts and ends as done.
+  const g2 = new Guide({ template: room, bounds: b, voxels: new VoxelMap(0.2, 7) });
+  g2.setPass(low, [3, 1.0, 4]);
+  t = 0;
+  for (const s of g2.stations) {
+    g2.onPhoto(tiltedPose(at(s, 1.0), s.aim, 24));
+    st = g2.update({ pos: at(s, 1.0), fwd: s.aim, t: (t += 0.6) });
+  }
+  assert.ok(st.complete && !st.partial, 'a lap at the waist completes');
+  assert.equal(g2.progress(), 1);
+});
+
+test('guide: going back for missed spots stops after a minute', () => {
+  const room = getTemplate('room');
+  const mid = room.passes[0];
+  const b = new Bounds({ poly: [[0, 0], [7, 0], [7, 6], [0, 6]], floorY: 0 });
+  const g = new Guide({ template: room, bounds: b, voxels: new VoxelMap(0.2, 7) });
+  g.setPass(mid, [3.5, 1.4, 5]);
+  const S = g.stations;
+  // Every spot photographed but a run of seven in the middle (walked past without a photo landing).
+  let st, t = 0;
+  S.forEach((s, i) => {
+    if (i < 20 || i > 26) g.onPhoto(poseLookDir(s.pos, s.aim));
+    st = g.update({ pos: s.pos, fwd: s.aim, t: (t += 0.6) });
+  });
+  assert.ok(!st.complete && st.missed, 'sent back for the missed spots');
+  // Lingering where the lap ended, a step in from it and well away from the missed spots (too far for each to be
+  // skipped as unreachable): after a minute, the pass ends.
+  const end = S[S.length - 1].pos, far = [end[0] + (3.5 - end[0]) * 0.3, 1.4, end[2] + (3 - end[2]) * 0.3];
+  assert.ok(Math.hypot(far[0] - S[23].pos[0], far[2] - S[23].pos[2]) > 3, 'away from the missed spots');
+  const t0 = t;
+  while (!st.complete && t < t0 + 120) st = g.update({ pos: far, fwd: [0, 0, 1], t: (t += 1) });
+  assert.ok(st.complete && st.partial, 'ends, partly done');
+  assert.ok(t - t0 <= 62, `after about a minute (${t - t0} s)`);
+});
+
+test('grade: a scan without its overhead and low laps isn\'t an A, and says which laps are missing', () => {
+  const room = getTemplate('room');
+  const bounds = { poly: [[0, 0], [6, 0], [6, 5], [0, 5]], floorY: 0, margin: 0.35, skips: [], segment: 1, space: 100 };
+  const b = new Bounds(bounds);
+  const intr = { fx: 900, fy: 900, cx: 640, cy: 360, w: 1280, h: 720 };
+  const shots = (pass, y, pitch) => planPass(pass.guide, b, pass, null).filter((s) => !s.transit).map((s) => ({ pass: pass.id, pose: tiltedPose([s.pos[0], y, s.pos[2]], s.aim, pitch) }));
+  const [mid, high, low, cross] = room.passes;
+  const toFrames = (list) => list.map((x, i) => ({ seq: i + 1, segment: 1, space: 100, tracking: '6dof', tracked: true, pass: x.pass, pose: Array.from(x.pose), intr, m: { relSharp: 0.9 }, flags: [], trigger: 'trans', baseline: 0.2 }));
+  const capture = (frames) => ({ template: 'room', tracking: '6dof', segments: 1, bounds, boundsBySpace: { 100: bounds }, stats: { gaps: 0 } });
+  // The real scan, roughly: an eye-level lap, and the other laps walked at chest height.
+  const one = toFrames([...shots(mid, 1.57, -11), ...shots(high, 1.7, -16), ...shots(low, 1.45, 14), ...shots(cross, 1.5, -15)]);
+  const r1 = analyzeCapture(one, capture(one));
+  const plan = r1.parts.find((p) => p.id === 'plan');
+  assert.ok(plan, 'a Capture plan part');
+  assert.match(plan.detail, /Eye-level lap 100% · Overhead lap 0% · Low lap 0% · Cross the room 100%/);
+  assert.ok(r1.score < 88 && r1.grade !== 'A', `not an A (${r1.score} ${r1.grade})`);
+  assert.ok(r1.fixes.some((f) => f.level === 'bad' && /^Overhead lap: 0% .*above your head/.test(f.text)), 'says the overhead lap is missing');
+  assert.ok(r1.fixes.some((f) => /^Low lap: 0% .*waist height/.test(f.text)), 'and the low lap');
+  // Every lap done as asked: no cap, no fix about the plan.
+  const all = toFrames([...shots(mid, 1.5, -8), ...shots(high, 1.9, -33), ...shots(low, 0.95, 26), ...shots(cross, 1.45, -15)]);
+  const r2 = analyzeCapture(all, capture(all));
+  assert.equal(r2.parts.find((p) => p.id === 'plan').value, 1);
+  assert.ok(!r2.fixes.some((f) => /lap: \d+% of its path/.test(f.text)));
+  assert.ok(r2.score > r1.score, `${r2.score} > ${r1.score}`);
+});
+
 // The practice room's geometry, scanned with a lap: the map new sessions are lined up with.
 const W_AR = 1280, H_AR = 576, F_AR = W_AR / 2 / Math.tan(35 * DEG);
 const INTR_AR = { fx: F_AR, fy: F_AR, cx: W_AR / 2, cy: H_AR / 2, w: W_AR, h: H_AR };
