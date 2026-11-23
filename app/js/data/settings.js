@@ -17,7 +17,19 @@ export const DEFAULTS = {
   guide: true, // AR: mark the scan area and follow the path
   autoAdvance: true, // go to the next pass when the path is done
   stationUrl: '', // SplatStation on your PC, e.g. http://192.168.1.20:8787
+  theme: 'dark', // dark | light | system (the capture screen is always dark)
 };
+
+/** Put the chosen appearance on the page (and the browser's address bar). */
+export function applyTheme(theme = getSettings().theme) {
+  let t = theme;
+  if (t === 'system') t = typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  if (t !== 'light') t = 'dark';
+  document.documentElement.dataset.theme = t;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', t === 'light' ? '#eceee9' : '#111315');
+  return t;
+}
 
 let cache = null;
 

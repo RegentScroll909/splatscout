@@ -2,7 +2,7 @@
 
 import { h, mount, toast, fmtBytes, confirmDialog } from './dom.js';
 import { icon } from './icons.js';
-import { getSettings, setSettings } from '../data/settings.js';
+import { getSettings, setSettings, applyTheme } from '../data/settings.js';
 import { APP_VERSION } from '../data/exporter.js';
 import * as store from '../data/store.js';
 
@@ -25,6 +25,10 @@ export function settingsScreen(root, { navigate }) {
       h('header.page-head', h('button.icon-btn', { onclick: () => navigate('#/'), 'aria-label': 'Back' }, icon('back')), h('h1', 'Settings')),
       h('section.card',
         h('label.field', h('span', 'Your name (saved in exports)'), h('input', { value: s.author, placeholder: 'e.g. Alex R.', oninput: (e) => setSettings({ author: e.target.value }) })),
+        h('label.field', h('span', 'Appearance'),
+          h('select', { onchange: (e) => applyTheme(setSettings({ theme: e.target.value }).theme) },
+            [['dark', 'Dark (default)'], ['light', 'Light'], ['system', 'Match this phone']].map(([v, t]) => h('option', { value: v, selected: (s.theme || 'dark') === v }, t))),
+          h('div.small.muted', 'The capture screen stays dark: it sits over the camera.')),
         toggle('voice', 'Voice coaching', 'Speaks the important warnings so you can watch the scene.'),
         toggle('sounds', 'Shutter tick', 'A soft click each time a photo is taken.'),
         toggle('overlayVoxels', 'Paint coverage on surfaces (AR)'),

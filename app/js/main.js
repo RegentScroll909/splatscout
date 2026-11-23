@@ -9,6 +9,13 @@ import { settingsScreen } from './ui/settingsScreen.js';
 import { clubScreen } from './ui/clubScreen.js';
 import { campusScreen } from './ui/campusScreen.js';
 import { h, mount } from './ui/dom.js';
+import { getSettings, applyTheme } from './data/settings.js';
+
+applyTheme();
+// "Match this phone" follows the phone's own light/dark switch.
+if (typeof matchMedia === 'function') {
+  matchMedia('(prefers-color-scheme: light)').addEventListener?.('change', () => getSettings().theme === 'system' && applyTheme());
+}
 
 const root = document.getElementById('app');
 let cleanup = null;

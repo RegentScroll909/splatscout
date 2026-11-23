@@ -48,8 +48,8 @@ const BLOBS = [
   { cx: 248, cy: 240, rx: 58, ry: 32, inner: [1, 1, 1], outer: hex('#dff8ff'), a: 1 },
 ];
 const ROT = (-24 * Math.PI) / 180;
-const BG_TOP = hex('#121821'), BG_BOTTOM = hex('#090b0e');
-const BRACKET = hex('#3ddcff');
+const BG_TOP = hex('#1d2024'), BG_BOTTOM = hex('#111315');
+const BRACKET = hex('#ff6b2c');
 
 function insideRounded(x, y, r) {
   const cx = Math.min(Math.max(x, r), 512 - r), cy = Math.min(Math.max(y, r), 512 - r);

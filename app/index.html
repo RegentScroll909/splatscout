@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#090b0e">
+  <meta name="theme-color" content="#111315">
   <meta name="description" content="SplatScout: an AR capture coach for Gaussian splats. Tracks what you have scanned, coaches you live and checks that your photos will make a good splat.">
   <title>SplatScout</title>
   <link rel="manifest" href="manifest.webmanifest">
@@ -11,7 +11,18 @@
   <link rel="apple-touch-icon" href="icons/icon-192.png">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
   <link rel="stylesheet" href="css/app.css">
+  <script>
+    // Appearance before the first paint (Settings → Appearance; the app keeps it up to date from then on).
+    try {
+      var t = (JSON.parse(localStorage.getItem('splatscout.settings') || '{}').theme) || 'dark';
+      if (t === 'system') t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
 </head>
 <body>
   <main id="app"></main>
