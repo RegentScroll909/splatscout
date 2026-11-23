@@ -34,6 +34,17 @@
     #crop .row input[type=range] { flex: 1; }
     #crop .hint { font-size: 12px; color: #9aa; margin: 8px 0 0; line-height: 1.4; }
     #crop .grow { flex: 1; }
+    /* Whether the crop is on, as saved, said plainly; then the switch, and what Apply would change. */
+    #cropNow { margin: 0 0 10px; padding: 8px 10px; border-radius: 6px; font-size: 13px; line-height: 1.4; background: #16191d; border: 1px solid #2c3034; }
+    #cropNow b { letter-spacing: .02em; }
+    #cropNow.on b { color: #5fe3f0; }
+    #cropNow.off b { color: #fbbf24; }
+    #crop .seg { display: flex; border: 1px solid #3a3040; border-radius: 8px; overflow: hidden; margin: 0 0 10px; }
+    #crop .seg button { flex: 1; border: 0; border-radius: 0; background: transparent; padding: 7px 10px; color: #aab; }
+    #crop .seg button + button { border-left: 1px solid #3a3040; }
+    #crop .seg button.sel { background: #0e5f69; color: #fff; }
+    #crop .dim { opacity: .45; }
+    #cropApply.done { background: transparent; border-color: #3a3040; color: #9aa; }
   </style>
   <script type="importmap">
     {
@@ -64,13 +75,17 @@
   <button id="jump" title="Jump (in ghost mode: hold to rise)">⤒</button>
   <div id="crop">
     <div class="head"><b>Crop to the scan area</b><button id="cropClose" title="Close">✕</button></div>
+    <p id="cropNow"></p>
+    <div class="seg" role="group" aria-label="Crop">
+      <button id="cropOnBtn" title="Leave out the small splats outside the outline (plus the margin)">Crop on</button>
+      <button id="cropOffBtn" title="Keep every splat">Crop off</button>
+    </div>
     <canvas id="cropMap" title="Seen from above. Drag a corner of the outline to move it."></canvas>
-    <label class="row"><input type="checkbox" id="cropOn"> Remove small splats outside the outline</label>
-    <label class="row">Margin <input type="range" id="cropMargin" min="0" max="3" step="0.1"> <span id="cropMarginV"></span></label>
-    <p class="hint">Drag the corners to move the outline; everything in the lighter area stays. Big, faint splats always stay wherever they are: plain walls get their colour from them. Untick to keep everything.</p>
+    <label class="row" id="cropMarginRow">Margin <input type="range" id="cropMargin" min="0" max="3" step="0.1"> <span id="cropMarginV"></span></label>
+    <p class="hint" id="cropHint"></p>
     <div class="row"><button id="cropReset" title="Back to the outline marked on the phone">Reset outline</button><span class="grow"></span><button id="cropApply" class="on">Apply</button></div>
     <p class="hint" id="cropMsg"></p>
-    <div class="row"><button id="cropPeek" class="grow" title="See exactly what the crop took out (put back by unticking the crop)" hidden>Show only what’s removed</button></div>
+    <div class="row"><button id="cropPeek" class="grow" title="See exactly what the crop took out (it comes back when the crop is turned off)" hidden>Show only what’s removed</button></div>
   </div>
   <script type="module">
     import * as THREE from 'three';
@@ -480,7 +495,41 @@
     // ------------------------------------------------------------------ crop editor
     // A top-down map of the whole splat with the scan outline on it: move its corners, change the
     // margin, or switch the crop off; Apply re-crops on the station (nothing is trained again).
-    const crop = { st: null, areas: null, drag: null, img: null, busy: false };
+    // st: the crop as saved (from the station); want: the switch as set here (Apply makes it the saved one).
+    const crop = { st: null, areas: null, drag: null, img: null, busy: false, want: false };
+    const fmtN = (n) => (Number.isFinite(n) ? n.toLocaleString() : '?');
+    const outlineKey = (areas) => JSON.stringify((areas || []).map((a) => a.poly.map((p) => p.map((v) => +(+v).toFixed(2)))));
+
+    /**
+     * Say plainly whether the crop is on (as saved), set the switch, and what Apply would change ("Applied" when
+     * nothing). The toolbar's Crop button says on or off too, once the panel has been opened.
+     */
+    function showCropState() {
+      const st = crop.st;
+      if (!st) return;
+      const now = $('cropNow');
+      now.className = st.on ? 'on' : 'off';
+      const head = document.createElement('b');
+      head.textContent = st.on ? 'Crop is on' : 'Crop is off';
+      now.replaceChildren(head, st.on
+        ? `: ${fmtN(st.removed)} small splats outside the outline are left out; ${fmtN(st.splats)} are shown (margin ${(+st.margin).toFixed(1)} m).`
+        : `: nothing is left out; all ${fmtN(st.splats)} splats are shown.`);
+      $('cropOnBtn').classList.toggle('sel', crop.want);
+      $('cropOffBtn').classList.toggle('sel', !crop.want);
+      $('cropMarginRow').classList.toggle('dim', !crop.want);
+      $('cropMargin').disabled = !crop.want;
+      $('cropHint').textContent = crop.want
+        ? 'Drag the corners to move the outline; everything in the lighter area stays. Big, faint splats always stay wherever they are: plain walls get their colour from them.'
+        : 'With the crop off nothing is left out. The outline and margin are kept for when you turn it back on.';
+      const reshaped = outlineKey(crop.areas) !== outlineKey(st.areas) || Math.abs(+$('cropMargin').value - +st.margin) > 1e-6;
+      const change = crop.want !== st.on ? (crop.want ? 'Apply: turn the crop on' : 'Apply: turn the crop off') : crop.want && reshaped ? 'Apply the new outline' : null;
+      const apply = $('cropApply');
+      apply.textContent = change || 'Applied';
+      apply.classList.toggle('on', !!change);
+      apply.classList.toggle('done', !change);
+      apply.disabled = !change || crop.busy;
+      $('cropBtn').textContent = st.on ? '⬚ Crop: on' : '⬚ Crop: off';
+    }
     const cropMap = $('cropMap'), cctx = cropMap.getContext('2d');
     const clone = (a) => JSON.parse(JSON.stringify(a));
     const inPoly = (poly, x, z) => {
@@ -516,7 +565,7 @@
       }
       crop.st = j;
       crop.areas = clone(j.areas);
-      $('cropOn').checked = j.on;
+      crop.want = !!j.on;
       $('cropMargin').value = j.margin;
       // The map as an image: brighter where there's more surface at wall height.
       const m = j.map, raw = atob(m.data);
@@ -576,8 +625,9 @@
       const px = (x) => (x - m.x0) * s, py = (z) => (z - m.z0) * s;
       cctx.imageSmoothingEnabled = false;
       cctx.drawImage(crop.img, 0, 0, cropMap.width, cropMap.height);
-      const margin = +$('cropMargin').value, on = $('cropOn').checked;
+      const margin = +$('cropMargin').value, on = crop.want;
       $('cropMarginV').textContent = `${margin.toFixed(1)} m`;
+      showCropState();
       if (on) {
         // Darken what the crop would remove (small splats only; the big background stays).
         const step = Math.max(2, Math.round(cropMap.width / 150));
@@ -627,13 +677,26 @@
     cropMap.addEventListener('pointermove', (e) => {
       if (!crop.drag) return;
       crop.areas[crop.drag.ai].poly[crop.drag.ci] = mapPoint(e);
+      edited();
       drawCrop();
     });
     const drop = () => (crop.drag = null);
     cropMap.addEventListener('pointerup', drop);
     cropMap.addEventListener('pointercancel', drop);
-    $('cropMargin').addEventListener('input', drawCrop);
-    $('cropOn').addEventListener('change', drawCrop);
+    // Anything changed here: the last Apply's message no longer describes it.
+    const edited = () => !crop.busy && ($('cropMsg').textContent = '');
+    $('cropMargin').addEventListener('input', () => {
+      edited();
+      drawCrop();
+    });
+    const setWant = (on) => {
+      if (!crop.st || crop.busy) return;
+      crop.want = on;
+      edited();
+      drawCrop();
+    };
+    $('cropOnBtn').onclick = () => setWant(true);
+    $('cropOffBtn').onclick = () => setWant(false);
     $('cropReset').onclick = () => {
       if (!crop.st || !crop.st.original.length) return;
       crop.areas = clone(crop.st.original);
@@ -650,7 +713,7 @@
       try {
         const r = await fetch('/api/crop', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ply, on: $('cropOn').checked, areas: crop.areas, margin: +$('cropMargin').value }),
+          body: JSON.stringify({ ply, on: crop.want, areas: crop.areas, margin: +$('cropMargin').value }),
         }).then((x) => x.json());
         if (r.error) throw new Error(r.error);
         $('cropMsg').textContent = 'Loading the new splat…';
@@ -664,13 +727,14 @@
         await checkPeek();
         // What's removed is mostly faint specks beyond the walls: say so, or it looks like nothing happened.
         $('cropMsg').textContent = r.removed
-          ? `Removed ${r.removed.toLocaleString()} small splats outside the outline (${r.kept.toLocaleString()} stay). They’re mostly faint specks beyond the walls, so from inside the room little changes: zoom out, or show only what’s removed.`
-          : `Crop off: all ${r.kept.toLocaleString()} splats are in.`;
+          ? `Done. From inside the room little may change: what's left out is mostly faint specks beyond the walls. Zoom out, or show only what's removed.`
+          : 'Done: the whole splat is back.';
       } catch (e) {
         $('cropMsg').textContent = 'Could not crop: ' + e.message;
       } finally {
         crop.busy = false;
         $('cropApply').disabled = false;
+        showCropState();
       }
     };
     // Only splats in the library can be re-cropped (job previews are still training).

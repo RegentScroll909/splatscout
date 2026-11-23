@@ -243,9 +243,11 @@ which removes small floaters seen through windows or past the area. Big, faint s
 seen only from inside a room, a plain wall can be painted by large blobs metres behind it, and cropping those
 away left walls dark and see-through. What the crop removes is kept beside the splat (`scene.outside.ply`).
 Turn cropping off on the dashboard (*Crop splats to the scan area*), or change it afterwards in the viewer:
-**⬚ Crop** shows the splat from above with the outline on it. Drag its corners, change the margin, or untick it
-to keep everything, then press Apply. It takes a few seconds, nothing is trained again, and the camera stays
-where it was. What's removed is mostly faint specks beyond the walls, so from inside the room a crop can look like
+**⬚ Crop** (it says *Crop: on* or *Crop: off* once opened) shows the splat from above with the outline on it, and
+says at the top whether the crop is on and how many splats it leaves out. Switch it with **Crop on / Crop off**,
+drag the outline's corners or change the margin, then press Apply, whose label says what it will do (*Apply: turn
+the crop off*, *Apply the new outline*; *Applied* when nothing has changed). It takes a few seconds, nothing is
+trained again, and the camera stays where it was. What's removed is mostly faint specks beyond the walls, so from inside the room a crop can look like
 it did nothing: zoom out, or press *Show only what's removed* to see exactly what it took out.
 
 **Start it:** double-click **`start-station.cmd`** (or run `node station/station.mjs`), then open
